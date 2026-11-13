@@ -1,0 +1,6 @@
+{
+  "name": "Sahithi Collections",
+  "description": "Style That Celebrates You. A modern feminine fashion boutique showcasing girls' and young women's ethnic wear, western wear, dresses, festive ensembles, and accessories.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
