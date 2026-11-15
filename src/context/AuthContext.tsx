@@ -1,3 +1,4 @@
+import { fetchApi } from '../services/apiTransport';
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   clearClientFirebaseSession,
@@ -231,12 +232,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const syncSessionAndCapabilities = useCallback(async () => {
     try {
       const [sessionRes, capRes] = await Promise.all([
-        fetch(normalizeApiPath('/api/auth/session'), {
+        fetchApi(normalizeApiPath('/api/auth/session'), {
           credentials: 'include',
           cache: 'no-store',
           headers: buildBaseHeaders(),
         }),
-        fetch(normalizeApiPath('/api/auth/capabilities?refresh=1'), {
+        fetchApi(normalizeApiPath('/api/auth/capabilities?refresh=1'), {
           credentials: 'include',
           cache: 'no-store',
           headers: buildBaseHeaders(),
@@ -304,7 +305,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const refreshCapabilities = useCallback(async (): Promise<AuthCapabilities | null> => {
     try {
-      const capRes = await fetch(normalizeApiPath('/api/auth/capabilities?refresh=1'), {
+      const capRes = await fetchApi(normalizeApiPath('/api/auth/capabilities?refresh=1'), {
         credentials: 'include',
         cache: 'no-store',
         headers: buildBaseHeaders(),
@@ -348,7 +349,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return csrfTokenRef.current;
       }
       try {
-        const res = await fetch(normalizeApiPath('/api/auth/session'), {
+        const res = await fetchApi(normalizeApiPath('/api/auth/session'), {
           credentials: 'include',
           cache: 'no-store',
           headers: buildBaseHeaders(),
@@ -409,7 +410,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           }
         }
 
-        const response = await fetch(normalizedPath, {
+        const response = await fetchApi(normalizedPath, {
           ...options,
           headers,
           credentials: 'include',
@@ -445,9 +446,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         // 2. If deployed on a static frontend host without Express /api/* routes (404 / 405 / HTML SPA fallback), execute directly against Firebase Auth & Firestore REST
         const isMissingBackendRoute =
-          ((effectiveStatus === 404 || effectiveStatus === 405) &&
+          response.headers.get('X-Sahithi-Transport') !== 'firebase' &&
+          (((effectiveStatus === 404 || effectiveStatus === 405) &&
             (!isJson || code === 'API_ROUTE_NOT_FOUND')) ||
-          (response.ok && !isJson);
+            (response.ok && !isJson));
 
         if (isMissingBackendRoute) {
           const clientlessResult = await handleClientlessApiRequest<T>(
