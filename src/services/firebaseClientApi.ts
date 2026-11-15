@@ -1,3 +1,4 @@
+import { normalizeAdminOverview } from './adminOverview';
 import firebaseAppletConfig from '../../firebase-applet-config.json';
 import {
   DEFAULT_SITE_SETTINGS,
@@ -1758,14 +1759,14 @@ export async function handleClientlessApiRequest<T>(
           created_at: number;
         }>('admin_audit_log', idToken);
 
-        const activeCount = products.filter((p) => p.status === 'active').length;
+        const activeCount = products.filter((p) => (p.status === 'active' || (p.status as string) === 'published')).length;
         const draftCount = products.filter((p) => p.status === 'draft').length;
         const archivedCount = products.filter((p) => p.status === 'archived').length;
         const lowStockCount = products.filter(
-          (p) => p.status === 'active' && Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 2)
+          (p) => (p.status === 'active' || (p.status as string) === 'published') && Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 2)
         ).length;
         const outOfStockCount = products.filter(
-          (p) => p.status === 'active' && Number(p.stock_qty) <= 0
+          (p) => (p.status === 'active' || (p.status as string) === 'published') && Number(p.stock_qty) <= 0
         ).length;
 
         const paidOrders = orders.filter(
@@ -1778,7 +1779,7 @@ export async function handleClientlessApiRequest<T>(
 
         return {
           ok: true,
-          data: {
+          data: normalizeAdminOverview({
             metrics: {
               totalProducts: products.length,
               activeProducts: activeCount,
@@ -1791,10 +1792,16 @@ export async function handleClientlessApiRequest<T>(
               pendingOrders: orders.filter((o) => o.status === 'pending').length,
               totalRevenuePaise,
               totalRevenue: Number((totalRevenuePaise / 100).toFixed(2)),
-              unreadMessages: messages.filter((m) => m.status === 'new').length,
+              unreadMessages: messages.filter((m) => (m.status === 'new' || m.status === 'unread')).length,
               totalMessages: messages.length,
+              totalAuditEvents: auditLogs.length,
             },
-            recentAudit: [...auditLogs]
+            lowStockItems: products
+              .filter(p => (p.status === 'active' || (p.status as string) === 'published') && Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 2))
+              .slice(0, 8).map(p => formatProductDto(p, true)),
+            recentOrders: [...orders].sort((a, b) => Number((b as any).created_at || 0) - Number((a as any).created_at || 0)).slice(0, 8),
+            recentMessages: [...messages].sort((a, b) => Number((b as any).created_at || 0) - Number((a as any).created_at || 0)).slice(0, 8),
+            recentAuditLogs: [...auditLogs]
               .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
               .slice(0, 12)
               .map((log) => ({
@@ -1806,7 +1813,7 @@ export async function handleClientlessApiRequest<T>(
                 summary: log.summary,
                 createdAt: Number(log.created_at || Date.now()),
               })),
-          } as unknown as T,
+          }) as unknown as T,
         };
       }
 
