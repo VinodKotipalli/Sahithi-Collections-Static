@@ -134,6 +134,39 @@ const DEFAULT_CAPABILITIES: AuthCapabilities = {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+function normalizeApiPath(rawPath: string): string {
+  const trimmed = rawPath.trim();
+  if (!trimmed) return '/api';
+  // Strip any accidental localhost origin so deployed frontend always uses same-origin relative /api/* paths
+  const withoutLocalhost = trimmed.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i, '');
+  const withLeadingSlash = withoutLocalhost.startsWith('/')
+    ? withoutLocalhost
+    : `/${withoutLocalhost}`;
+  const [pathname, query] = withLeadingSlash.split('?');
+  const cleanPathname =
+    pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
+  return query ? `${cleanPathname}?${query}` : cleanPathname;
+}
+
+async function readJsonBody(
+  response: Response
+): Promise<{ isJson: boolean; payload: Record<string, unknown> }> {
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  try {
+    const text = await response.text();
+    if (!text.trim()) {
+      return { isJson: false, payload: {} };
+    }
+    const parsed = JSON.parse(text) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { isJson: true, payload: parsed as Record<string, unknown> };
+    }
+    return { isJson: contentType.includes('application/json'), payload: {} };
+  } catch {
+    return { isJson: false, payload: {} };
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [capabilities, setCapabilities] = useState<AuthCapabilities>(DEFAULT_CAPABILITIES);
@@ -144,27 +177,40 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const syncSessionAndCapabilities = useCallback(async () => {
     try {
       const [sessionRes, capRes] = await Promise.all([
-        fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' }),
-        fetch('/api/auth/capabilities?refresh=1', { credentials: 'include', cache: 'no-store' }),
+        fetch(normalizeApiPath('/api/auth/session'), {
+          credentials: 'include',
+          cache: 'no-store',
+          headers: { Accept: 'application/json' },
+        }),
+        fetch(normalizeApiPath('/api/auth/capabilities?refresh=1'), {
+          credentials: 'include',
+          cache: 'no-store',
+          headers: { Accept: 'application/json' },
+        }),
       ]);
 
       if (sessionRes.ok) {
-        const sessionData = (await sessionRes.json()) as {
-          authenticated: boolean;
-          csrfToken?: string;
-          user: AuthUser | null;
-        };
-        if (sessionData.csrfToken) {
-          csrfTokenRef.current = sessionData.csrfToken;
-        }
-        if (!isLoggingOutRef.current) {
-          setUser(sessionData.authenticated ? sessionData.user : null);
+        const { isJson, payload } = await readJsonBody(sessionRes);
+        if (isJson) {
+          const sessionData = payload as {
+            authenticated?: boolean;
+            csrfToken?: string;
+            user?: AuthUser | null;
+          };
+          if (typeof sessionData.csrfToken === 'string' && sessionData.csrfToken) {
+            csrfTokenRef.current = sessionData.csrfToken;
+          }
+          if (!isLoggingOutRef.current) {
+            setUser(sessionData.authenticated ? (sessionData.user ?? null) : null);
+          }
         }
       }
 
       if (capRes.ok) {
-        const capData = (await capRes.json()) as AuthCapabilities;
-        setCapabilities(capData);
+        const { isJson, payload } = await readJsonBody(capRes);
+        if (isJson && typeof payload.passwordMinLength === 'number') {
+          setCapabilities(payload as unknown as AuthCapabilities);
+        }
       }
     } catch {
       // Leave current session state intact if network request fails momentarily
@@ -175,12 +221,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const refreshCapabilities = useCallback(async (): Promise<AuthCapabilities | null> => {
     try {
-      const capRes = await fetch('/api/auth/capabilities?refresh=1', {
+      const capRes = await fetch(normalizeApiPath('/api/auth/capabilities?refresh=1'), {
         credentials: 'include',
         cache: 'no-store',
+        headers: { Accept: 'application/json' },
       });
       if (!capRes.ok) return null;
-      const capData = (await capRes.json()) as AuthCapabilities;
+      const { isJson, payload } = await readJsonBody(capRes);
+      if (!isJson || typeof payload.passwordMinLength !== 'number') return null;
+      const capData = payload as unknown as AuthCapabilities;
       setCapabilities(capData);
       return capData;
     } catch {
@@ -203,20 +252,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!forceRefresh && csrfTokenRef.current) {
       return csrfTokenRef.current;
     }
-    const res = await fetch('/api/auth/session', {
+    const res = await fetch(normalizeApiPath('/api/auth/session'), {
       credentials: 'include',
       cache: 'no-store',
+      headers: { Accept: 'application/json' },
     });
     if (res.ok) {
-      const data = (await res.json()) as {
-        csrfToken?: string;
-        authenticated: boolean;
-        user: AuthUser | null;
-      };
-      if (data.csrfToken) {
-        csrfTokenRef.current = data.csrfToken;
+      const { isJson, payload } = await readJsonBody(res);
+      if (isJson) {
+        const data = payload as {
+          csrfToken?: string;
+          authenticated?: boolean;
+          user?: AuthUser | null;
+        };
+        if (typeof data.csrfToken === 'string' && data.csrfToken) {
+          csrfTokenRef.current = data.csrfToken;
+        }
+        setUser(data.authenticated ? (data.user ?? null) : null);
       }
-      setUser(data.authenticated ? data.user : null);
     }
     return csrfTokenRef.current;
   }, []);
@@ -228,8 +281,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       hasRetriedCsrf = false
     ): Promise<ApiResult<T>> => {
       try {
+        const normalizedPath = normalizeApiPath(path);
         const method = (options.method || 'GET').toUpperCase();
         const headers = new Headers(options.headers || {});
+        if (!headers.has('Accept')) {
+          headers.set('Accept', 'application/json');
+        }
         const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
         if (method !== 'GET' && method !== 'HEAD') {
           const token = await ensureCsrfToken(hasRetriedCsrf);
@@ -241,20 +298,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           }
         }
 
-        const response = await fetch(path, {
+        const response = await fetch(normalizedPath, {
           ...options,
           headers,
           credentials: 'include',
           cache: 'no-store',
         });
 
-        let payload: Record<string, unknown> = {};
-        let isJson = true;
-        try {
-          payload = (await response.json()) as Record<string, unknown>;
-        } catch {
-          isJson = false;
-        }
+        const { isJson, payload } = await readJsonBody(response);
 
         if (typeof payload.csrfToken === 'string' && payload.csrfToken) {
           csrfTokenRef.current = payload.csrfToken;
@@ -270,7 +321,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             (code === 'CSRF_INVALID' || code === 'CSRF_EXPIRED' || code === 'CSRF_MISSING')
           ) {
             csrfTokenRef.current = '';
-            return requestApi<T>(path, options, true);
+            return requestApi<T>(normalizedPath, options, true);
           }
 
           if (response.status === 401) {
@@ -293,16 +344,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return {
             ok: false,
             status: response.status,
-            code,
+            code: code || (!isJson && response.status === 404 ? 'API_ROUTE_NOT_FOUND' : undefined),
             requestId: typeof payload.requestId === 'string' ? payload.requestId : undefined,
             retryAfterSeconds:
               typeof payload.retryAfterSeconds === 'number' ? payload.retryAfterSeconds : undefined,
             ...(fieldErrors && Object.keys(fieldErrors).length > 0 ? { fieldErrors } : {}),
             error:
               serverError ||
-              (!isJson
-                ? `The server returned an unexpected response (HTTP ${response.status}). Please refresh the page and try again.`
-                : `Request failed (HTTP ${response.status}). Please try again.`),
+              (!isJson && response.status === 404
+                ? `The authentication service endpoint (${method} ${normalizedPath}) was not found on this host (HTTP 404). Ensure the backend server is running and /api/* requests are routed to it.`
+                : !isJson
+                  ? `The server returned an unexpected response (HTTP ${response.status}). Please refresh the page and try again.`
+                  : `Request failed (HTTP ${response.status}). Please try again.`),
+          };
+        }
+
+        if (!isJson) {
+          return {
+            ok: false,
+            status: 502,
+            code: 'NON_JSON_API_RESPONSE',
+            error: `The server returned an HTML fallback instead of JSON for ${method} ${normalizedPath}. Ensure /api/* requests reach the backend server.`,
           };
         }
 
@@ -536,9 +598,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
 
       try {
-        const verifyRes = await fetch('/api/auth/session', {
+        const verifyRes = await fetch(normalizeApiPath('/api/auth/session'), {
           credentials: 'include',
           cache: 'no-store',
+          headers: { Accept: 'application/json' },
         });
         if (!verifyRes.ok) {
           return {
@@ -548,16 +611,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             error: 'Unable to confirm that your session ended. Please try signing out again.',
           };
         }
-        const verifyData = (await verifyRes.json()) as {
-          authenticated: boolean;
+        const { isJson, payload } = await readJsonBody(verifyRes);
+        if (!isJson) {
+          return {
+            ok: false,
+            status: 502,
+            code: 'LOGOUT_VERIFY_FAILED',
+            error: 'Unable to confirm that your session ended. Please try signing out again.',
+          };
+        }
+        const verifyData = payload as {
+          authenticated?: boolean;
           csrfToken?: string;
-          user: AuthUser | null;
+          user?: AuthUser | null;
         };
-        if (verifyData.csrfToken) {
+        if (typeof verifyData.csrfToken === 'string' && verifyData.csrfToken) {
           csrfTokenRef.current = verifyData.csrfToken;
         }
         if (verifyData.authenticated) {
-          setUser(verifyData.user);
+          setUser(verifyData.user ?? null);
           return {
             ok: false,
             status: 500,

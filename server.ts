@@ -13,7 +13,7 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-function resolveListenTarget(isProd: boolean): { port: number; host: string } {
+function resolveListenTarget(): { port: number; host: string; fallbackPort: number } {
   const args = process.argv.slice(2);
   let cliPort: string | undefined;
   let cliHost: string | undefined;
@@ -33,13 +33,20 @@ function resolveListenTarget(isProd: boolean): { port: number; host: string } {
     }
   }
 
+  const defaultAppPort = (process.env.DEFAULT_APP_PORT || '3000').trim();
+  const parsedFallback = Number.parseInt(defaultAppPort || '3000', 10);
+  const fallbackPort =
+    Number.isInteger(parsedFallback) && parsedFallback > 0 && parsedFallback <= 65535
+      ? parsedFallback
+      : 3000;
+
   let portSource = cliPort;
   if (!portSource) {
     const envPort = (process.env.PORT || '').trim();
     const nginxPort = (process.env.NGINX_PORT || '').trim();
-    const defaultAppPort = (process.env.DEFAULT_APP_PORT || '3000').trim();
-    // In AI Studio dev containers, nginx occupies NGINX_PORT (e.g. 8080) and proxies to DEFAULT_APP_PORT (3000).
-    if (!isProd && envPort && nginxPort && envPort === nginxPort) {
+    // Whenever nginx occupies NGINX_PORT (e.g. 8080) in the container and proxies to DEFAULT_APP_PORT (3000),
+    // bind the Node backend to DEFAULT_APP_PORT in both development and production modes.
+    if (envPort && nginxPort && envPort === nginxPort) {
       portSource = defaultAppPort;
     } else {
       portSource = envPort || defaultAppPort;
@@ -47,14 +54,14 @@ function resolveListenTarget(isProd: boolean): { port: number; host: string } {
   }
 
   const parsedPort = Number.parseInt(portSource || '3000', 10);
-  const port = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : 3000;
+  const port = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : fallbackPort;
   const host = (cliHost || '0.0.0.0').trim() || '0.0.0.0';
-  return { port, host };
+  return { port, host, fallbackPort };
 }
 
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
-  const { port, host } = resolveListenTarget(isProd);
+  const { port, host, fallbackPort } = resolveListenTarget();
 
   const rootApp = express();
   const httpServer = http.createServer(rootApp);
@@ -133,6 +140,14 @@ async function startServer() {
       const distDir = path.resolve(__dirname, 'dist');
       app.use(express.static(distDir, { index: false }));
       app.get('*', (req, res) => {
+        if (req.path === '/api' || req.path.startsWith('/api/')) {
+          res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+          res.status(404).json({
+            code: 'API_ROUTE_NOT_FOUND',
+            error: `API endpoint not found (${req.method} ${req.originalUrl || req.url}).`,
+          });
+          return;
+        }
         const indexHtml = path.join(distDir, 'index.html');
         if (fs.existsSync(indexHtml)) {
           const cleanPath = req.path.replace(/\/+$/, '') || '/';
@@ -164,7 +179,10 @@ async function startServer() {
         await readyPromise;
       }
       if (!readyApp) {
-        res.status(503).send('Server is initializing.');
+        res.status(503).json({
+          code: 'SERVER_INITIALIZING',
+          error: 'Server is initializing. Please try again in a moment.',
+        });
         return;
       }
       return readyApp(req, res, next);
@@ -179,12 +197,28 @@ async function startServer() {
   });
 
   await new Promise<void>((resolve, reject) => {
-    httpServer.once('error', reject);
-    httpServer.listen(port, host, () => {
-      httpServer.off('error', reject);
-      console.log(`Sahithi Collections server listening on http://${host}:${port}`);
-      resolve();
-    });
+    const tryListen = (targetPort: number, allowFallback: boolean) => {
+      const onError = (err: NodeJS.ErrnoException) => {
+        httpServer.off('listening', onListening);
+        if (allowFallback && err.code === 'EADDRINUSE' && targetPort !== fallbackPort) {
+          console.warn(
+            `[sahithi] Port ${targetPort} is already in use (occupied by reverse proxy); falling back to port ${fallbackPort}.`
+          );
+          tryListen(fallbackPort, false);
+          return;
+        }
+        reject(err);
+      };
+      const onListening = () => {
+        httpServer.off('error', onError);
+        console.log(`Sahithi Collections server listening on http://${host}:${targetPort}`);
+        resolve();
+      };
+      httpServer.once('error', onError);
+      httpServer.once('listening', onListening);
+      httpServer.listen(targetPort, host);
+    };
+    tryListen(port, true);
   });
 
   await readyPromise;

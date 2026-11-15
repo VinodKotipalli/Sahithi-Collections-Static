@@ -739,4 +739,57 @@ test('Rate limiter runs cleanly with X-Forwarded-For proxy headers without ERR_E
   }
 });
 
+test('All auth endpoints respond with JSON and unmatched /api routes or wrong HTTP methods return 404 API_ROUTE_NOT_FOUND JSON instead of HTML', async () => {
+  const sessionRes = await fetch(`${baseUrl}/api/auth/session`);
+  assert.equal(sessionRes.status, 200);
+  assert.match(sessionRes.headers.get('content-type') || '', /application\/json/i);
+  const { csrfToken } = (await sessionRes.json()) as { csrfToken: string };
+  const cookies = sessionRes.headers
+    .getSetCookie()
+    .map((c) => c.split(';')[0])
+    .join('; ');
 
+  // 1. Invalid credentials on POST /api/auth/login -> 401 INVALID_CREDENTIALS JSON (never 404)
+  const badLogin = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookies,
+      'X-CSRF-Token': csrfToken,
+    },
+    body: JSON.stringify({ email: 'nobody@example.com', password: 'WrongPassword!123' }),
+  });
+  assert.equal(badLogin.status, 401);
+  assert.match(badLogin.headers.get('content-type') || '', /application\/json/i);
+  const badLoginJson = (await badLogin.json()) as { code?: string };
+  assert.equal(badLoginJson.code, 'INVALID_CREDENTIALS');
+
+  // 2. Wrong HTTP method (GET /api/auth/login, GET /api/admin/login) -> 404 API_ROUTE_NOT_FOUND JSON (never HTML fallback)
+  for (const wrongPath of ['/api/auth/login', '/api/admin/login', '/api/auth/nonexistent']) {
+    const res = await fetch(`${baseUrl}${wrongPath}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+    assert.equal(res.status, 404, `Expected 404 for GET ${wrongPath}`);
+    assert.match(res.headers.get('content-type') || '', /application\/json/i);
+    const body = (await res.json()) as { code?: string; requestId?: string };
+    assert.equal(body.code, 'API_ROUTE_NOT_FOUND');
+    assert.ok(body.requestId);
+  }
+
+  // 3. Unmatched POST /api/auth/unknown -> 404 API_ROUTE_NOT_FOUND JSON
+  const unknownPost = await fetch(`${baseUrl}/api/auth/unknown`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookies,
+      'X-CSRF-Token': csrfToken,
+    },
+    body: JSON.stringify({}),
+  });
+  assert.equal(unknownPost.status, 404);
+  assert.match(unknownPost.headers.get('content-type') || '', /application\/json/i);
+  const unknownPostJson = (await unknownPost.json()) as { code?: string; requestId?: string };
+  assert.equal(unknownPostJson.code, 'API_ROUTE_NOT_FOUND');
+  assert.ok(unknownPostJson.requestId);
+});

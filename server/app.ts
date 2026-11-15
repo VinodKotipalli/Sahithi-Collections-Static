@@ -2650,6 +2650,16 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     serializePublicUser,
   });
 
+  app.use('/api', (req: AuthedRequest, res: Response) => {
+    const requestId = req.requestId || crypto.randomUUID();
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    return res.status(404).json({
+      code: 'API_ROUTE_NOT_FOUND',
+      error: `API endpoint not found (${req.method} ${req.originalUrl || req.url}).`,
+      requestId,
+    });
+  });
+
   app.use('/api', (err: unknown, req: AuthedRequest, res: Response, _next: NextFunction) => {
     const requestId = req.requestId || crypto.randomUUID();
     const errObj = err && typeof err === 'object' ? (err as Record<string, unknown>) : null;
