@@ -1,3 +1,4 @@
+import { fetchApi } from './services/apiTransport';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2 } from 'lucide-react';
 import { MotionConfig } from 'motion/react';
@@ -49,7 +50,7 @@ function BoutiqueShell() {
 
   const fetchPublicCatalog = useCallback(async () => {
     try {
-      const res = await fetch('/api/products', {
+      const res = await fetchApi('/api/products', {
         credentials: 'include',
         cache: 'no-store',
         headers: { Accept: 'application/json', 'X-Sahithi-Client': 'web-spa' },
