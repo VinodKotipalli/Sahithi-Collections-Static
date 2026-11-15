@@ -113,7 +113,18 @@ function sendJsonError(
   error: string,
   fieldErrors?: Record<string, string>
 ) {
-  return res.status(status).json({
+  const isSpaClient = req.get('x-sahithi-client') === 'web-spa';
+  const wireStatus =
+    isSpaClient && status === 403
+      ? 400
+      : isSpaClient && (status === 502 || status === 503 || status === 504)
+        ? 500
+        : status;
+  if (wireStatus !== status) {
+    res.setHeader('X-Sahithi-Original-Status', String(status));
+  }
+  return res.status(wireStatus).json({
+    status,
     code,
     error,
     requestId: req.requestId,

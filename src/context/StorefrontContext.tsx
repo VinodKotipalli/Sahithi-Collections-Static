@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useState, type React
 import { COLLECTIONS } from '../config/collections';
 import { LOOKBOOK_ENTRIES } from '../config/lookbook';
 import { SITE_CONFIG } from '../config/site';
+import { handleClientlessApiRequest } from '../services/firebaseClientApi';
 import type { SiteSettings, StorefrontCategory, StorefrontContent } from '../types/boutique';
 
 export const FALLBACK_CATEGORIES: StorefrontCategory[] = COLLECTIONS.map((c, idx) => ({
@@ -101,8 +102,10 @@ export function StorefrontProvider({ children }: { children: ReactNode }) {
       const res = await fetch('/api/storefront', {
         credentials: 'include',
         cache: 'no-store',
+        headers: { Accept: 'application/json', 'X-Sahithi-Client': 'web-spa' },
       });
-      if (res.ok) {
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (res.ok && contentType.includes('application/json')) {
         const data = (await res.json()) as {
           settings?: SiteSettings;
           content?: StorefrontContent;
@@ -112,6 +115,19 @@ export function StorefrontProvider({ children }: { children: ReactNode }) {
         if (data.content) setContent(data.content);
         if (Array.isArray(data.categories)) {
           setCategories(data.categories);
+        }
+        return;
+      }
+      const fallback = await handleClientlessApiRequest<{
+        settings?: SiteSettings;
+        content?: StorefrontContent;
+        categories?: StorefrontCategory[];
+      }>('/api/storefront', 'GET');
+      if (fallback.ok) {
+        if (fallback.data.settings) setSettings(fallback.data.settings);
+        if (fallback.data.content) setContent(fallback.data.content);
+        if (Array.isArray(fallback.data.categories)) {
+          setCategories(fallback.data.categories);
         }
       }
     } catch {

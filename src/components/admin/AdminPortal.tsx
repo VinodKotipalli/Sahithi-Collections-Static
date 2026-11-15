@@ -386,6 +386,10 @@ export function AdminPortal({
       setGateError(
         res.error || 'Unable to verify owner authorization right now. Please try again.'
       );
+      if (currentSubPath === '/login') {
+        setGate('unauthenticated');
+        return;
+      }
       setGate('error');
       return;
     }

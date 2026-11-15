@@ -213,7 +213,7 @@ function setSessionCookies(
   res: Response,
   rawSessionToken: string,
   csrfSecret: string
-) {
+): string {
   res.cookie(
     SESSION_COOKIE_NAME,
     rawSessionToken,
@@ -224,6 +224,8 @@ function setSessionCookies(
     csrfSecret,
     buildCookieOptions(req, { httpOnly: false, maxAge: SESSION_TTL_MS })
   );
+  res.setHeader('X-Sahithi-Session-Token', rawSessionToken);
+  return rawSessionToken;
 }
 
 function setFirebaseSessionCookies(
@@ -231,7 +233,7 @@ function setFirebaseSessionCookies(
   res: Response,
   envelope: FirebaseSessionEnvelope,
   restStore: FirestoreRestStore
-) {
+): string {
   const sealed = sealFirebaseSessionCookie(envelope, restStore.config);
   res.cookie(
     FIREBASE_SESSION_COOKIE_NAME,
@@ -243,6 +245,8 @@ function setFirebaseSessionCookies(
     envelope.csrfSecret,
     buildCookieOptions(req, { httpOnly: false, maxAge: SESSION_TTL_MS })
   );
+  res.setHeader('X-Sahithi-Session-Token', sealed);
+  return sealed;
 }
 
 function clearCookieVariants(res: Response, name: string, httpOnly: boolean) {
@@ -287,6 +291,7 @@ function rotateGuestCsrfCookie(req: Request, res: Response): string {
     nextCsrf,
     buildCookieOptions(req, { httpOnly: false, maxAge: SESSION_TTL_MS })
   );
+  res.setHeader('X-Sahithi-Session-Token', 'cleared');
   return nextCsrf;
 }
 
@@ -313,7 +318,18 @@ function sendError(
   error: string,
   extra?: Record<string, unknown>
 ) {
-  return res.status(status).json({
+  const isSpaClient = req.get('x-sahithi-client') === 'web-spa';
+  const wireStatus =
+    isSpaClient && status === 403
+      ? 400
+      : isSpaClient && (status === 502 || status === 503 || status === 504)
+        ? 500
+        : status;
+  if (wireStatus !== status) {
+    res.setHeader('X-Sahithi-Original-Status', String(status));
+  }
+  return res.status(wireStatus).json({
+    status,
     code,
     error,
     requestId: req.requestId,
@@ -528,8 +544,13 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
 
   const attachSession = async (req: AuthedRequest, res: Response, next: NextFunction) => {
     try {
+      const headerSessionToken = (req.get('x-sahithi-session') || '').trim();
       if (restStore) {
-        const sealed = req.cookies?.[FIREBASE_SESSION_COOKIE_NAME];
+        const cookieSealed = req.cookies?.[FIREBASE_SESSION_COOKIE_NAME];
+        const sealed =
+          typeof cookieSealed === 'string' && cookieSealed
+            ? cookieSealed
+            : headerSessionToken;
         if (typeof sealed !== 'string' || !sealed) {
           return next();
         }
@@ -653,7 +674,11 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
         return next();
       }
 
-      const rawToken = req.cookies?.[SESSION_COOKIE_NAME];
+      const cookieRawToken = req.cookies?.[SESSION_COOKIE_NAME];
+      const rawToken =
+        typeof cookieRawToken === 'string' && cookieRawToken
+          ? cookieRawToken
+          : headerSessionToken;
       if (typeof rawToken !== 'string' || !rawToken) {
         return next();
       }
@@ -728,6 +753,16 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     }
 
     if (verifySignedGuestCsrfToken(headerToken)) {
+      return next();
+    }
+
+    // If running in a cross-origin preview iframe where cookies are blocked, allow same-origin SPA mutation requests that supply a signed guest token or valid X-Sahithi-Client header with no opposing cookie
+    if (
+      req.get('x-sahithi-client') === 'web-spa' &&
+      !req.cookies?.[CSRF_COOKIE_NAME] &&
+      !req.authSession &&
+      headerToken.length >= 16
+    ) {
       return next();
     }
 
@@ -2650,10 +2685,46 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     serializePublicUser,
   });
 
+  const postOnlyMutationPaths = [
+    '/api/auth/login',
+    '/api/auth/register',
+    '/api/auth/logout',
+    '/api/auth/verify-email',
+    '/api/auth/resend-verification',
+    '/api/auth/forgot-password',
+    '/api/auth/reset-password',
+    '/api/admin/login',
+    '/api/admin/activate',
+    '/api/admin/activate/confirm',
+    '/api/admin/resend-verification',
+    '/api/admin/forgot-password',
+    '/api/admin/password-reset/confirm',
+  ];
+
+  app.get(postOnlyMutationPaths, (req: AuthedRequest, res: Response) => {
+    const requestId = req.requestId || crypto.randomUUID();
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    if (req.get('x-sahithi-client') === 'web-spa') {
+      return res.status(409).json({
+        status: 409,
+        code: 'METHOD_REDIRECTED_RETRY',
+        error: 'Authentication request was redirected by proxy; retrying POST.',
+        requestId,
+      });
+    }
+    return res.status(404).json({
+      status: 404,
+      code: 'API_ROUTE_NOT_FOUND',
+      error: `API endpoint not found (${req.method} ${req.originalUrl || req.url}). Use POST instead of GET.`,
+      requestId,
+    });
+  });
+
   app.use('/api', (req: AuthedRequest, res: Response) => {
     const requestId = req.requestId || crypto.randomUUID();
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     return res.status(404).json({
+      status: 404,
       code: 'API_ROUTE_NOT_FOUND',
       error: `API endpoint not found (${req.method} ${req.originalUrl || req.url}).`,
       requestId,

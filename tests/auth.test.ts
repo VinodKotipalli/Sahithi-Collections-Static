@@ -793,3 +793,131 @@ test('All auth endpoints respond with JSON and unmatched /api routes or wrong HT
   assert.equal(unknownPostJson.code, 'API_ROUTE_NOT_FOUND');
   assert.ok(unknownPostJson.requestId);
 });
+
+test('SPA client header (X-Sahithi-Client: web-spa) protects 403 JSON errors from nginx HTML interception and recovers from 302 POST->GET redirects', async () => {
+  // 1. Missing CSRF with X-Sahithi-Client: web-spa returns wire status 400 with X-Sahithi-Original-Status: 403 and status: 403 in JSON body
+  const csrfErrRes = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Sahithi-Client': 'web-spa',
+    },
+    body: JSON.stringify({ email: 'test@example.com', password: 'Password123!' }),
+  });
+  assert.equal(csrfErrRes.status, 400);
+  assert.equal(csrfErrRes.headers.get('x-sahithi-original-status'), '403');
+  assert.match(csrfErrRes.headers.get('content-type') || '', /application\/json/i);
+  const csrfErrJson = (await csrfErrRes.json()) as { status?: number; code?: string };
+  assert.equal(csrfErrJson.status, 403);
+  assert.equal(csrfErrJson.code, 'CSRF_MISSING');
+
+  // 2. GET on POST-only auth routes with X-Sahithi-Client: web-spa returns 409 METHOD_REDIRECTED_RETRY JSON
+  for (const postOnlyPath of ['/api/auth/login', '/api/admin/login', '/api/auth/register', '/api/auth/logout']) {
+    const redirectedGet = await fetch(`${baseUrl}${postOnlyPath}`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        'X-Sahithi-Client': 'web-spa',
+      },
+    });
+    assert.equal(redirectedGet.status, 409, `Expected 409 for redirected GET ${postOnlyPath}`);
+    const body = (await redirectedGet.json()) as { code?: string };
+    assert.equal(body.code, 'METHOD_REDIRECTED_RETRY');
+  }
+});
+
+test('Header-based session token (X-Sahithi-Session) maintains authenticated session when third-party iframe cookies are blocked', async () => {
+  sentEmails.length = 0;
+
+  // Register and verify a user
+  const sessionInit = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { 'X-Sahithi-Client': 'web-spa' },
+  });
+  const { csrfToken: guestCsrf } = (await sessionInit.json()) as { csrfToken: string };
+
+  const email = 'iframe-customer@example.com';
+  const password = 'IframePassword!2026';
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Sahithi-Client': 'web-spa',
+      'X-CSRF-Token': guestCsrf,
+    },
+    body: JSON.stringify({
+      fullName: 'Iframe Customer',
+      email,
+      password,
+      confirmPassword: password,
+    }),
+  });
+  assert.equal(regRes.status, 200);
+  assert.equal(sentEmails.length, 1);
+
+  const verifyMatch = sentEmails[0].text.match(/token=([A-Za-z0-9_-]+)/);
+  assert.ok(verifyMatch);
+
+  const verifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Sahithi-Client': 'web-spa',
+      'X-CSRF-Token': guestCsrf,
+    },
+    body: JSON.stringify({ token: verifyMatch[1] }),
+  });
+  assert.equal(verifyRes.status, 200);
+
+  // Now log in WITHOUT sending any Cookie header, and capture X-Sahithi-Session-Token
+  const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Sahithi-Client': 'web-spa',
+      'X-CSRF-Token': guestCsrf,
+    },
+    body: JSON.stringify({ email, password }),
+  });
+  assert.equal(loginRes.status, 200);
+  const sessionToken = loginRes.headers.get('x-sahithi-session-token');
+  assert.ok(sessionToken && sessionToken !== 'cleared');
+  const loginJson = (await loginRes.json()) as { csrfToken: string; user: { email: string } };
+  assert.equal(loginJson.user.email, email);
+
+  // Verify /api/auth/session and /api/account/profile succeed using ONLY X-Sahithi-Session header (no cookies)
+  const checkRes = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: {
+      'X-Sahithi-Client': 'web-spa',
+      'X-Sahithi-Session': sessionToken,
+    },
+  });
+  assert.equal(checkRes.status, 200);
+  const checkJson = (await checkRes.json()) as { authenticated: boolean; user: { email: string } | null };
+  assert.equal(checkJson.authenticated, true);
+  assert.equal(checkJson.user?.email, email);
+
+  // Log out using ONLY X-Sahithi-Session header and confirm session is revoked
+  const logoutRes = await fetch(`${baseUrl}/api/auth/logout`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Sahithi-Client': 'web-spa',
+      'X-Sahithi-Session': sessionToken,
+      'X-CSRF-Token': loginJson.csrfToken,
+    },
+    body: JSON.stringify({}),
+  });
+  assert.equal(logoutRes.status, 200);
+  assert.equal(logoutRes.headers.get('x-sahithi-session-token'), 'cleared');
+
+  const afterLogoutRes = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: {
+      'X-Sahithi-Client': 'web-spa',
+      'X-Sahithi-Session': sessionToken,
+    },
+  });
+  const afterLogoutJson = (await afterLogoutRes.json()) as { authenticated: boolean };
+  assert.equal(afterLogoutJson.authenticated, false);
+});
+

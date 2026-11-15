@@ -23,6 +23,7 @@ import { useBoutiqueRouter } from './hooks/useBoutiqueRouter';
 import { usePrefersReducedMotion } from './hooks/usePrefersReducedMotion';
 import { useShoppingBag } from './hooks/useShoppingBag';
 import { useWishlist } from './hooks/useWishlist';
+import { handleClientlessApiRequest } from './services/firebaseClientApi';
 import type { CollectionCategory, Product } from './types/boutique';
 
 function BoutiqueShell() {
@@ -51,15 +52,28 @@ function BoutiqueShell() {
       const res = await fetch('/api/products', {
         credentials: 'include',
         cache: 'no-store',
+        headers: { Accept: 'application/json', 'X-Sahithi-Client': 'web-spa' },
       });
-      if (res.ok) {
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (res.ok && contentType.includes('application/json')) {
         const data = (await res.json()) as { items?: Product[] };
         if (Array.isArray(data.items)) {
           setProducts(data.items);
           setQuickViewProduct((current) =>
             current ? data.items!.find((p) => p.id === current.id) || null : null
           );
+          return;
         }
+      }
+      const fallback = await handleClientlessApiRequest<{ items?: Product[] }>(
+        '/api/products',
+        'GET'
+      );
+      if (fallback.ok && Array.isArray(fallback.data.items)) {
+        setProducts(fallback.data.items);
+        setQuickViewProduct((current) =>
+          current ? fallback.data.items!.find((p) => p.id === current.id) || null : null
+        );
       }
     } catch {
       // Preserve current catalog list if transient error occurs
