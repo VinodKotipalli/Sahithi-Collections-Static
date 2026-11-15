@@ -1,3 +1,4 @@
+import { fetchApi } from '../services/apiTransport';
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
 import { COLLECTIONS } from '../config/collections';
 import { LOOKBOOK_ENTRIES } from '../config/lookbook';
@@ -99,7 +100,7 @@ export function StorefrontProvider({ children }: { children: ReactNode }) {
 
   const refreshStorefront = useCallback(async () => {
     try {
-      const res = await fetch('/api/storefront', {
+      const res = await fetchApi('/api/storefront', {
         credentials: 'include',
         cache: 'no-store',
         headers: { Accept: 'application/json', 'X-Sahithi-Client': 'web-spa' },
