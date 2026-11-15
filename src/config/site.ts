@@ -77,7 +77,7 @@ export const SITE_CONFIG = {
     instagramHandle: '',
     email: '',
     storeAddress: '',
-    hoursNote: 'Configure boutique hours in src/config/site.ts',
+    hoursNote: 'Mon – Sat · 10:30 AM – 8:00 PM IST',
   } satisfies ContactConfig,
 };
 
@@ -102,17 +102,22 @@ export function buildWhatsAppEnquiryMessage(params: {
   productName: string;
   selectedSize: string;
   selectedColor: string;
+  brandName?: string;
 }): string {
-  return `Hello ${SITE_CONFIG.brandName}, I would like to enquire about "${params.productName}" (Size: ${params.selectedSize}, Color: ${params.selectedColor}). Could you please share availability and styling details?`;
+  const brand = params.brandName?.trim() || SITE_CONFIG.brandName;
+  return `Hello ${brand}, I would like to enquire about "${params.productName}" (Size: ${params.selectedSize}, Color: ${params.selectedColor}). Could you please share availability and styling details?`;
 }
 
 export function buildWhatsAppEnquiryUrl(params: {
   productName: string;
   selectedSize: string;
   selectedColor: string;
+  brandName?: string;
+  contact?: ContactConfig;
 }): string | null {
-  if (!isWhatsAppConfigured()) return null;
-  const digits = SITE_CONFIG.contact.whatsappNumber.replace(/\D/g, '');
+  const contact = params.contact || SITE_CONFIG.contact;
+  if (!isWhatsAppConfigured(contact)) return null;
+  const digits = contact.whatsappNumber.replace(/\D/g, '');
   const text = encodeURIComponent(buildWhatsAppEnquiryMessage(params));
   return `https://wa.me/${digits}?text=${text}`;
 }

@@ -1,47 +1,103 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Loader2 } from 'lucide-react';
 import { MotionConfig } from 'motion/react';
 import { AboutSection } from './components/AboutSection';
+import { AccountDashboard } from './components/account/AccountDashboard';
+import { AdminErrorBoundary, AdminPortal } from './components/admin/AdminPortal';
 import { AuthPage } from './components/auth/AuthPage';
+import { BagDrawer } from './components/BagDrawer';
 import { CollectionsSection } from './components/CollectionsSection';
 import { ContactAndFooter } from './components/ContactAndFooter';
 import { HeroSection } from './components/HeroSection';
 import { LookbookLightbox } from './components/LookbookLightbox';
 import { LookbookSection } from './components/LookbookSection';
 import { Navbar } from './components/Navbar';
-import { ProductShowcase, SortOption } from './components/ProductShowcase';
+import { ProductShowcase, type SortOption } from './components/ProductShowcase';
 import { QuickViewModal } from './components/QuickViewModal';
 import { ScrollProgressAndTop } from './components/ScrollProgressAndTop';
 import { SpotlightEditSection } from './components/SpotlightEditSection';
 import { WishlistDrawer } from './components/WishlistDrawer';
-import { PRODUCTS } from './config/products';
-import { AuthProvider, useAuth } from './context/AuthContext';
-import { AppRoute, useBoutiqueRouter } from './hooks/useBoutiqueRouter';
+import { AuthProvider, useAuth, type AuthUser } from './context/AuthContext';
+import { StorefrontProvider, useStorefront } from './context/StorefrontContext';
+import { useBoutiqueRouter } from './hooks/useBoutiqueRouter';
 import { usePrefersReducedMotion } from './hooks/usePrefersReducedMotion';
+import { useShoppingBag } from './hooks/useShoppingBag';
 import { useWishlist } from './hooks/useWishlist';
-import { CollectionCategory, Product } from './types/boutique';
+import type { CollectionCategory, Product } from './types/boutique';
 
-function StorefrontAndAuthShell({
-  route,
-  returnTo,
-  navigate,
-  navigateToStoreSection,
-}: {
-  route: AppRoute;
-  returnTo: string;
-  navigate: (target: AppRoute, nextPath?: string) => void;
-  navigateToStoreSection: (sectionHash?: string) => void;
-}) {
-  const { user } = useAuth();
+function BoutiqueShell() {
   const prefersReducedMotion = usePrefersReducedMotion();
+  const { user, isLoadingSession, refreshSession } = useAuth();
+  const { settings, refreshStorefront } = useStorefront();
+  const { route, adminSubPath, queryToken, queryMode, nextPath, navigate, navigateToSection } =
+    useBoutiqueRouter();
+
+  const [products, setProducts] = useState<Product[]>([]);
+  const [loadingCatalog, setLoadingCatalog] = useState(true);
+
   const [selectedCategory, setSelectedCategory] = useState<'All' | CollectionCategory>('All');
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState<SortOption>('newest');
 
   const [quickViewProduct, setQuickViewProduct] = useState<Product | null>(null);
   const [wishlistOpen, setWishlistOpen] = useState(false);
+  const [bagOpen, setBagOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
 
   const searchInputRef = useRef<HTMLInputElement>(null);
+
+  const fetchPublicCatalog = useCallback(async () => {
+    try {
+      const res = await fetch('/api/products', {
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { items?: Product[] };
+        if (Array.isArray(data.items)) {
+          setProducts(data.items);
+          setQuickViewProduct((current) =>
+            current ? data.items!.find((p) => p.id === current.id) || null : null
+          );
+        }
+      }
+    } catch {
+      // Preserve current catalog list if transient error occurs
+    } finally {
+      setLoadingCatalog(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchPublicCatalog();
+  }, [fetchPublicCatalog]);
+
+  // Mark private routes (/admin, /account) noindex client-side in addition to server headers
+  useEffect(() => {
+    const isPrivate = route === '/admin' || route === '/account';
+    let meta = document.querySelector<HTMLMetaElement>('meta[name="robots"]');
+    if (isPrivate) {
+      if (!meta) {
+        meta = document.createElement('meta');
+        meta.name = 'robots';
+        document.head.appendChild(meta);
+      }
+      meta.content = 'noindex, nofollow';
+    } else if (meta) {
+      meta.remove();
+    }
+
+    const brand = settings.brandName || 'Sahithi Collections';
+    const cleanTagline = (settings.tagline || 'Style That Celebrates You').replace(/\.+$/, '');
+    if (route === '/admin') {
+      document.title =
+        adminSubPath === '/login'
+          ? `Owner Sign-In — ${brand}`
+          : `Atelier Studio — ${brand}`;
+    } else {
+      document.title = `${brand} — ${cleanTagline}`;
+    }
+  }, [route, adminSubPath, settings.brandName, settings.tagline]);
 
   const {
     wishlistIds,
@@ -50,17 +106,27 @@ function StorefrontAndAuthShell({
     removeFromWishlist,
     clearWishlist,
     isWishlisted,
-  } = useWishlist(user?.id);
+  } = useWishlist();
+
+  const {
+    bagItems,
+    bagCount,
+    addItem: addToBag,
+    updateItemQty,
+    removeItem: removeBagItem,
+    acceptPriceUpdates,
+    clearBag,
+  } = useShoppingBag();
 
   const wishlistProducts = useMemo(() => {
-    const productMap = new Map(PRODUCTS.map((p) => [p.id, p]));
+    const productMap = new Map(products.map((p) => [p.id, p]));
     return wishlistIds.map((id) => productMap.get(id)).filter((p): p is Product => Boolean(p));
-  }, [wishlistIds]);
+  }, [wishlistIds, products]);
 
   const filteredProducts = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
 
-    const matches = PRODUCTS.filter((product) => {
+    const matches = products.filter((product) => {
       const categoryMatch =
         selectedCategory === 'All' || product.category === selectedCategory;
       if (!categoryMatch) return false;
@@ -89,7 +155,47 @@ function StorefrontAndAuthShell({
           return b.dateAdded.localeCompare(a.dateAdded);
       }
     });
-  }, [selectedCategory, searchQuery, sortBy]);
+  }, [products, selectedCategory, searchQuery, sortBy]);
+
+  // Revalidate session whenever entering /account and redirect if unauthenticated
+  useEffect(() => {
+    if (route === '/account') {
+      void refreshSession();
+    }
+  }, [route, refreshSession]);
+
+  useEffect(() => {
+    if (!isLoadingSession && route === '/account' && !user) {
+      navigate('/login?next=%2Faccount', { replace: true });
+    }
+  }, [isLoadingSession, route, user, navigate]);
+
+  // Route Firebase email action redirects (?mode=resetPassword|verifyEmail&oobCode=...) directly
+  useEffect(() => {
+    if (!queryToken || !queryMode) return;
+    if (route === '/login' || route === '/') {
+      if (queryMode === 'resetPassword') {
+        navigate(`/reset-password?token=${encodeURIComponent(queryToken)}`, { replace: true });
+        return;
+      }
+      if (queryMode === 'verifyEmail') {
+        navigate(`/verify-email?token=${encodeURIComponent(queryToken)}`, { replace: true });
+      }
+    }
+  }, [route, queryMode, queryToken, navigate]);
+
+  // Redirect already-signed-in users away from /login or /signup
+  useEffect(() => {
+    if (
+      !isLoadingSession &&
+      user &&
+      (route === '/login' || route === '/signup') &&
+      queryMode !== 'resetPassword' &&
+      queryMode !== 'verifyEmail'
+    ) {
+      navigate(nextPath || (user.isOwner ? '/admin/dashboard' : '/account'), { replace: true });
+    }
+  }, [isLoadingSession, user, route, nextPath, queryMode, navigate]);
 
   const scrollToShowcase = () => {
     const section = document.getElementById('new-arrivals');
@@ -116,76 +222,131 @@ function StorefrontAndAuthShell({
     setSortBy('newest');
   };
 
-  if (route !== '/') {
+  const isAuthRoute =
+    route === '/login' ||
+    route === '/signup' ||
+    route === '/forgot-password' ||
+    route === '/reset-password' ||
+    route === '/verify-email';
+
+  const handleAuthenticatedRedirect = (loggedInUser?: AuthUser) => {
+    const activeUser = loggedInUser || user;
+    navigate(nextPath || (activeUser?.isOwner ? '/admin/dashboard' : '/account'), { replace: true });
+  };
+
+  if (route === '/admin') {
     return (
-      <AuthPage
-        route={route}
-        returnTo={returnTo}
-        onNavigateRoute={(next) => navigate(next, returnTo)}
-        onReturnToStore={(path) => {
-          if (path && path.startsWith('/#')) {
-            navigateToStoreSection(path.slice(1));
-          } else {
-            navigateToStoreSection();
-          }
-        }}
-      />
+      <AdminErrorBoundary onReturnHome={() => navigate('/', { replace: true })}>
+        <AdminPortal
+          adminSubPath={adminSubPath}
+          queryToken={queryToken}
+          queryMode={queryMode}
+          onNavigate={(target, navOptions) => {
+            navigate(target, navOptions);
+            if (target === '/') {
+              void fetchPublicCatalog();
+              void refreshStorefront();
+            }
+          }}
+          onCatalogMutated={() => void fetchPublicCatalog()}
+          onStorefrontMutated={() => void refreshStorefront()}
+        />
+      </AdminErrorBoundary>
     );
   }
 
   return (
     <div className="min-h-screen bg-[#FFF9F5] text-[#242124]">
-      <a
-        href="#main-content"
-        className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-xl focus:bg-[#49243E] focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:text-[#FFF9F5]"
-      >
-        Skip to main content
-      </a>
-
-      <Navbar
-        wishlistCount={wishlistCount}
-        onOpenWishlist={() => setWishlistOpen(true)}
-        onOpenSearch={handleOpenSearch}
-        onOpenLogin={() => navigate('/login', window.location.hash ? `/${window.location.hash}` : '/')}
-      />
-
-      <main id="main-content">
-        <HeroSection />
-
-        <CollectionsSection onSelectCollection={handleSelectCollection} />
-
-        <ProductShowcase
-          products={filteredProducts}
-          selectedCategory={selectedCategory}
-          onSelectCategory={setSelectedCategory}
-          searchQuery={searchQuery}
-          onSearchChange={setSearchQuery}
-          sortBy={sortBy}
-          onSortChange={setSortBy}
-          onClearFilters={handleClearFilters}
-          searchInputRef={searchInputRef}
-          isWishlisted={isWishlisted}
-          onToggleWishlist={toggleWishlist}
-          onQuickView={setQuickViewProduct}
+      {route === '/account' ? (
+        isLoadingSession ? (
+          <div className="flex min-h-screen items-center justify-center bg-[#FFF9F5]">
+            <div className="flex items-center gap-3 text-sm font-medium text-[#49243E]">
+              <Loader2 className="h-5 w-5 animate-spin text-[#B76E79]" aria-hidden="true" />
+              <span>Loading your atelier profile...</span>
+            </div>
+          </div>
+        ) : user ? (
+          <AccountDashboard
+            wishlistCount={wishlistCount}
+            onOpenWishlist={() => setWishlistOpen(true)}
+            onNavigate={navigate}
+          />
+        ) : null
+      ) : isAuthRoute ? (
+        <AuthPage
+          initialRoute={route}
+          queryToken={queryToken}
+          queryMode={queryMode}
+          onNavigate={navigate}
+          onAuthenticated={handleAuthenticatedRedirect}
         />
+      ) : (
+        <>
+          <a
+            href="#main-content"
+            className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-xl focus:bg-[#49243E] focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:text-[#FFF9F5]"
+          >
+            Skip to main content
+          </a>
 
-        <SpotlightEditSection onExploreEdit={handleSelectCollection} />
+          <Navbar
+            wishlistCount={wishlistCount}
+            bagCount={bagCount}
+            onOpenWishlist={() => setWishlistOpen(true)}
+            onOpenBag={() => setBagOpen(true)}
+            onOpenSearch={handleOpenSearch}
+            onNavigateAuth={(target, options) => navigate(target, options)}
+            onNavigateSection={navigateToSection}
+          />
 
-        <LookbookSection onOpenLightbox={setLightboxIndex} />
+          <main id="main-content">
+            <HeroSection />
 
-        <AboutSection />
-      </main>
+            <CollectionsSection onSelectCollection={handleSelectCollection} />
 
-      <ContactAndFooter
-        onOpenLogin={() => navigate('/login', window.location.hash ? `/${window.location.hash}` : '/')}
-      />
+            <ProductShowcase
+              products={filteredProducts}
+              isLoading={loadingCatalog}
+              selectedCategory={selectedCategory}
+              onSelectCategory={setSelectedCategory}
+              searchQuery={searchQuery}
+              onSearchChange={setSearchQuery}
+              sortBy={sortBy}
+              onSortChange={setSortBy}
+              onClearFilters={handleClearFilters}
+              searchInputRef={searchInputRef}
+              isWishlisted={isWishlisted}
+              onToggleWishlist={toggleWishlist}
+              onQuickView={setQuickViewProduct}
+            />
 
-      <ScrollProgressAndTop />
+            <SpotlightEditSection onExploreEdit={handleSelectCollection} />
+
+            <LookbookSection onOpenLightbox={setLightboxIndex} />
+
+            <AboutSection />
+          </main>
+
+          <ContactAndFooter
+            onNavigateAuth={() => navigate(user ? '/account' : '/login')}
+            accountLabel={user ? 'My Account' : 'Login / Sign Up'}
+          />
+
+          <ScrollProgressAndTop />
+
+          <LookbookLightbox
+            activeIndex={lightboxIndex}
+            onClose={() => setLightboxIndex(null)}
+            onChangeIndex={setLightboxIndex}
+          />
+        </>
+      )}
 
       <QuickViewModal
         product={quickViewProduct}
         isWishlisted={quickViewProduct ? isWishlisted(quickViewProduct.id) : false}
         onToggleWishlist={toggleWishlist}
+        onAddToBag={addToBag}
         onClose={() => setQuickViewProduct(null)}
       />
 
@@ -198,31 +359,27 @@ function StorefrontAndAuthShell({
         onQuickView={setQuickViewProduct}
       />
 
-      <LookbookLightbox
-        activeIndex={lightboxIndex}
-        onClose={() => setLightboxIndex(null)}
-        onChangeIndex={setLightboxIndex}
+      <BagDrawer
+        isOpen={bagOpen}
+        items={bagItems}
+        onClose={() => setBagOpen(false)}
+        onUpdateQty={updateItemQty}
+        onRemoveItem={removeBagItem}
+        onAcceptPriceUpdates={acceptPriceUpdates}
+        onClearBag={clearBag}
+        onOrderCompleted={() => void fetchPublicCatalog()}
       />
     </div>
   );
 }
 
 export default function App() {
-  const { route, returnTo, navigate, navigateToStoreSection } = useBoutiqueRouter();
-
-  const handleRecoveryDetected = useCallback(() => {
-    navigate('/reset-password');
-  }, [navigate]);
-
   return (
     <MotionConfig reducedMotion="user">
-      <AuthProvider onRecoveryDetected={handleRecoveryDetected}>
-        <StorefrontAndAuthShell
-          route={route}
-          returnTo={returnTo}
-          navigate={navigate}
-          navigateToStoreSection={navigateToStoreSection}
-        />
+      <AuthProvider>
+        <StorefrontProvider>
+          <BoutiqueShell />
+        </StorefrontProvider>
       </AuthProvider>
     </MotionConfig>
   );

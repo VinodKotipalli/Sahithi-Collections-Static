@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { ChevronLeft, ChevronRight, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
-import { LOOKBOOK_ENTRIES } from '../config/lookbook';
+import { useStorefront } from '../context/StorefrontContext';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 import { BoutiqueImage } from './BoutiqueImage';
@@ -19,21 +19,25 @@ export function LookbookLightbox({
 }: LookbookLightboxProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const prefersReducedMotion = usePrefersReducedMotion();
-  const isOpen = activeIndex !== null;
+  const { content } = useStorefront();
+  const entries = content.lookbookEntries;
+  const total = entries.length;
+  const safeIndex =
+    activeIndex !== null && activeIndex >= 0 && activeIndex < total ? activeIndex : null;
+  const isOpen = safeIndex !== null && total > 0;
 
   useFocusTrap(isOpen, containerRef, onClose);
 
-  const total = LOOKBOOK_ENTRIES.length;
-  const entry = activeIndex !== null ? LOOKBOOK_ENTRIES[activeIndex] : null;
+  const entry = safeIndex !== null ? entries[safeIndex] : null;
 
   const goPrev = () => {
-    if (activeIndex === null) return;
-    onChangeIndex((activeIndex - 1 + total) % total);
+    if (safeIndex === null || total === 0) return;
+    onChangeIndex((safeIndex - 1 + total) % total);
   };
 
   const goNext = () => {
-    if (activeIndex === null) return;
-    onChangeIndex((activeIndex + 1) % total);
+    if (safeIndex === null || total === 0) return;
+    onChangeIndex((safeIndex + 1) % total);
   };
 
   useEffect(() => {

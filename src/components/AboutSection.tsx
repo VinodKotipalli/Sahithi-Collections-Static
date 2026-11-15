@@ -1,12 +1,13 @@
 import { motion } from 'motion/react';
-import { SITE_CONFIG } from '../config/site';
+import { useStorefront } from '../context/StorefrontContext';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 import { BoutiqueImage } from './BoutiqueImage';
 import { RevealSection } from './RevealSection';
 
 export function AboutSection() {
   const prefersReducedMotion = usePrefersReducedMotion();
-  const { about } = SITE_CONFIG;
+  const { settings, content } = useStorefront();
+  const { about } = content;
 
   return (
     <section
@@ -66,7 +67,7 @@ export function AboutSection() {
                       src={about.image.src}
                       alt={about.image.alt}
                       loading="lazy"
-                      fallbackTitle={SITE_CONFIG.brandName}
+                      fallbackTitle={settings.brandName}
                       className="h-full w-full object-cover"
                     />
                   </div>

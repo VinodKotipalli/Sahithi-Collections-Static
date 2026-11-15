@@ -1,0 +1,126 @@
+{
+  "entities": {
+    "EnvironmentUser": {
+      "title": "EnvironmentUser",
+      "description": "Server-managed user authentication record isolated per deployment environment.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "full_name": { "type": "string", "minLength": 2, "maxLength": 100 },
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "email_verified": { "type": "boolean" },
+        "phone_e164": { "type": "string", "maxLength": 24 },
+        "phone_verified": { "type": "boolean" },
+        "created_at": { "type": "number" },
+        "updated_at": { "type": "number" }
+      },
+      "required": ["id", "full_name", "email", "email_verified", "created_at", "updated_at"]
+    },
+    "AdminBinding": {
+      "title": "AdminBinding",
+      "description": "Immutable owner user binding record per environment.",
+      "type": "object",
+      "properties": {
+        "owner_user_id": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "bound_email": { "type": "string", "format": "email", "maxLength": 254 },
+        "bound_at": { "type": "number" },
+        "bound_via": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["owner_user_id", "bound_email", "bound_at", "bound_via"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Boutique catalog product document managed by the store owner.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "slug": { "type": "string", "maxLength": 120 },
+        "title": { "type": "string", "minLength": 2, "maxLength": 140 },
+        "category": { "type": "string", "maxLength": 64 },
+        "sku": { "type": "string", "maxLength": 64 },
+        "status": { "type": "string", "enum": ["draft", "published", "archived"] },
+        "price_paise": { "type": "number" },
+        "stock_qty": { "type": "number" },
+        "version": { "type": "number" }
+      },
+      "required": ["id", "slug", "title", "category", "sku", "status", "price_paise", "stock_qty", "version"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "Server-validated customer boutique order.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "order_number": { "type": "string", "maxLength": 64 },
+        "status": { "type": "string", "enum": ["pending", "confirmed", "shipped", "delivered", "cancelled"] },
+        "total_paise": { "type": "number" },
+        "created_at": { "type": "number" }
+      },
+      "required": ["id", "order_number", "status", "total_paise", "created_at"]
+    },
+    "Category": {
+      "title": "Category",
+      "description": "Boutique collection category metadata.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 80 },
+        "slug": { "type": "string", "maxLength": 96 },
+        "position": { "type": "number" }
+      },
+      "required": ["id", "name", "slug", "position"]
+    },
+    "SiteDocument": {
+      "title": "SiteDocument",
+      "description": "Storefront configuration or editorial content JSON document.",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string", "maxLength": 64 },
+        "updated_at": { "type": "number" }
+      },
+      "required": ["key", "updated_at"]
+    },
+    "ContactMessage": {
+      "title": "ContactMessage",
+      "description": "Boutique customer enquiry submitted from the storefront contact form.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "sender_email": { "type": "string", "format": "email", "maxLength": 254 },
+        "status": { "type": "string", "enum": ["unread", "read", "replied", "archived"] },
+        "created_at": { "type": "number" }
+      },
+      "required": ["id", "sender_email", "status", "created_at"]
+    }
+  },
+  "firestore": {
+    "/environments/{envKey}/users/{userId}": {
+      "schema": { "$ref": "#/entities/EnvironmentUser" },
+      "description": "Environment-isolated server-managed user accounts."
+    },
+    "/environments/{envKey}/admin_bindings/{bindingId}": {
+      "schema": { "$ref": "#/entities/AdminBinding" },
+      "description": "Immutable verified store owner binding per environment."
+    },
+    "/environments/{envKey}/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Boutique products managed strictly through backend admin APIs."
+    },
+    "/environments/{envKey}/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/Order" },
+      "description": "Customer orders validated and persisted by backend APIs."
+    },
+    "/environments/{envKey}/categories/{categoryId}": {
+      "schema": { "$ref": "#/entities/Category" },
+      "description": "Storefront product categories managed by admin."
+    },
+    "/environments/{envKey}/site_documents/{docKey}": {
+      "schema": { "$ref": "#/entities/SiteDocument" },
+      "description": "Storefront site settings and editable page content."
+    },
+    "/environments/{envKey}/contact_messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ContactMessage" },
+      "description": "Customer enquiries submitted through the contact form."
+    }
+  }
+}

@@ -1,23 +1,16 @@
 import { RefObject } from 'react';
 import { ArrowUpDown, Search, Sparkles, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
+import { useStorefront } from '../context/StorefrontContext';
 import { CollectionCategory, Product } from '../types/boutique';
 import { ProductCard } from './ProductCard';
 import { RevealSection } from './RevealSection';
 
 export type SortOption = 'newest' | 'price-asc' | 'price-desc' | 'featured';
 
-const CATEGORIES: Array<'All' | CollectionCategory> = [
-  'All',
-  'Ethnic Wear',
-  'Western Wear',
-  'Dresses',
-  'Festive Collection',
-  'Accessories',
-];
-
 interface ProductShowcaseProps {
   products: Product[];
+  isLoading?: boolean;
   selectedCategory: 'All' | CollectionCategory;
   onSelectCategory: (cat: 'All' | CollectionCategory) => void;
   searchQuery: string;
@@ -33,6 +26,7 @@ interface ProductShowcaseProps {
 
 export function ProductShowcase({
   products,
+  isLoading = false,
   selectedCategory,
   onSelectCategory,
   searchQuery,
@@ -45,6 +39,12 @@ export function ProductShowcase({
   onToggleWishlist,
   onQuickView,
 }: ProductShowcaseProps) {
+  const { categories, content } = useStorefront();
+  const { showcaseHeader } = content;
+  const categoryTabs: Array<'All' | CollectionCategory> = [
+    'All',
+    ...categories.map((c) => c.name),
+  ];
   const hasActiveFilters = selectedCategory !== 'All' || searchQuery.trim().length > 0;
 
   return (
@@ -54,14 +54,14 @@ export function ProductShowcase({
           <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
             <div>
               <p className="text-xs font-medium tracking-[0.2em] uppercase text-[#B76E79]">
-                New Arrivals &amp; Signature Pieces
+                {showcaseHeader.kicker}
               </p>
               <h2 className="mt-2 font-serif text-3xl font-semibold tracking-tight text-[#49243E] sm:text-4xl">
-                The Boutique Showcase
+                {showcaseHeader.heading}
               </h2>
             </div>
             <p className="max-w-md text-sm text-[#242124]/75">
-              Browse curated styles with transparent demo pricing in INR. Tap any piece for color options, sizing, and direct boutique enquiry.
+              {showcaseHeader.subtitle}
             </p>
           </div>
         </RevealSection>
@@ -69,7 +69,7 @@ export function ProductShowcase({
         {/* Filter, Search & Sort Controls */}
         <div className="mt-8 flex flex-col gap-4 border-y border-[#49243E]/10 py-5">
           <div className="flex flex-wrap items-center gap-2" role="tablist" aria-label="Filter by collection">
-            {CATEGORIES.map((category) => {
+            {categoryTabs.map((category) => {
               const active = selectedCategory === category;
               return (
                 <button
@@ -145,8 +145,22 @@ export function ProductShowcase({
           </div>
         </div>
 
-        {/* Product Grid or Empty State */}
-        {products.length > 0 ? (
+        {/* Product Grid, Loading Skeletons, or Empty State */}
+        {isLoading ? (
+          <div className="mt-8 grid grid-cols-1 gap-5 min-[360px]:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 sm:gap-6">
+            {Array.from({ length: 4 }).map((_, idx) => (
+              <div
+                key={idx}
+                className="overflow-hidden rounded-2xl border border-[#49243E]/10 bg-white p-3.5"
+              >
+                <div className="aspect-[3/4] w-full animate-pulse rounded-xl bg-[#F3D5DF]/35" />
+                <div className="mt-4 h-3 w-20 animate-pulse rounded bg-[#49243E]/10" />
+                <div className="mt-2 h-5 w-3/4 animate-pulse rounded bg-[#49243E]/12" />
+                <div className="mt-4 h-8 w-full animate-pulse rounded-lg bg-[#49243E]/8" />
+              </div>
+            ))}
+          </div>
+        ) : products.length > 0 ? (
           <motion.div
             layout
             className="mt-8 grid grid-cols-1 gap-5 min-[360px]:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 sm:gap-6"

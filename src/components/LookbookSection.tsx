@@ -1,5 +1,5 @@
 import { Expand } from 'lucide-react';
-import { LOOKBOOK_ENTRIES } from '../config/lookbook';
+import { useStorefront } from '../context/StorefrontContext';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 import { LookbookEntry } from '../types/boutique';
 import { BoutiqueImage } from './BoutiqueImage';
@@ -23,6 +23,8 @@ function getLayoutClasses(layout: LookbookEntry['layout']): string {
 
 export function LookbookSection({ onOpenLightbox }: LookbookSectionProps) {
   const prefersReducedMotion = usePrefersReducedMotion();
+  const { content } = useStorefront();
+  const { lookbookHeader, lookbookEntries } = content;
 
   return (
     <section id="lookbook" className="py-16 sm:py-24 bg-[#FFF9F5]">
@@ -31,20 +33,20 @@ export function LookbookSection({ onOpenLightbox }: LookbookSectionProps) {
           <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between border-b border-[#49243E]/10 pb-6">
             <div>
               <p className="text-xs font-medium tracking-[0.2em] uppercase text-[#B76E79]">
-                Editorial Journal
+                {lookbookHeader.kicker}
               </p>
               <h2 className="mt-2 font-serif text-3xl font-semibold tracking-tight text-[#49243E] sm:text-4xl">
-                The Style Lookbook
+                {lookbookHeader.heading}
               </h2>
             </div>
             <p className="max-w-md text-sm leading-relaxed text-[#242124]/75">
-              Tap any frame to view full-resolution styling notes in our editorial lightbox.
+              {lookbookHeader.subtitle}
             </p>
           </div>
         </RevealSection>
 
         <div className="mt-10 grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-3 md:auto-rows-[240px] lg:auto-rows-[275px] sm:gap-5">
-          {LOOKBOOK_ENTRIES.map((entry, idx) => (
+          {lookbookEntries.map((entry, idx) => (
             <RevealSection
               key={entry.id}
               delay={idx * 0.04}

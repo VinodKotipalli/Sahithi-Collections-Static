@@ -87,7 +87,7 @@ export function WishlistDrawer({
                     Your wishlist is empty
                   </h3>
                   <p className="mt-2 text-sm leading-relaxed text-[#242124]/70">
-                    Tap the heart icon on any dress, ethnic ensemble, or accessory to save your favorite styles here.
+                    Tap the heart icon on any dress, ethnic ensemble, or accessory to save your favorite styles here. Favorites stay saved on this browser and device without creating an account.
                   </p>
                   <a
                     href="#new-arrivals"
@@ -166,13 +166,13 @@ export function WishlistDrawer({
             {/* Footer */}
             {items.length > 0 && (
               <div className="border-t border-[#49243E]/10 bg-[#FFF9F5] px-5 py-4 flex items-center justify-between gap-3">
-                <span className="text-xs text-[#242124]/70">
-                  Saved locally in your browser
+                <span className="text-xs leading-snug text-[#242124]/70">
+                  Saved on this browser &amp; device only
                 </span>
                 <button
                   type="button"
                   onClick={onClearAll}
-                  className="min-h-[40px] rounded-xl border border-[#49243E]/20 px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/40"
+                  className="min-h-[40px] shrink-0 rounded-xl border border-[#49243E]/20 px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/40"
                 >
                   Clear All
                 </button>

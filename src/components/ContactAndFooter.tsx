@@ -1,15 +1,36 @@
-import { Instagram, Mail, MapPin, MessageCircle } from 'lucide-react';
+import { useState, type FormEvent } from 'react';
+import {
+  CheckCircle2,
+  Instagram,
+  Loader2,
+  Mail,
+  MapPin,
+  MessageCircle,
+  Send,
+} from 'lucide-react';
 import {
   isAddressConfigured,
   isEmailConfigured,
   isInstagramConfigured,
   isWhatsAppConfigured,
-  SITE_CONFIG,
 } from '../config/site';
+import { useAuth } from '../context/AuthContext';
+import { useStorefront } from '../context/StorefrontContext';
 import { RevealSection } from './RevealSection';
 
-export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) {
-  const { contact } = SITE_CONFIG;
+interface ContactAndFooterProps {
+  onNavigateAuth?: () => void;
+  accountLabel?: string;
+}
+
+export function ContactAndFooter({
+  onNavigateAuth,
+  accountLabel = 'Account / Login',
+}: ContactAndFooterProps) {
+  const { apiRequest } = useAuth();
+  const { settings } = useStorefront();
+  const { contact, socialLinks, brandName, tagline, logoUrl } = settings;
+
   const hasWhatsApp = isWhatsAppConfigured(contact);
   const hasInstagram = isInstagramConfigured(contact);
   const hasEmail = isEmailConfigured(contact);
@@ -18,6 +39,57 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
 
   const cleanInstagramHandle = contact.instagramHandle.replace(/^@/, '').trim();
   const cleanWhatsApp = contact.whatsappNumber.replace(/\D/g, '');
+  const instagramLink =
+    socialLinks.instagramUrl ||
+    (hasInstagram ? `https://instagram.com/${cleanInstagramHandle}` : '');
+
+  const [senderName, setSenderName] = useState('');
+  const [senderEmail, setSenderEmail] = useState('');
+  const [senderPhone, setSenderPhone] = useState('');
+  const [subject, setSubject] = useState('');
+  const [message, setMessage] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitSuccess, setSubmitSuccess] = useState<string | null>(null);
+
+  const handleEnquirySubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (submitting) return;
+    setSubmitError(null);
+    setSubmitSuccess(null);
+    setSubmitting(true);
+    try {
+      const res = await apiRequest<{ id: string; message: string }>('/api/contact', {
+        method: 'POST',
+        body: JSON.stringify({
+          senderName,
+          senderEmail,
+          senderPhone,
+          subject,
+          message,
+        }),
+      });
+      if (!res.ok) {
+        setSubmitError(res.error);
+        return;
+      }
+      setSenderName('');
+      setSenderEmail('');
+      setSenderPhone('');
+      setSubject('');
+      setMessage('');
+      setSubmitSuccess(res.data.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const activeSocials = [
+    { label: 'Instagram', url: instagramLink },
+    { label: 'Facebook', url: socialLinks.facebookUrl },
+    { label: 'Pinterest', url: socialLinks.pinterestUrl },
+    { label: 'YouTube', url: socialLinks.youtubeUrl },
+  ].filter((item) => item.url.trim().length > 0);
 
   return (
     <>
@@ -30,15 +102,11 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
                   Boutique Concierge
                 </p>
                 <h2 className="mt-2 font-serif text-3xl font-semibold tracking-tight text-[#49243E] sm:text-4xl">
-                  Connect With Sahithi Collections
+                  Connect With {brandName}
                 </h2>
               </div>
               <p className="max-w-md text-sm leading-relaxed text-[#242124]/75">
-                Reach out directly through your preferred channel once boutique details are configured in{' '}
-                <code className="rounded bg-[#F3D5DF]/40 px-1.5 py-0.5 font-mono text-xs text-[#49243E]">
-                  src/config/site.ts
-                </code>
-                .
+                Reach out for sizing guidance, custom outfit styling, or bridal and festive enquiries with our boutique team.
               </p>
             </div>
           </RevealSection>
@@ -60,8 +128,7 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
                     </p>
                   ) : (
                     <p className="mt-2 text-sm text-[#242124]/65">
-                      Placeholder — add your boutique WhatsApp number in{' '}
-                      <code className="font-mono text-xs">site.ts</code> to enable product enquiries.
+                      Personal styling consultations and bespoke sizing advice via our enquiry desk.
                     </p>
                   )}
                 </div>
@@ -76,9 +143,12 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
                     Message on WhatsApp
                   </a>
                 ) : (
-                  <span className="mt-5 inline-block text-xs font-medium text-[#B76E79]">
-                    Status: Pending setup
-                  </span>
+                  <a
+                    href="#boutique-enquiry-form"
+                    className="mt-5 inline-flex min-h-[42px] items-center justify-center rounded-xl border border-[#49243E]/20 px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/35"
+                  >
+                    Send an Enquiry
+                  </a>
                 )}
               </div>
             </RevealSection>
@@ -97,15 +167,14 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
                     <p className="mt-2 text-sm text-[#242124]/80">@{cleanInstagramHandle}</p>
                   ) : (
                     <p className="mt-2 text-sm text-[#242124]/65">
-                      Placeholder — add your Instagram handle in{' '}
-                      <code className="font-mono text-xs">site.ts</code> to activate Follow Our Style.
+                      Explore seasonal lookbooks, festive edits, and daily atelier styling inspiration.
                     </p>
                   )}
                 </div>
 
-                {hasInstagram ? (
+                {instagramLink ? (
                   <a
-                    href={`https://instagram.com/${cleanInstagramHandle}`}
+                    href={instagramLink}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="mt-5 inline-flex min-h-[42px] items-center justify-center rounded-xl border border-[#49243E]/25 px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#49243E] hover:text-[#FFF9F5]"
@@ -113,9 +182,12 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
                     Follow Our Style
                   </a>
                 ) : (
-                  <span className="mt-5 inline-block text-xs font-medium text-[#B76E79]">
-                    Status: Pending setup
-                  </span>
+                  <a
+                    href="#lookbook"
+                    className="mt-5 inline-flex min-h-[42px] items-center justify-center rounded-xl border border-[#49243E]/20 px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/35"
+                  >
+                    Browse Lookbook
+                  </a>
                 )}
               </div>
             </RevealSection>
@@ -134,8 +206,7 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
                     <p className="mt-2 break-all text-sm text-[#242124]/80">{contact.email}</p>
                   ) : (
                     <p className="mt-2 text-sm text-[#242124]/65">
-                      Placeholder — configure your boutique email address in{' '}
-                      <code className="font-mono text-xs">site.ts</code>.
+                      Direct concierge inbox for order updates, custom measurements, and gifting.
                     </p>
                   )}
                 </div>
@@ -148,9 +219,12 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
                     Send an Email
                   </a>
                 ) : (
-                  <span className="mt-5 inline-block text-xs font-medium text-[#B76E79]">
-                    Status: Pending setup
-                  </span>
+                  <a
+                    href="#boutique-enquiry-form"
+                    className="mt-5 inline-flex min-h-[42px] items-center justify-center rounded-xl border border-[#49243E]/20 px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/35"
+                  >
+                    Write to Us
+                  </a>
                 )}
               </div>
             </RevealSection>
@@ -163,7 +237,7 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
                     <MapPin className="h-5 w-5" aria-hidden="true" />
                   </div>
                   <h3 className="mt-4 font-serif text-xl font-semibold text-[#49243E]">
-                    Store Address
+                    Atelier Showroom
                   </h3>
                   {hasAddress ? (
                     <p className="mt-2 text-sm leading-relaxed text-[#242124]/80">
@@ -171,34 +245,197 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
                     </p>
                   ) : (
                     <p className="mt-2 text-sm text-[#242124]/65">
-                      Placeholder — add your showroom or studio street address in{' '}
-                      <code className="font-mono text-xs">site.ts</code>.
+                      Private appointments and curated collections crafted for your special occasions.
                     </p>
                   )}
                 </div>
 
-                <span className="mt-5 inline-block text-xs font-medium text-[#49243E]/70">
-                  {hasAddress ? contact.hoursNote : 'Status: Pending setup'}
+                <span className="mt-5 inline-block text-xs font-medium text-[#49243E]/75">
+                  {contact.hoursNote || 'Mon – Sat · 10:30 AM – 8:00 PM IST'}
                 </span>
               </div>
             </RevealSection>
           </div>
+
+          {/* Direct Boutique Enquiry Form */}
+          <RevealSection delay={0.18}>
+            <div
+              id="boutique-enquiry-form"
+              className="mt-8 rounded-3xl border border-[#49243E]/12 bg-white p-6 sm:p-8"
+            >
+              <div className="grid grid-cols-1 gap-8 lg:grid-cols-12">
+                <div className="lg:col-span-5">
+                  <p className="text-xs font-medium tracking-[0.2em] uppercase text-[#B76E79]">
+                    Direct Message
+                  </p>
+                  <h3 className="mt-2 font-serif text-2xl font-semibold text-[#49243E] sm:text-3xl">
+                    Send a Boutique Enquiry
+                  </h3>
+                  <p className="mt-2.5 text-sm leading-relaxed text-[#242124]/75">
+                    Have a question about fabric details, custom sizing, or availability? Leave us a note and our team will respond promptly.
+                  </p>
+                  {activeSocials.length > 0 && (
+                    <div className="mt-5 flex flex-wrap gap-2">
+                      {activeSocials.map((soc) => (
+                        <a
+                          key={soc.label}
+                          href={soc.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex min-h-[38px] items-center rounded-xl border border-[#49243E]/18 px-3.5 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/40"
+                        >
+                          {soc.label}
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <form onSubmit={handleEnquirySubmit} className="space-y-4 lg:col-span-7">
+                  {submitError && (
+                    <div
+                      role="alert"
+                      className="rounded-xl border border-[#B76E79]/50 bg-[#F3D5DF]/35 px-4 py-3 text-xs font-medium text-[#49243E]"
+                    >
+                      {submitError}
+                    </div>
+                  )}
+                  {submitSuccess && (
+                    <div
+                      role="status"
+                      className="flex items-center gap-2 rounded-xl border border-[#166534]/25 bg-[#F0FDF4] px-4 py-3 text-xs font-medium text-[#166534]"
+                    >
+                      <CheckCircle2 className="h-4 w-4 shrink-0" aria-hidden="true" />
+                      <span>{submitSuccess}</span>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <div>
+                      <label htmlFor="enquiry-name" className="block text-xs font-medium text-[#49243E]">
+                        Your Name
+                      </label>
+                      <input
+                        id="enquiry-name"
+                        type="text"
+                        required
+                        minLength={2}
+                        maxLength={100}
+                        value={senderName}
+                        onChange={(e) => setSenderName(e.target.value)}
+                        placeholder="Ananya Rao"
+                        className="mt-1 h-11 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3.5 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="enquiry-email" className="block text-xs font-medium text-[#49243E]">
+                        Email Address
+                      </label>
+                      <input
+                        id="enquiry-email"
+                        type="email"
+                        required
+                        value={senderEmail}
+                        onChange={(e) => setSenderEmail(e.target.value)}
+                        placeholder="you@example.com"
+                        className="mt-1 h-11 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3.5 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <div>
+                      <label htmlFor="enquiry-phone" className="block text-xs font-medium text-[#49243E]">
+                        Phone / WhatsApp (optional)
+                      </label>
+                      <input
+                        id="enquiry-phone"
+                        type="tel"
+                        maxLength={24}
+                        value={senderPhone}
+                        onChange={(e) => setSenderPhone(e.target.value)}
+                        placeholder="+91 98765 43210"
+                        className="mt-1 h-11 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3.5 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="enquiry-subject" className="block text-xs font-medium text-[#49243E]">
+                        Subject
+                      </label>
+                      <input
+                        id="enquiry-subject"
+                        type="text"
+                        required
+                        minLength={2}
+                        maxLength={140}
+                        value={subject}
+                        onChange={(e) => setSubject(e.target.value)}
+                        placeholder="Custom sizing or order enquiry"
+                        className="mt-1 h-11 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3.5 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label htmlFor="enquiry-message" className="block text-xs font-medium text-[#49243E]">
+                      Message
+                    </label>
+                    <textarea
+                      id="enquiry-message"
+                      rows={3}
+                      required
+                      minLength={5}
+                      maxLength={2000}
+                      value={message}
+                      onChange={(e) => setMessage(e.target.value)}
+                      placeholder="Share the design name, size preference, or occasion date..."
+                      className="mt-1 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 p-3.5 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
+                    />
+                  </div>
+
+                  <div className="flex justify-end">
+                    <button
+                      type="submit"
+                      disabled={submitting}
+                      className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-[#49243E] px-6 text-sm font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31] disabled:opacity-60"
+                    >
+                      {submitting ? (
+                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                      ) : (
+                        <Send className="h-4 w-4" aria-hidden="true" />
+                      )}
+                      <span>{submitting ? 'Sending enquiry...' : 'Send Enquiry'}</span>
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </RevealSection>
         </div>
       </section>
 
       <footer className="bg-[#49243E] py-12 text-[#FFF9F5]">
         <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
           <div className="flex flex-col gap-8 border-b border-[#FFF9F5]/15 pb-8 md:flex-row md:items-center md:justify-between">
-            <div>
-              <a
-                href="#home"
-                className="font-serif text-2xl font-semibold tracking-tight text-[#FFF9F5]"
-              >
-                {SITE_CONFIG.brandName}
-              </a>
-              <p className="mt-1.5 text-sm italic font-serif text-[#F3D5DF]">
-                {SITE_CONFIG.tagline}
-              </p>
+            <div className="flex items-center gap-3">
+              {logoUrl && (
+                <img
+                  src={logoUrl}
+                  alt=""
+                  className="h-10 w-10 rounded-full border border-[#FFF9F5]/25 object-cover"
+                />
+              )}
+              <div>
+                <a
+                  href="#home"
+                  className="font-serif text-2xl font-semibold tracking-tight text-[#FFF9F5]"
+                >
+                  {brandName}
+                </a>
+                <p className="mt-1 text-sm italic font-serif text-[#F3D5DF]">
+                  {tagline}
+                </p>
+              </div>
             </div>
 
             <nav aria-label="Footer navigation" className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-[#FFF9F5]/85">
@@ -220,34 +457,35 @@ export function ContactAndFooter({ onOpenLogin }: { onOpenLogin?: () => void }) 
               <a href="#contact" className="transition-colors hover:text-[#F3D5DF]">
                 Contact
               </a>
-              {onOpenLogin && (
+              {onNavigateAuth && (
                 <button
                   type="button"
-                  onClick={onOpenLogin}
+                  onClick={onNavigateAuth}
                   className="transition-colors hover:text-[#F3D5DF]"
                 >
-                  Login
+                  {accountLabel}
                 </button>
               )}
-              {hasInstagram && (
+              {activeSocials.map((soc) => (
                 <a
-                  href={`https://instagram.com/${cleanInstagramHandle}`}
+                  key={soc.label}
+                  href={soc.url}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="font-medium text-[#F3D5DF] transition-colors hover:text-[#FFF9F5]"
                 >
-                  Follow Our Style
+                  {soc.label}
                 </a>
-              )}
+              ))}
             </nav>
           </div>
 
           <div className="mt-6 flex flex-col gap-2 text-xs text-[#FFF9F5]/70 sm:flex-row sm:items-center sm:justify-between">
             <p>
-              &copy; {currentYear} {SITE_CONFIG.brandName}. All rights reserved.
+              &copy; {currentYear} {brandName}. All rights reserved.
             </p>
             <p>
-              Showcase product listings and INR prices are editable demo catalog entries.
+              Crafted boutique apparel &amp; accessories · Live INR catalog.
             </p>
           </div>
         </div>

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { ArrowUpRight } from 'lucide-react';
-import { COLLECTIONS } from '../config/collections';
+import { useStorefront } from '../context/StorefrontContext';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 import { CollectionCategory } from '../types/boutique';
 import { BoutiqueImage } from './BoutiqueImage';
@@ -12,7 +12,20 @@ interface CollectionsSectionProps {
 
 export function CollectionsSection({ onSelectCollection }: CollectionsSectionProps) {
   const prefersReducedMotion = usePrefersReducedMotion();
+  const { categories, content } = useStorefront();
   const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const { collectionsHeader } = content;
+
+  const gridColsClass =
+    categories.length <= 2
+      ? 'sm:grid-cols-2 lg:grid-cols-2'
+      : categories.length === 3
+        ? 'sm:grid-cols-2 lg:grid-cols-3'
+        : categories.length === 4
+          ? 'sm:grid-cols-2 lg:grid-cols-4'
+          : categories.length === 5
+            ? 'sm:grid-cols-2 lg:grid-cols-5'
+            : 'sm:grid-cols-2 lg:grid-cols-4';
 
   return (
     <section id="collections" className="py-16 sm:py-24 bg-[#FFF9F5]">
@@ -21,26 +34,26 @@ export function CollectionsSection({ onSelectCollection }: CollectionsSectionPro
           <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between border-b border-[#49243E]/10 pb-6">
             <div>
               <p className="text-xs font-medium tracking-[0.2em] uppercase text-[#B76E79]">
-                Curated Worlds
+                {collectionsHeader.kicker}
               </p>
               <h2 className="mt-2 font-serif text-3xl font-semibold tracking-tight text-[#49243E] sm:text-4xl">
-                Shop by Collection
+                {collectionsHeader.heading}
               </h2>
             </div>
             <p className="max-w-md text-sm leading-relaxed text-[#242124]/75">
-              Select a silhouette story to filter the showcase and discover pieces tailored for your occasion.
+              {collectionsHeader.subtitle}
             </p>
           </div>
         </RevealSection>
 
-        <div className="mt-10 grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-5">
-          {COLLECTIONS.map((col, index) => {
+        <div className={`mt-10 grid grid-cols-1 gap-5 ${gridColsClass}`}>
+          {categories.map((col, index) => {
             const isHovered = hoveredId === col.id;
             return (
               <RevealSection key={col.id} delay={index * 0.05}>
                 <button
                   type="button"
-                  onClick={() => onSelectCollection(col.category)}
+                  onClick={() => onSelectCollection(col.name)}
                   onMouseEnter={() => setHoveredId(col.id)}
                   onMouseLeave={() => setHoveredId(null)}
                   className={`group relative flex w-full flex-col overflow-hidden rounded-2xl border border-[#49243E]/10 bg-white text-left transition-all duration-300 ${
@@ -51,10 +64,10 @@ export function CollectionsSection({ onSelectCollection }: CollectionsSectionPro
                 >
                   <div className="relative aspect-[3/4] w-full overflow-hidden bg-[#F3D5DF]/25">
                     <BoutiqueImage
-                      src={col.image}
-                      alt={col.alt}
+                      src={col.imageUrl}
+                      alt={col.altText || col.name}
                       loading="lazy"
-                      fallbackTitle={col.category}
+                      fallbackTitle={col.name}
                       className={`h-full w-full object-cover object-top transition-transform duration-500 ease-out ${
                         !prefersReducedMotion && isHovered ? 'scale-105' : 'scale-100'
                       }`}
@@ -66,7 +79,7 @@ export function CollectionsSection({ onSelectCollection }: CollectionsSectionPro
                     <div className="absolute inset-x-0 bottom-0 p-4 text-[#FFF9F5]">
                       <div className="flex items-center justify-between gap-2">
                         <h3 className="font-serif text-xl font-semibold tracking-tight">
-                          {col.category}
+                          {col.name}
                         </h3>
                         <ArrowUpRight
                           className={`h-4 w-4 shrink-0 text-[#F3D5DF] transition-transform duration-200 ${

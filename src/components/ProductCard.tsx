@@ -154,9 +154,27 @@ export function ProductCard({
 
         {/* Price + Quick View Action (always reachable on touch & desktop) */}
         <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-[#49243E]/8 pt-3">
-          <span className="text-base font-semibold tabular-nums text-[#242124]">
-            {formatINR(product.price)}
-          </span>
+          <div className="flex flex-col">
+            <div className="flex items-baseline gap-2">
+              <span className="text-base font-semibold tabular-nums text-[#242124]">
+                {formatINR(product.price)}
+              </span>
+              {product.compareAtPrice && product.compareAtPrice > product.price && (
+                <span className="text-xs line-through tabular-nums text-[#242124]/45">
+                  {formatINR(product.compareAtPrice)}
+                </span>
+              )}
+            </div>
+            {product.stockQty !== undefined && product.stockQty === 0 ? (
+              <span className="text-[11px] font-medium text-[#B76E79]">Out of stock</span>
+            ) : product.stockQty !== undefined &&
+              product.lowStockThreshold !== undefined &&
+              product.stockQty <= product.lowStockThreshold ? (
+              <span className="text-[11px] font-medium text-[#49243E]/75 tabular-nums">
+                Only {product.stockQty} left
+              </span>
+            ) : null}
+          </div>
 
           <button
             type="button"

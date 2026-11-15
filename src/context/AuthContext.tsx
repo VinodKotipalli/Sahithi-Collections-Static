@@ -1,381 +1,612 @@
-import { createContext, ReactNode, useCallback, useContext, useEffect, useState } from 'react';
-import { Session, User } from '@supabase/supabase-js';
-import {
-  AUTH_CONFIG,
-  isAppleAuthConfigured,
-  isGoogleAuthConfigured,
-  isSmsOtpConfigured,
-  isSupabaseConfigured,
-  sanitizeInternalRedirectPath,
-} from '../config/auth';
-import { getSupabaseClient } from '../lib/supabase';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 
-export interface AuthActionResult {
-  error: string | null;
-  needsEmailVerification?: boolean;
-  needsNameCompletion?: boolean;
-  neutralMessage?: string;
+export interface AuthUser {
+  id: string;
+  fullName: string;
+  email: string | null;
+  emailVerified: boolean;
+  hasPassword: boolean;
+  isOwner: boolean;
+  recentReauthValid: boolean;
+  recentReauthExpiresAt: number;
 }
+
+export interface AuthCapabilities {
+  emailDeliveryConfigured: boolean;
+  emailPasswordEnabled?: boolean;
+  providerStatusReason?: string | null;
+  firebaseProjectId?: string | null;
+  passwordMinLength: number;
+  authMode?: 'local' | 'firebase_managed';
+  environmentTarget?: string;
+  databaseBackend?: 'firestore' | 'sqlite';
+}
+
+export type ApiResult<T> =
+  | { ok: true; data: T }
+  | {
+      ok: false;
+      status: number;
+      code?: string;
+      requestId?: string;
+      retryAfterSeconds?: number;
+      error: string;
+      fieldErrors?: Record<string, string>;
+    };
 
 interface AuthContextValue {
-  user: User | null;
-  session: Session | null;
+  user: AuthUser | null;
+  capabilities: AuthCapabilities;
   isLoadingSession: boolean;
-  isConfigured: boolean;
-  isSmsConfigured: boolean;
-  isGoogleConfigured: boolean;
-  isAppleConfigured: boolean;
-  isRecoverySession: boolean;
-  clearRecoverySession: () => void;
-  signInWithEmail: (email: string, password: string) => Promise<AuthActionResult>;
-  signUpWithEmail: (
+  refreshSession: () => Promise<void>;
+  refreshCapabilities: () => Promise<AuthCapabilities | null>;
+  loginWithEmail: (email: string, password: string) => Promise<ApiResult<{ user: AuthUser }>>;
+  registerWithEmail: (
     fullName: string,
     email: string,
+    password: string,
+    confirmPassword: string
+  ) => Promise<
+    ApiResult<{
+      message: string;
+      acceptedByProvider?: boolean;
+      cooldownSeconds?: number;
+      requestId?: string;
+    }>
+  >;
+  resendVerificationEmail: (
+    email: string,
+    password?: string
+  ) => Promise<
+    ApiResult<{
+      message: string;
+      alreadyVerified?: boolean;
+      acceptedByProvider?: boolean;
+      cooldownSeconds?: number;
+      requestId?: string;
+    }>
+  >;
+  verifyEmailToken: (
+    token: string
+  ) => Promise<
+    ApiResult<{
+      message: string;
+      purpose: 'verify_email' | 'link_email';
+      user?: AuthUser;
+      verifiedEmail?: string;
+    }>
+  >;
+  requestPasswordReset: (email: string) => Promise<ApiResult<{ message: string }>>;
+  resetPassword: (token: string, password: string) => Promise<ApiResult<{ message: string }>>;
+  updateProfileName: (fullName: string) => Promise<ApiResult<{ user: AuthUser }>>;
+  reauthenticateWithPassword: (
     password: string
-  ) => Promise<AuthActionResult>;
-  sendPasswordReset: (email: string) => Promise<AuthActionResult>;
-  updatePassword: (newPassword: string) => Promise<AuthActionResult>;
-  sendPhoneOtp: (e164Phone: string, captchaToken?: string) => Promise<AuthActionResult>;
-  verifyPhoneOtp: (e164Phone: string, token: string) => Promise<AuthActionResult>;
-  updateProfileName: (fullName: string) => Promise<AuthActionResult>;
-  signInWithOAuth: (provider: 'google' | 'apple', returnTo?: string) => Promise<AuthActionResult>;
-  signOut: () => Promise<void>;
+  ) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
+  changePassword: (newPassword: string) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
+  requestLinkEmail: (email: string) => Promise<ApiResult<{ message: string }>>;
+  logout: () => Promise<ApiResult<{ message: string }>>;
+  loginAdminWithEmail: (
+    email: string,
+    password: string
+  ) => Promise<ApiResult<{ user: AuthUser; ownerBinding: { boundAt: number; boundVia: string } }>>;
+  activateAdminAccount: (
+    email: string,
+    password: string,
+    confirmPassword: string
+  ) => Promise<
+    ApiResult<{
+      requiresVerification: boolean;
+      email: string;
+      message: string;
+      acceptedByProvider?: boolean;
+      cooldownSeconds?: number;
+    }>
+  >;
+  confirmAdminActivation: (
+    token: string
+  ) => Promise<ApiResult<{ verified: boolean; email: string; message: string }>>;
+  resendAdminVerification: (
+    email: string,
+    password?: string
+  ) => Promise<
+    ApiResult<{
+      message: string;
+      alreadyVerified?: boolean;
+      acceptedByProvider?: boolean;
+      cooldownSeconds?: number;
+    }>
+  >;
+  requestAdminPasswordReset: (email: string) => Promise<ApiResult<{ message: string }>>;
+  confirmAdminPasswordReset: (
+    token: string,
+    password: string
+  ) => Promise<ApiResult<{ message: string }>>;
+  apiRequest: <T>(path: string, options?: RequestInit) => Promise<ApiResult<T>>;
 }
+
+const DEFAULT_CAPABILITIES: AuthCapabilities = {
+  emailDeliveryConfigured: false,
+  emailPasswordEnabled: true,
+  providerStatusReason: null,
+  passwordMinLength: 8,
+  authMode: 'local',
+};
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-const OAUTH_RETURN_KEY = 'sahithi_auth_return_to';
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [capabilities, setCapabilities] = useState<AuthCapabilities>(DEFAULT_CAPABILITIES);
+  const [isLoadingSession, setIsLoadingSession] = useState(true);
+  const csrfTokenRef = useRef<string>('');
+  const isLoggingOutRef = useRef<boolean>(false);
 
-export function getStoredOAuthReturnPath(): string {
-  if (typeof window === 'undefined') return '/';
-  try {
-    const val = window.sessionStorage.getItem(OAUTH_RETURN_KEY);
-    window.sessionStorage.removeItem(OAUTH_RETURN_KEY);
-    return sanitizeInternalRedirectPath(val);
-  } catch {
-    return '/';
-  }
-}
+  const syncSessionAndCapabilities = useCallback(async () => {
+    try {
+      const [sessionRes, capRes] = await Promise.all([
+        fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' }),
+        fetch('/api/auth/capabilities?refresh=1', { credentials: 'include', cache: 'no-store' }),
+      ]);
 
-function mapEmailSignInError(message: string): string {
-  const lower = message.toLowerCase();
-  if (lower.includes('rate limit') || lower.includes('too many')) {
-    return 'Too many sign-in attempts. Please wait a moment and try again.';
-  }
-  if (lower.includes('email not confirmed')) {
-    return 'Please verify your email address using the link sent to your inbox before signing in.';
-  }
-  return 'Invalid email or password. Please check your details and try again.';
-}
+      if (sessionRes.ok) {
+        const sessionData = (await sessionRes.json()) as {
+          authenticated: boolean;
+          csrfToken?: string;
+          user: AuthUser | null;
+        };
+        if (sessionData.csrfToken) {
+          csrfTokenRef.current = sessionData.csrfToken;
+        }
+        if (!isLoggingOutRef.current) {
+          setUser(sessionData.authenticated ? sessionData.user : null);
+        }
+      }
 
-function mapOtpError(message: string): string {
-  const lower = message.toLowerCase();
-  if (lower.includes('expired')) {
-    return 'This verification code has expired. Please request a new code.';
-  }
-  if (lower.includes('rate limit') || lower.includes('too many') || lower.includes('wait')) {
-    return 'Too many verification attempts. Please wait before requesting or entering another code.';
-  }
-  if (lower.includes('invalid') || lower.includes('token')) {
-    return 'The verification code is incorrect. Please check the digits and try again.';
-  }
-  if (lower.includes('sms') || lower.includes('provider') || lower.includes('delivery')) {
-    return 'Unable to deliver the SMS right now. Please check your number or try again shortly.';
-  }
-  return 'Could not complete mobile verification. Please try again.';
-}
+      if (capRes.ok) {
+        const capData = (await capRes.json()) as AuthCapabilities;
+        setCapabilities(capData);
+      }
+    } catch {
+      // Leave current session state intact if network request fails momentarily
+    } finally {
+      setIsLoadingSession(false);
+    }
+  }, []);
 
-export function AuthProvider({
-  children,
-  onRecoveryDetected,
-}: {
-  children: ReactNode;
-  onRecoveryDetected?: () => void;
-}) {
-  const [session, setSession] = useState<Session | null>(null);
-  const [isLoadingSession, setIsLoadingSession] = useState<boolean>(() => isSupabaseConfigured());
-  const [isRecoverySession, setIsRecoverySession] = useState(false);
-
-  const isConfigured = isSupabaseConfigured();
-  const isSmsConfigured = isSmsOtpConfigured();
-  const isGoogleConfigured = isGoogleAuthConfigured();
-  const isAppleConfigured = isAppleAuthConfigured();
+  const refreshCapabilities = useCallback(async (): Promise<AuthCapabilities | null> => {
+    try {
+      const capRes = await fetch('/api/auth/capabilities?refresh=1', {
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!capRes.ok) return null;
+      const capData = (await capRes.json()) as AuthCapabilities;
+      setCapabilities(capData);
+      return capData;
+    } catch {
+      return null;
+    }
+  }, []);
 
   useEffect(() => {
-    const supabase = getSupabaseClient();
-    if (!supabase) {
-      setIsLoadingSession(false);
-      return;
-    }
-
-    let mounted = true;
-
-    supabase.auth
-      .getSession()
-      .then(({ data }) => {
-        if (!mounted) return;
-        setSession(data.session ?? null);
-        setIsLoadingSession(false);
-      })
-      .catch(() => {
-        if (!mounted) return;
-        setIsLoadingSession(false);
-      });
-
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((event, nextSession) => {
-      if (!mounted) return;
-      setSession(nextSession);
-      if (event === 'PASSWORD_RECOVERY') {
-        setIsRecoverySession(true);
-        onRecoveryDetected?.();
-      } else if (event === 'SIGNED_OUT') {
-        setIsRecoverySession(false);
+    void syncSessionAndCapabilities();
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        void syncSessionAndCapabilities();
       }
-    });
-
-    return () => {
-      mounted = false;
-      subscription.unsubscribe();
     };
-  }, [onRecoveryDetected]);
+    window.addEventListener('pageshow', handlePageShow);
+    return () => window.removeEventListener('pageshow', handlePageShow);
+  }, [syncSessionAndCapabilities]);
 
-  const clearRecoverySession = useCallback(() => {
-    setIsRecoverySession(false);
+  const ensureCsrfToken = useCallback(async (forceRefresh = false): Promise<string> => {
+    if (!forceRefresh && csrfTokenRef.current) {
+      return csrfTokenRef.current;
+    }
+    const res = await fetch('/api/auth/session', {
+      credentials: 'include',
+      cache: 'no-store',
+    });
+    if (res.ok) {
+      const data = (await res.json()) as {
+        csrfToken?: string;
+        authenticated: boolean;
+        user: AuthUser | null;
+      };
+      if (data.csrfToken) {
+        csrfTokenRef.current = data.csrfToken;
+      }
+      setUser(data.authenticated ? data.user : null);
+    }
+    return csrfTokenRef.current;
   }, []);
 
-  const signInWithEmail = useCallback(
-    async (email: string, password: string): Promise<AuthActionResult> => {
-      const supabase = getSupabaseClient();
-      if (!supabase) {
-        return { error: 'Authentication provider is not configured yet.' };
-      }
-      const { error } = await supabase.auth.signInWithPassword({
-        email: email.trim(),
-        password,
-      });
-      if (error) {
-        return { error: mapEmailSignInError(error.message) };
-      }
-      return { error: null };
-    },
-    []
-  );
-
-  const signUpWithEmail = useCallback(
-    async (fullName: string, email: string, password: string): Promise<AuthActionResult> => {
-      const supabase = getSupabaseClient();
-      if (!supabase) {
-        return { error: 'Authentication provider is not configured yet.' };
-      }
-
-      const redirectUrl =
-        typeof window !== 'undefined' ? `${window.location.origin}/auth/callback` : undefined;
-
-      const { data, error } = await supabase.auth.signUp({
-        email: email.trim(),
-        password,
-        options: {
-          emailRedirectTo: redirectUrl,
-          data: {
-            full_name: fullName.trim(),
-          },
-        },
-      });
-
-      if (error) {
-        const lower = error.message.toLowerCase();
-        if (lower.includes('rate limit') || lower.includes('too many')) {
-          return { error: 'Too many sign-up requests. Please wait a moment and try again.' };
+  const requestApi = useCallback(
+    async <T,>(
+      path: string,
+      options: RequestInit = {},
+      hasRetriedCsrf = false
+    ): Promise<ApiResult<T>> => {
+      try {
+        const method = (options.method || 'GET').toUpperCase();
+        const headers = new Headers(options.headers || {});
+        const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
+        if (method !== 'GET' && method !== 'HEAD') {
+          const token = await ensureCsrfToken(hasRetriedCsrf);
+          if (token) {
+            headers.set('X-CSRF-Token', token);
+          }
+          if (!isFormData && !headers.has('Content-Type') && options.body) {
+            headers.set('Content-Type', 'application/json');
+          }
         }
-        if (lower.includes('password')) {
+
+        const response = await fetch(path, {
+          ...options,
+          headers,
+          credentials: 'include',
+          cache: 'no-store',
+        });
+
+        let payload: Record<string, unknown> = {};
+        let isJson = true;
+        try {
+          payload = (await response.json()) as Record<string, unknown>;
+        } catch {
+          isJson = false;
+        }
+
+        if (typeof payload.csrfToken === 'string' && payload.csrfToken) {
+          csrfTokenRef.current = payload.csrfToken;
+        }
+
+        if (!response.ok) {
+          const code = typeof payload.code === 'string' ? payload.code : undefined;
+          if (
+            response.status === 403 &&
+            !hasRetriedCsrf &&
+            method !== 'GET' &&
+            method !== 'HEAD' &&
+            (code === 'CSRF_INVALID' || code === 'CSRF_EXPIRED' || code === 'CSRF_MISSING')
+          ) {
+            csrfTokenRef.current = '';
+            return requestApi<T>(path, options, true);
+          }
+
+          if (response.status === 401) {
+            setUser(null);
+          }
+          const serverError = typeof payload.error === 'string' ? payload.error : null;
+          const rawFieldErrors =
+            payload.fieldErrors &&
+            typeof payload.fieldErrors === 'object' &&
+            !Array.isArray(payload.fieldErrors)
+              ? (payload.fieldErrors as Record<string, unknown>)
+              : null;
+          const fieldErrors: Record<string, string> | undefined = rawFieldErrors
+            ? Object.fromEntries(
+                Object.entries(rawFieldErrors).filter(
+                  (entry): entry is [string, string] => typeof entry[1] === 'string'
+                )
+              )
+            : undefined;
           return {
-            error: `Password must be at least ${AUTH_CONFIG.passwordMinLength} characters and meet security requirements.`,
+            ok: false,
+            status: response.status,
+            code,
+            requestId: typeof payload.requestId === 'string' ? payload.requestId : undefined,
+            retryAfterSeconds:
+              typeof payload.retryAfterSeconds === 'number' ? payload.retryAfterSeconds : undefined,
+            ...(fieldErrors && Object.keys(fieldErrors).length > 0 ? { fieldErrors } : {}),
+            error:
+              serverError ||
+              (!isJson
+                ? `The server returned an unexpected response (HTTP ${response.status}). Please refresh the page and try again.`
+                : `Request failed (HTTP ${response.status}). Please try again.`),
           };
         }
-        return { error: 'Unable to complete registration. Please check your details and try again.' };
-      }
 
-      const needsEmailVerification = Boolean(data.user && !data.session);
-      return {
-        error: null,
-        needsEmailVerification,
-        neutralMessage: needsEmailVerification
-          ? 'Please check your inbox for a verification link to activate your account.'
-          : undefined,
-      };
-    },
-    []
-  );
-
-  const sendPasswordReset = useCallback(async (email: string): Promise<AuthActionResult> => {
-    const supabase = getSupabaseClient();
-    if (!supabase) {
-      return { error: 'Authentication provider is not configured yet.' };
-    }
-
-    const redirectTo =
-      typeof window !== 'undefined' ? `${window.location.origin}/reset-password` : undefined;
-
-    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-      redirectTo,
-    });
-
-    if (error && error.message.toLowerCase().includes('rate limit')) {
-      return { error: 'Too many reset requests. Please wait a minute before trying again.' };
-    }
-
-    return {
-      error: null,
-      neutralMessage:
-        'If an account exists for that email address, a password reset link has been sent.',
-    };
-  }, []);
-
-  const updatePassword = useCallback(async (newPassword: string): Promise<AuthActionResult> => {
-    const supabase = getSupabaseClient();
-    if (!supabase) {
-      return { error: 'Authentication provider is not configured yet.' };
-    }
-    const { error } = await supabase.auth.updateUser({ password: newPassword });
-    if (error) {
-      return { error: 'Could not update password. Your reset link may have expired.' };
-    }
-    setIsRecoverySession(false);
-    return { error: null };
-  }, []);
-
-  const sendPhoneOtp = useCallback(
-    async (e164Phone: string, captchaToken?: string): Promise<AuthActionResult> => {
-      const supabase = getSupabaseClient();
-      if (!supabase || !isSmsOtpConfigured()) {
-        return { error: 'SMS OTP authentication is not configured yet.' };
-      }
-
-      const { error } = await supabase.auth.signInWithOtp({
-        phone: e164Phone,
-        options: {
-          shouldCreateUser: AUTH_CONFIG.allowPhoneSignup,
-          captchaToken: captchaToken || undefined,
-        },
-      });
-
-      if (error) {
-        return { error: mapOtpError(error.message) };
-      }
-      return { error: null };
-    },
-    []
-  );
-
-  const verifyPhoneOtp = useCallback(
-    async (e164Phone: string, token: string): Promise<AuthActionResult> => {
-      const supabase = getSupabaseClient();
-      if (!supabase || !isSmsOtpConfigured()) {
-        return { error: 'SMS OTP authentication is not configured yet.' };
-      }
-
-      const { data, error } = await supabase.auth.verifyOtp({
-        phone: e164Phone,
-        token: token.trim(),
-        type: 'sms',
-      });
-
-      if (error || !data.session) {
-        return { error: error ? mapOtpError(error.message) : 'Verification did not complete.' };
-      }
-
-      const existingName = data.user?.user_metadata?.full_name;
-      const needsNameCompletion =
-        typeof existingName !== 'string' || existingName.trim().length === 0;
-
-      return { error: null, needsNameCompletion };
-    },
-    []
-  );
-
-  const updateProfileName = useCallback(async (fullName: string): Promise<AuthActionResult> => {
-    const supabase = getSupabaseClient();
-    if (!supabase) {
-      return { error: 'Authentication provider is not configured yet.' };
-    }
-    const { error } = await supabase.auth.updateUser({
-      data: { full_name: fullName.trim() },
-    });
-    if (error) {
-      return { error: 'Could not save your name right now. You can continue shopping safely.' };
-    }
-    return { error: null };
-  }, []);
-
-  const signInWithOAuth = useCallback(
-    async (provider: 'google' | 'apple', returnTo = '/'): Promise<AuthActionResult> => {
-      const supabase = getSupabaseClient();
-      if (!supabase) {
-        return { error: 'Authentication provider is not configured yet.' };
-      }
-      if (provider === 'google' && !isGoogleAuthConfigured()) {
-        return { error: 'Google sign-in is not enabled in this environment.' };
-      }
-      if (provider === 'apple' && !isAppleAuthConfigured()) {
-        return { error: 'Apple sign-in is not enabled in this environment.' };
-      }
-
-      const safeReturn = sanitizeInternalRedirectPath(returnTo);
-      try {
-        window.sessionStorage.setItem(OAUTH_RETURN_KEY, safeReturn);
+        return { ok: true, data: payload as T };
       } catch {
-        // Ignore storage restrictions
+        return {
+          ok: false,
+          status: 0,
+          error: 'Network error. Please check your connection and try again.',
+        };
       }
-
-      const redirectTo =
-        typeof window !== 'undefined'
-          ? `${window.location.origin}/auth/callback?next=${encodeURIComponent(safeReturn)}`
-          : undefined;
-
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider,
-        options: {
-          redirectTo,
-        },
-      });
-
-      if (error) {
-        return { error: `Unable to start ${provider === 'google' ? 'Google' : 'Apple'} sign-in.` };
-      }
-      return { error: null };
     },
-    []
+    [ensureCsrfToken]
   );
 
-  const signOut = useCallback(async () => {
-    const supabase = getSupabaseClient();
-    if (!supabase) return;
-    await supabase.auth.signOut();
-  }, []);
+  const loginWithEmail = useCallback(
+    async (email: string, password: string) => {
+      const res = await requestApi<{ user: AuthUser }>('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
+      });
+      if (res.ok) setUser(res.data.user);
+      return res;
+    },
+    [requestApi]
+  );
+
+  const registerWithEmail = useCallback(
+    (fullName: string, email: string, password: string, confirmPassword: string) =>
+      requestApi<{
+        message: string;
+        acceptedByProvider?: boolean;
+        cooldownSeconds?: number;
+        requestId?: string;
+      }>('/api/auth/register', {
+        method: 'POST',
+        body: JSON.stringify({ fullName, email, password, confirmPassword }),
+      }),
+    [requestApi]
+  );
+
+  const resendVerificationEmail = useCallback(
+    (email: string, password?: string) =>
+      requestApi<{
+        message: string;
+        alreadyVerified?: boolean;
+        acceptedByProvider?: boolean;
+        cooldownSeconds?: number;
+        requestId?: string;
+      }>('/api/auth/resend-verification', {
+        method: 'POST',
+        body: JSON.stringify({ email, ...(password ? { password } : {}) }),
+      }),
+    [requestApi]
+  );
+
+  const verifyEmailToken = useCallback(
+    async (token: string) => {
+      const res = await requestApi<{
+        message: string;
+        purpose: 'verify_email' | 'link_email';
+        user?: AuthUser;
+        verifiedEmail?: string;
+      }>('/api/auth/verify-email', {
+        method: 'POST',
+        body: JSON.stringify({ token }),
+      });
+      if (res.ok && res.data.user) {
+        setUser(res.data.user);
+      }
+      return res;
+    },
+    [requestApi]
+  );
+
+  const requestPasswordReset = useCallback(
+    (email: string) =>
+      requestApi<{ message: string }>('/api/auth/forgot-password', {
+        method: 'POST',
+        body: JSON.stringify({ email }),
+      }),
+    [requestApi]
+  );
+
+  const resetPassword = useCallback(
+    async (token: string, password: string) => {
+      const res = await requestApi<{ message: string }>('/api/auth/reset-password', {
+        method: 'POST',
+        body: JSON.stringify({ token, password }),
+      });
+      if (res.ok) setUser(null);
+      return res;
+    },
+    [requestApi]
+  );
+
+  const updateProfileName = useCallback(
+    async (fullName: string) => {
+      const res = await requestApi<{ user: AuthUser }>('/api/account/profile', {
+        method: 'PATCH',
+        body: JSON.stringify({ fullName }),
+      });
+      if (res.ok) setUser(res.data.user);
+      return res;
+    },
+    [requestApi]
+  );
+
+  const reauthenticateWithPassword = useCallback(
+    async (password: string) => {
+      const res = await requestApi<{ message: string; user: AuthUser }>(
+        '/api/account/reauthenticate',
+        {
+          method: 'POST',
+          body: JSON.stringify({ password }),
+        }
+      );
+      if (res.ok) setUser(res.data.user);
+      return res;
+    },
+    [requestApi]
+  );
+
+  const changePassword = useCallback(
+    async (newPassword: string) => {
+      const res = await requestApi<{ message: string; user: AuthUser }>(
+        '/api/account/change-password',
+        {
+          method: 'POST',
+          body: JSON.stringify({ newPassword }),
+        }
+      );
+      if (res.ok) setUser(res.data.user);
+      return res;
+    },
+    [requestApi]
+  );
+
+  const requestLinkEmail = useCallback(
+    (email: string) =>
+      requestApi<{ message: string }>('/api/account/link-email', {
+        method: 'POST',
+        body: JSON.stringify({ email }),
+      }),
+    [requestApi]
+  );
+
+  const loginAdminWithEmail = useCallback(
+    async (email: string, password: string) => {
+      const res = await requestApi<{
+        user: AuthUser;
+        ownerBinding: { boundAt: number; boundVia: string };
+      }>('/api/admin/login', {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
+      });
+      if (res.ok) setUser(res.data.user);
+      return res;
+    },
+    [requestApi]
+  );
+
+  const activateAdminAccount = useCallback(
+    (email: string, password: string, confirmPassword: string) =>
+      requestApi<{
+        requiresVerification: boolean;
+        email: string;
+        message: string;
+        acceptedByProvider?: boolean;
+        cooldownSeconds?: number;
+      }>('/api/admin/activate', {
+        method: 'POST',
+        body: JSON.stringify({ email, password, confirmPassword }),
+      }),
+    [requestApi]
+  );
+
+  const confirmAdminActivation = useCallback(
+    (token: string) =>
+      requestApi<{ verified: boolean; email: string; message: string }>(
+        '/api/admin/activate/confirm',
+        {
+          method: 'POST',
+          body: JSON.stringify({ token }),
+        }
+      ),
+    [requestApi]
+  );
+
+  const resendAdminVerification = useCallback(
+    (email: string, password?: string) =>
+      requestApi<{
+        message: string;
+        alreadyVerified?: boolean;
+        acceptedByProvider?: boolean;
+        cooldownSeconds?: number;
+      }>('/api/admin/resend-verification', {
+        method: 'POST',
+        body: JSON.stringify({ email, ...(password ? { password } : {}) }),
+      }),
+    [requestApi]
+  );
+
+  const requestAdminPasswordReset = useCallback(
+    (email: string) =>
+      requestApi<{ message: string }>('/api/admin/forgot-password', {
+        method: 'POST',
+        body: JSON.stringify({ email }),
+      }),
+    [requestApi]
+  );
+
+  const confirmAdminPasswordReset = useCallback(
+    (token: string, password: string) =>
+      requestApi<{ message: string }>('/api/admin/password-reset/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ token, password }),
+      }),
+    [requestApi]
+  );
+
+  const logout = useCallback(async (): Promise<ApiResult<{ message: string }>> => {
+    isLoggingOutRef.current = true;
+    try {
+      const res = await requestApi<{ message: string; csrfToken?: string }>('/api/auth/logout', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) {
+        return res;
+      }
+
+      try {
+        const verifyRes = await fetch('/api/auth/session', {
+          credentials: 'include',
+          cache: 'no-store',
+        });
+        if (!verifyRes.ok) {
+          return {
+            ok: false,
+            status: verifyRes.status,
+            code: 'LOGOUT_VERIFY_FAILED',
+            error: 'Unable to confirm that your session ended. Please try signing out again.',
+          };
+        }
+        const verifyData = (await verifyRes.json()) as {
+          authenticated: boolean;
+          csrfToken?: string;
+          user: AuthUser | null;
+        };
+        if (verifyData.csrfToken) {
+          csrfTokenRef.current = verifyData.csrfToken;
+        }
+        if (verifyData.authenticated) {
+          setUser(verifyData.user);
+          return {
+            ok: false,
+            status: 500,
+            code: 'LOGOUT_INCOMPLETE',
+            error: 'Your session remained active on the server. Please try signing out again.',
+          };
+        }
+      } catch {
+        return {
+          ok: false,
+          status: 0,
+          code: 'LOGOUT_VERIFY_FAILED',
+          error: 'Network error while verifying sign-out. Please try again.',
+        };
+      }
+
+      setUser(null);
+      return res;
+    } finally {
+      isLoggingOutRef.current = false;
+    }
+  }, [requestApi]);
 
   return (
     <AuthContext.Provider
       value={{
-        user: session?.user ?? null,
-        session,
+        user,
+        capabilities,
         isLoadingSession,
-        isConfigured,
-        isSmsConfigured,
-        isGoogleConfigured,
-        isAppleConfigured,
-        isRecoverySession,
-        clearRecoverySession,
-        signInWithEmail,
-        signUpWithEmail,
-        sendPasswordReset,
-        updatePassword,
-        sendPhoneOtp,
-        verifyPhoneOtp,
+        refreshSession: syncSessionAndCapabilities,
+        refreshCapabilities,
+        loginWithEmail,
+        registerWithEmail,
+        resendVerificationEmail,
+        verifyEmailToken,
+        requestPasswordReset,
+        resetPassword,
         updateProfileName,
-        signInWithOAuth,
-        signOut,
+        reauthenticateWithPassword,
+        changePassword,
+        requestLinkEmail,
+        logout,
+        loginAdminWithEmail,
+        activateAdminAccount,
+        confirmAdminActivation,
+        resendAdminVerification,
+        requestAdminPasswordReset,
+        confirmAdminPasswordReset,
+        apiRequest: requestApi,
       }}
     >
       {children}
@@ -383,10 +614,10 @@ export function AuthProvider({
   );
 }
 
-export function useAuth(): AuthContextValue {
+export function useAuth() {
   const ctx = useContext(AuthContext);
   if (!ctx) {
-    throw new Error('useAuth must be used inside AuthProvider');
+    throw new Error('useAuth must be used inside <AuthProvider>.');
   }
   return ctx;
 }

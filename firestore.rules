@@ -1,0 +1,236 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidEnv(envKey) {
+      return isValidId(envKey) && envKey in ['development', 'shared-preview', 'production'];
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner() {
+      return isSignedIn()
+        && request.auth.token.email == 'saivinodkotipalli2003@gmail.com'
+        && request.auth.token.email_verified == true;
+    }
+
+    function isValidCategory(data, categoryId) {
+      return data.keys().hasAll(['id', 'name', 'slug', 'subtitle', 'image_url', 'alt_text', 'position', 'created_at', 'updated_at'])
+        && data.keys().hasOnly(['id', 'name', 'slug', 'subtitle', 'image_url', 'alt_text', 'position', 'created_at', 'updated_at'])
+        && data.id == categoryId
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 80
+        && data.slug is string && data.slug.size() >= 1 && data.slug.size() <= 96
+        && data.subtitle is string && data.subtitle.size() <= 240
+        && data.image_url is string && data.image_url.size() <= 512
+        && data.alt_text is string && data.alt_text.size() <= 240
+        && data.position is number && data.position >= 0 && data.position <= 1000
+        && data.created_at is number && data.updated_at is number;
+    }
+
+    function isValidProduct(data, productId) {
+      return data.keys().hasAll([
+          'id', 'slug', 'title', 'description', 'fabric_note', 'category', 'sku',
+          'price_paise', 'stock_qty', 'low_stock_threshold', 'featured', 'status',
+          'colors_json', 'sizes_json', 'version', 'created_at', 'updated_at',
+          'variants', 'images', 'variant_skus', 'image_urls'
+        ])
+        && data.keys().hasOnly([
+          'id', 'slug', 'title', 'description', 'fabric_note', 'category', 'sku',
+          'price_paise', 'compare_at_paise', 'stock_qty', 'low_stock_threshold', 'featured', 'status',
+          'colors_json', 'sizes_json', 'version', 'published_at', 'archived_at',
+          'created_at', 'updated_at', 'variants', 'images', 'variant_skus', 'image_urls'
+        ])
+        && data.id == productId
+        && data.slug is string && data.slug.size() >= 1 && data.slug.size() <= 140
+        && data.title is string && data.title.size() >= 2 && data.title.size() <= 160
+        && data.description is string && data.description.size() <= 5000
+        && data.fabric_note is string && data.fabric_note.size() <= 500
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 80
+        && data.sku is string && data.sku.size() >= 1 && data.sku.size() <= 64
+        && data.price_paise is number && data.price_paise >= 100 && data.price_paise <= 100000000
+        && (data.compare_at_paise == null || (data.compare_at_paise is number && data.compare_at_paise >= 100 && data.compare_at_paise <= 100000000))
+        && data.stock_qty is number && data.stock_qty >= 0 && data.stock_qty <= 1000000
+        && data.low_stock_threshold is number && data.low_stock_threshold >= 0 && data.low_stock_threshold <= 10000
+        && data.featured is bool
+        && data.status in ['draft', 'published', 'archived']
+        && data.colors_json is string && data.colors_json.size() <= 10000
+        && data.sizes_json is string && data.sizes_json.size() <= 5000
+        && data.version is number && data.version >= 1
+        && data.created_at is number && data.updated_at is number
+        && data.variants is list && data.variants.size() >= 1 && data.variants.size() <= 100
+        && data.images is list && data.images.size() <= 20
+        && data.variant_skus is list && data.variant_skus.size() <= 100
+        && data.image_urls is list && data.image_urls.size() <= 20;
+    }
+
+    function isValidPublicContactMessage(data, messageId) {
+      return data.keys().hasAll([
+          'id', 'sender_name', 'sender_email', 'sender_phone',
+          'subject', 'message', 'status', 'admin_note', 'created_at', 'updated_at'
+        ])
+        && data.keys().hasOnly([
+          'id', 'sender_name', 'sender_email', 'sender_phone',
+          'subject', 'message', 'status', 'admin_note', 'created_at', 'updated_at'
+        ])
+        && data.id == messageId
+        && data.sender_name is string && data.sender_name.size() >= 2 && data.sender_name.size() <= 120
+        && data.sender_email is string && data.sender_email.size() >= 5 && data.sender_email.size() <= 254
+        && data.sender_phone is string && data.sender_phone.size() <= 32
+        && data.subject is string && data.subject.size() >= 2 && data.subject.size() <= 140
+        && data.message is string && data.message.size() >= 5 && data.message.size() <= 3000
+        && data.status == 'unread'
+        && data.admin_note == ''
+        && data.created_at is number && data.created_at > 0
+        && data.updated_at is number && data.updated_at == data.created_at;
+    }
+
+    function isValidPublicOrder(data, orderId) {
+      return data.keys().hasAll([
+          'id', 'order_number', 'customer_user_id', 'customer_name',
+          'customer_email', 'customer_phone', 'shipping_address', 'status',
+          'subtotal_paise', 'total_paise', 'currency', 'created_at', 'product_ids', 'items'
+        ])
+        && data.keys().hasOnly([
+          'id', 'order_number', 'customer_user_id', 'customer_name',
+          'customer_email', 'customer_phone', 'shipping_address', 'status',
+          'subtotal_paise', 'total_paise', 'currency', 'created_at', 'product_ids', 'items'
+        ])
+        && data.id == orderId
+        && data.order_number is string && data.order_number.size() >= 4 && data.order_number.size() <= 64
+        && (data.customer_user_id == null || (isSignedIn() && data.customer_user_id == request.auth.uid))
+        && data.customer_name is string && data.customer_name.size() >= 2 && data.customer_name.size() <= 120
+        && data.customer_email is string && data.customer_email.size() >= 5 && data.customer_email.size() <= 254
+        && data.customer_phone is string && data.customer_phone.size() >= 5 && data.customer_phone.size() <= 32
+        && data.shipping_address is string && data.shipping_address.size() >= 5 && data.shipping_address.size() <= 600
+        && data.status == 'pending'
+        && data.subtotal_paise is number && data.subtotal_paise >= 100 && data.subtotal_paise <= 500000000
+        && data.total_paise is number && data.total_paise == data.subtotal_paise
+        && data.currency == 'INR'
+        && data.created_at is number && data.created_at > 0
+        && data.product_ids is list && data.product_ids.size() >= 1 && data.product_ids.size() <= 50
+        && data.items is list && data.items.size() >= 1 && data.items.size() <= 50;
+    }
+
+    function isValidEnvironmentUser(data, userId) {
+      return data.keys().hasAll(['id', 'full_name', 'email', 'email_verified', 'created_at', 'updated_at'])
+        && data.keys().hasOnly(['id', 'full_name', 'email', 'email_verified', 'phone_e164', 'phone_verified', 'created_at', 'updated_at'])
+        && data.id == userId
+        && data.full_name is string && data.full_name.size() >= 2 && data.full_name.size() <= 100
+        && data.email is string && data.email.size() >= 5 && data.email.size() <= 254
+        && data.email_verified is bool
+        && data.created_at is number && data.updated_at is number;
+    }
+
+    match /environments/{envKey} {
+      match /categories/{categoryId} {
+        allow list: if isValidEnv(envKey);
+        allow get: if isValidEnv(envKey) && isValidId(categoryId);
+        allow create, update: if isValidEnv(envKey) && isOwner() && isValidId(categoryId) && isValidCategory(request.resource.data, categoryId);
+        allow delete: if isValidEnv(envKey) && isOwner() && isValidId(categoryId);
+      }
+
+      match /site_documents/{docKey} {
+        allow get: if isValidEnv(envKey) && (docKey in ['settings', 'content'] || isOwner());
+        allow list: if isValidEnv(envKey) && isOwner();
+        allow create, update: if isValidEnv(envKey)
+          && isOwner()
+          && docKey in ['settings', 'content', 'owner_meta']
+          && request.resource.data.key == docKey
+          && request.resource.data.updated_at is number;
+        allow delete: if false;
+      }
+
+      match /products/{productId} {
+        allow list: if isValidEnv(envKey) && (isOwner() || resource.data.status == 'published');
+        allow get: if isValidEnv(envKey) && isValidId(productId) && (isOwner() || resource.data.status == 'published');
+        allow create, update: if isValidEnv(envKey) && isOwner() && isValidId(productId) && isValidProduct(request.resource.data, productId);
+        allow delete: if isValidEnv(envKey) && isOwner() && isValidId(productId);
+      }
+
+      match /product_media/{mediaId} {
+        allow list: if isValidEnv(envKey) && (isOwner() || resource.data.is_public == true);
+        allow get: if isValidEnv(envKey) && isValidId(mediaId) && (isOwner() || resource.data.is_public == true);
+        allow create, update, delete: if isValidEnv(envKey) && isOwner() && isValidId(mediaId);
+
+        match /chunks/{chunkId} {
+          allow get, list: if isValidEnv(envKey)
+            && isValidId(mediaId)
+            && (isOwner() || get(/databases/$(database)/documents/environments/$(envKey)/product_media/$(mediaId)).data.is_public == true);
+          allow create, update, delete: if isValidEnv(envKey) && isOwner() && isValidId(mediaId) && isValidId(chunkId);
+        }
+      }
+
+      match /contact_messages/{messageId} {
+        allow create: if isValidEnv(envKey) && isValidId(messageId) && isValidPublicContactMessage(request.resource.data, messageId);
+        allow get: if isValidEnv(envKey) && isOwner() && isValidId(messageId);
+        allow list: if isValidEnv(envKey) && isOwner();
+        allow update: if isValidEnv(envKey)
+          && isOwner()
+          && isValidId(messageId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'admin_note', 'updated_at'])
+          && request.resource.data.status in ['unread', 'read', 'replied', 'archived']
+          && request.resource.data.admin_note is string && request.resource.data.admin_note.size() <= 2000
+          && request.resource.data.updated_at is number;
+        allow delete: if isValidEnv(envKey) && isOwner() && isValidId(messageId);
+      }
+
+      match /orders/{orderId} {
+        allow create: if isValidEnv(envKey) && isValidId(orderId) && isValidPublicOrder(request.resource.data, orderId);
+        allow get: if isValidEnv(envKey) && isValidId(orderId) && (isOwner() || (isSignedIn() && resource.data.customer_user_id == request.auth.uid));
+        allow list: if isValidEnv(envKey) && (isOwner() || (isSignedIn() && resource.data.customer_user_id == request.auth.uid));
+        allow update: if isValidEnv(envKey)
+          && isOwner()
+          && isValidId(orderId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+          && request.resource.data.status in ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled'];
+        allow delete: if false;
+      }
+
+      match /product_audit_logs/{auditId} {
+        allow get: if isValidEnv(envKey) && isOwner() && isValidId(auditId);
+        allow list: if isValidEnv(envKey) && isOwner();
+        allow create: if isValidEnv(envKey)
+          && isOwner()
+          && isValidId(auditId)
+          && request.resource.data.id == auditId
+          && request.resource.data.created_at is number;
+        allow update, delete: if false;
+      }
+
+      match /users/{userId} {
+        allow get: if isValidEnv(envKey) && isValidId(userId) && (isOwner() || (isSignedIn() && request.auth.uid == userId));
+        allow list: if isValidEnv(envKey) && isOwner();
+        allow create, update: if isValidEnv(envKey)
+          && isValidId(userId)
+          && isSignedIn()
+          && request.auth.token.email_verified == true
+          && (request.auth.uid == userId || isOwner())
+          && isValidEnvironmentUser(request.resource.data, userId);
+        allow delete: if isValidEnv(envKey) && isOwner() && isValidId(userId);
+      }
+
+      match /admin_bindings/{bindingId} {
+        allow get: if isValidEnv(envKey) && isOwner() && bindingId == 'primary';
+        allow list: if isValidEnv(envKey) && isOwner();
+        allow create, update: if isValidEnv(envKey)
+          && isOwner()
+          && bindingId == 'primary'
+          && request.resource.data.bound_email == 'saivinodkotipalli2003@gmail.com'
+          && request.resource.data.owner_user_id is string && request.resource.data.owner_user_id.size() <= 128
+          && request.resource.data.bound_at is number
+          && request.resource.data.bound_via is string && request.resource.data.bound_via.size() <= 64;
+        allow delete: if false;
+      }
+    }
+  }
+}

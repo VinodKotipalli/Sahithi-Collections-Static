@@ -1,6 +1,6 @@
 import { ArrowRight } from 'lucide-react';
 import { motion } from 'motion/react';
-import { SITE_CONFIG } from '../config/site';
+import { useStorefront } from '../context/StorefrontContext';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 import { CollectionCategory } from '../types/boutique';
 import { BoutiqueImage } from './BoutiqueImage';
@@ -12,7 +12,8 @@ interface SpotlightEditSectionProps {
 
 export function SpotlightEditSection({ onExploreEdit }: SpotlightEditSectionProps) {
   const prefersReducedMotion = usePrefersReducedMotion();
-  const { spotlightEdit } = SITE_CONFIG;
+  const { content } = useStorefront();
+  const { spotlightEdit } = content;
 
   return (
     <section className="relative overflow-hidden bg-[#49243E] py-16 text-[#FFF9F5] sm:py-24">

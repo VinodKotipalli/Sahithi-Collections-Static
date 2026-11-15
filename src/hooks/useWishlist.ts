@@ -1,6 +1,4 @@
 import { useCallback, useEffect, useState } from 'react';
-import { isWishlistSyncConfigured } from '../config/auth';
-import { getSupabaseClient } from '../lib/supabase';
 
 const STORAGE_KEY = 'sahithi_collections_wishlist_v1';
 
@@ -19,7 +17,7 @@ function readStoredWishlist(): string[] {
   }
 }
 
-export function useWishlist(userId?: string | null) {
+export function useWishlist() {
   const [wishlistIds, setWishlistIds] = useState<string[]>(() => readStoredWishlist());
 
   useEffect(() => {
@@ -30,87 +28,19 @@ export function useWishlist(userId?: string | null) {
     }
   }, [wishlistIds]);
 
-  // Optional Supabase wishlist synchronization ONLY when explicitly enabled and signed in
-  useEffect(() => {
-    if (!userId || !isWishlistSyncConfigured()) return;
-    const supabase = getSupabaseClient();
-    if (!supabase) return;
+  const toggleWishlist = useCallback((productId: string) => {
+    setWishlistIds((prev) =>
+      prev.includes(productId) ? prev.filter((id) => id !== productId) : [productId, ...prev]
+    );
+  }, []);
 
-    let active = true;
-    supabase
-      .from('wishlist_items')
-      .select('product_id')
-      .eq('user_id', userId)
-      .then(({ data, error }) => {
-        if (!active || error || !Array.isArray(data)) return;
-        const remoteIds = data
-          .map((row) => row.product_id)
-          .filter((id): id is string => typeof id === 'string');
-        if (remoteIds.length > 0) {
-          setWishlistIds((prev) => Array.from(new Set([...remoteIds, ...prev])));
-        }
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [userId]);
-
-  const toggleWishlist = useCallback(
-    (productId: string) => {
-      setWishlistIds((prev) => {
-        const exists = prev.includes(productId);
-        const next = exists ? prev.filter((id) => id !== productId) : [productId, ...prev];
-
-        if (userId && isWishlistSyncConfigured()) {
-          const supabase = getSupabaseClient();
-          if (supabase) {
-            if (exists) {
-              void supabase
-                .from('wishlist_items')
-                .delete()
-                .eq('user_id', userId)
-                .eq('product_id', productId);
-            } else {
-              void supabase
-                .from('wishlist_items')
-                .upsert({ user_id: userId, product_id: productId });
-            }
-          }
-        }
-
-        return next;
-      });
-    },
-    [userId]
-  );
-
-  const removeFromWishlist = useCallback(
-    (productId: string) => {
-      setWishlistIds((prev) => prev.filter((id) => id !== productId));
-      if (userId && isWishlistSyncConfigured()) {
-        const supabase = getSupabaseClient();
-        if (supabase) {
-          void supabase
-            .from('wishlist_items')
-            .delete()
-            .eq('user_id', userId)
-            .eq('product_id', productId);
-        }
-      }
-    },
-    [userId]
-  );
+  const removeFromWishlist = useCallback((productId: string) => {
+    setWishlistIds((prev) => prev.filter((id) => id !== productId));
+  }, []);
 
   const clearWishlist = useCallback(() => {
     setWishlistIds([]);
-    if (userId && isWishlistSyncConfigured()) {
-      const supabase = getSupabaseClient();
-      if (supabase) {
-        void supabase.from('wishlist_items').delete().eq('user_id', userId);
-      }
-    }
-  }, [userId]);
+  }, []);
 
   const isWishlisted = useCallback(
     (productId: string) => wishlistIds.includes(productId),

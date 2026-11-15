@@ -1,7 +1,7 @@
 import { Component, lazy, ReactNode, Suspense, useEffect, useRef, useState } from 'react';
 import { ArrowDownRight } from 'lucide-react';
 import { motion, useScroll, useTransform } from 'motion/react';
-import { SITE_CONFIG } from '../config/site';
+import { useStorefront } from '../context/StorefrontContext';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 import { BoutiqueImage } from './BoutiqueImage';
 import { HeroRibbonFallback } from './HeroRibbonFallback';
@@ -62,7 +62,8 @@ export function HeroSection() {
 
   const imageParallaxY = useTransform(scrollYProgress, [0, 1], [0, 42]);
 
-  const { hero } = SITE_CONFIG;
+  const { settings, content } = useStorefront();
+  const { hero } = content;
 
   return (
     <section
@@ -90,7 +91,7 @@ export function HeroSection() {
               transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
               className="text-xs font-medium tracking-[0.2em] uppercase text-[#B76E79]"
             >
-              {hero.eyebrow} <span aria-hidden="true">·</span> {SITE_CONFIG.tagline}
+              {hero.eyebrow} <span aria-hidden="true">·</span> {settings.tagline}
             </motion.p>
 
             <motion.h1
@@ -182,34 +183,36 @@ export function HeroSection() {
                     alt={hero.mainImage.alt}
                     loading="eager"
                     fetchPriority="high"
-                    fallbackTitle={SITE_CONFIG.brandName}
+                    fallbackTitle={settings.brandName}
                     className="h-full w-full object-cover object-top"
                   />
                 </div>
               </motion.div>
 
               {/* Layered Product Cutout Card */}
-              <motion.div
-                animate={prefersReducedMotion ? undefined : { y: [0, -7, 0] }}
-                transition={
-                  prefersReducedMotion
-                    ? undefined
-                    : { duration: 6, repeat: Infinity, ease: 'easeInOut' }
-                }
-                className="relative z-20 -mt-14 ml-4 w-44 overflow-hidden rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5] p-2 shadow-[0_18px_40px_-14px_rgba(73,36,62,0.24)] sm:absolute sm:-bottom-6 sm:-left-8 sm:mt-0 sm:w-48"
-              >
-                <div className="aspect-[4/3] overflow-hidden rounded-xl bg-[#F3D5DF]/25">
-                  <BoutiqueImage
-                    src={hero.accentCutouts[0].src}
-                    alt={hero.accentCutouts[0].alt}
-                    loading="eager"
-                    className="h-full w-full object-cover"
-                  />
-                </div>
-                <p className="mt-2 px-1 pb-0.5 text-[11px] font-medium tracking-wide text-[#49243E]">
-                  {hero.accentCutouts[0].caption}
-                </p>
-              </motion.div>
+              {hero.accentCutouts[0] && (
+                <motion.div
+                  animate={prefersReducedMotion ? undefined : { y: [0, -7, 0] }}
+                  transition={
+                    prefersReducedMotion
+                      ? undefined
+                      : { duration: 6, repeat: Infinity, ease: 'easeInOut' }
+                  }
+                  className="relative z-20 -mt-14 ml-4 w-44 overflow-hidden rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5] p-2 shadow-[0_18px_40px_-14px_rgba(73,36,62,0.24)] sm:absolute sm:-bottom-6 sm:-left-8 sm:mt-0 sm:w-48"
+                >
+                  <div className="aspect-[4/3] overflow-hidden rounded-xl bg-[#F3D5DF]/25">
+                    <BoutiqueImage
+                      src={hero.accentCutouts[0].src}
+                      alt={hero.accentCutouts[0].alt}
+                      loading="eager"
+                      className="h-full w-full object-cover"
+                    />
+                  </div>
+                  <p className="mt-2 px-1 pb-0.5 text-[11px] font-medium tracking-wide text-[#49243E]">
+                    {hero.accentCutouts[0].caption}
+                  </p>
+                </motion.div>
+              )}
 
               {/* Secondary Layered Editorial Note Card (desktop/tablet) */}
               <motion.div

@@ -1,21 +1,31 @@
-import { useEffect, useRef, useState } from 'react';
-import { Check, ChevronLeft, ChevronRight, Heart, MessageCircle, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Heart,
+  MessageCircle,
+  ShoppingBag,
+  X,
+} from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import {
   buildWhatsAppEnquiryMessage,
   buildWhatsAppEnquiryUrl,
   isWhatsAppConfigured,
 } from '../config/site';
+import { useStorefront } from '../context/StorefrontContext';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
-import { Product } from '../types/boutique';
-import { formatINR } from '../utils/format';
+import type { BagItem, Product } from '../types/boutique';
+import { formatPaiseINR } from '../utils/format';
 import { BoutiqueImage } from './BoutiqueImage';
 
 interface QuickViewModalProps {
   product: Product | null;
   isWishlisted: boolean;
   onToggleWishlist: (id: string) => void;
+  onAddToBag?: (item: Omit<BagItem, 'quantity'> & { quantity?: number }) => void;
   onClose: () => void;
 }
 
@@ -23,23 +33,28 @@ export function QuickViewModal({
   product,
   isWishlisted,
   onToggleWishlist,
+  onAddToBag,
   onClose,
 }: QuickViewModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
   const prefersReducedMotion = usePrefersReducedMotion();
+  const { settings } = useStorefront();
   const isOpen = product !== null;
 
   const [activeImageIndex, setActiveImageIndex] = useState(0);
   const [selectedColor, setSelectedColor] = useState('');
   const [selectedSize, setSelectedSize] = useState('');
+  const [addedFeedback, setAddedFeedback] = useState(false);
 
   useFocusTrap(isOpen, modalRef, onClose);
 
   useEffect(() => {
     if (!product) return;
     setActiveImageIndex(0);
-    setSelectedColor(product.colors[0]?.name || 'Default');
-    setSelectedSize(product.sizes[0] || 'Free Size');
+    setAddedFeedback(false);
+    const firstInStock = product.variants?.find((v) => v.stockQty > 0) || product.variants?.[0];
+    setSelectedColor(firstInStock?.colorName || product.colors[0]?.name || 'Default');
+    setSelectedSize(firstInStock?.size || product.sizes[0] || 'Free Size');
   }, [product]);
 
   useEffect(() => {
@@ -55,12 +70,34 @@ export function QuickViewModal({
     return () => window.removeEventListener('keydown', handleArrows);
   }, [product]);
 
-  const whatsAppReady = isWhatsAppConfigured();
+  const activeVariant = useMemo(() => {
+    if (!product?.variants || product.variants.length === 0) return null;
+    return (
+      product.variants.find(
+        (v) => v.colorName === selectedColor && v.size === selectedSize
+      ) ||
+      product.variants.find((v) => v.colorName === selectedColor) ||
+      product.variants.find((v) => v.size === selectedSize) ||
+      product.variants[0]
+    );
+  }, [product, selectedColor, selectedSize]);
+
+  const displayPricePaise =
+    activeVariant?.pricePaise ?? product?.pricePaise ?? Math.round((product?.price || 0) * 100);
+  const displayComparePaise =
+    activeVariant?.compareAtPaise ??
+    product?.compareAtPaise ??
+    (product?.compareAtPrice ? Math.round(product.compareAtPrice * 100) : null);
+  const availableStock = activeVariant?.stockQty ?? product?.stockQty ?? 0;
+
+  const whatsAppReady = isWhatsAppConfigured(settings.contact);
   const enquiryUrl = product
     ? buildWhatsAppEnquiryUrl({
         productName: product.name,
         selectedSize,
         selectedColor,
+        brandName: settings.brandName,
+        contact: settings.contact,
       })
     : null;
   const enquiryPreview = product
@@ -68,8 +105,24 @@ export function QuickViewModal({
         productName: product.name,
         selectedSize,
         selectedColor,
+        brandName: settings.brandName,
       })
     : '';
+
+  const handleAddToBagClick = () => {
+    if (!product || !onAddToBag || availableStock <= 0) return;
+    onAddToBag({
+      productId: product.id,
+      variantId: activeVariant?.id || product.id,
+      seenPricePaise: displayPricePaise,
+      fallbackTitle: product.name,
+      fallbackVariant: `${selectedSize} · ${selectedColor}`,
+      fallbackImage: product.images[0]?.src || '',
+      quantity: 1,
+    });
+    setAddedFeedback(true);
+    window.setTimeout(() => setAddedFeedback(false), 1800);
+  };
 
   return (
     <AnimatePresence>
@@ -125,7 +178,7 @@ export function QuickViewModal({
                     />
 
                     {product.images.length > 1 && (
-                      <div className="absolute inset-x-3 top-1/2 flex -translate-y-1/2 justify-between pointer-events-none">
+                      <div className="pointer-events-none absolute inset-x-3 top-1/2 flex -translate-y-1/2 justify-between">
                         <button
                           type="button"
                           onClick={() =>
@@ -180,7 +233,7 @@ export function QuickViewModal({
                 </div>
 
                 {/* Details Column */}
-                <div className="md:col-span-6 flex flex-col justify-between">
+                <div className="flex flex-col justify-between md:col-span-6">
                   <div>
                     <h2
                       id="quick-view-title"
@@ -189,12 +242,25 @@ export function QuickViewModal({
                       {product.name}
                     </h2>
 
-                    <div className="mt-2.5 flex items-baseline gap-3">
+                    <div className="mt-2.5 flex flex-wrap items-baseline gap-3">
                       <span className="text-2xl font-semibold tabular-nums text-[#242124]">
-                        {formatINR(product.price)}
+                        {formatPaiseINR(displayPricePaise)}
                       </span>
-                      <span className="text-xs text-[#242124]/60">
-                        Demo showcase price
+                      {displayComparePaise && displayComparePaise > displayPricePaise && (
+                        <span className="text-sm line-through tabular-nums text-[#242124]/45">
+                          {formatPaiseINR(displayComparePaise)}
+                        </span>
+                      )}
+                      <span
+                        className={`text-xs font-medium tabular-nums ${
+                          availableStock <= 0 ? 'text-[#B76E79]' : 'text-[#49243E]/75'
+                        }`}
+                      >
+                        {availableStock <= 0
+                          ? 'Out of stock'
+                          : availableStock <= 5
+                            ? `Only ${availableStock} left`
+                            : `${availableStock} in stock`}
                       </span>
                     </div>
 
@@ -202,9 +268,11 @@ export function QuickViewModal({
                       {product.description}
                     </p>
 
-                    <p className="mt-2.5 text-xs text-[#49243E]/75">
-                      <span className="font-medium">Fabric &amp; Craft:</span> {product.fabricNote}
-                    </p>
+                    {product.fabricNote && (
+                      <p className="mt-2.5 text-xs text-[#49243E]/75">
+                        <span className="font-medium">Fabric &amp; Craft:</span> {product.fabricNote}
+                      </p>
+                    )}
 
                     {/* Color Selector */}
                     <div className="mt-6">
@@ -236,7 +304,9 @@ export function QuickViewModal({
                                 aria-hidden="true"
                               />
                               <span>{color.name}</span>
-                              {isSelected && <Check className="h-3.5 w-3.5 text-[#49243E]" aria-hidden="true" />}
+                              {isSelected && (
+                                <Check className="h-3.5 w-3.5 text-[#49243E]" aria-hidden="true" />
+                              )}
                             </button>
                           );
                         })}
@@ -254,6 +324,10 @@ export function QuickViewModal({
                       <div className="mt-2.5 flex flex-wrap gap-2">
                         {product.sizes.map((size) => {
                           const isSelected = selectedSize === size;
+                          const matchingVariant = product.variants?.find(
+                            (v) => v.size === size && v.colorName === selectedColor
+                          );
+                          const variantEmpty = matchingVariant ? matchingVariant.stockQty <= 0 : false;
                           return (
                             <button
                               key={size}
@@ -263,7 +337,9 @@ export function QuickViewModal({
                               className={`min-h-[42px] min-w-[48px] rounded-xl border px-3.5 py-2 text-xs font-semibold transition-all ${
                                 isSelected
                                   ? 'border-[#49243E] bg-[#49243E] text-[#FFF9F5]'
-                                  : 'border-[#49243E]/18 bg-white text-[#49243E] hover:border-[#49243E]/45'
+                                  : variantEmpty
+                                    ? 'border-[#49243E]/12 bg-white/60 text-[#242124]/45'
+                                    : 'border-[#49243E]/18 bg-white text-[#49243E] hover:border-[#49243E]/45'
                               }`}
                             >
                               {size}
@@ -274,28 +350,28 @@ export function QuickViewModal({
                     </div>
                   </div>
 
-                  {/* Actions & WhatsApp Enquiry */}
+                  {/* Actions: Add to Bag, Wishlist & WhatsApp Enquiry */}
                   <div className="mt-7 space-y-3 border-t border-[#49243E]/10 pt-5">
                     <div className="flex flex-col gap-2.5 sm:flex-row">
-                      {whatsAppReady && enquiryUrl ? (
-                        <a
-                          href={enquiryUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="flex min-h-[46px] flex-1 items-center justify-center gap-2 rounded-xl bg-[#49243E] px-5 py-3 text-sm font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31]"
-                        >
-                          <MessageCircle className="h-4 w-4" aria-hidden="true" />
-                          <span>Enquire About This Product</span>
-                        </a>
-                      ) : (
+                      {onAddToBag && (
                         <button
                           type="button"
-                          disabled
-                          aria-disabled="true"
-                          className="flex min-h-[46px] flex-1 cursor-not-allowed items-center justify-center gap-2 rounded-xl border border-[#49243E]/15 bg-[#49243E]/10 px-5 py-3 text-sm font-medium text-[#49243E]/55"
+                          disabled={availableStock <= 0}
+                          onClick={handleAddToBagClick}
+                          className="flex min-h-[46px] flex-1 items-center justify-center gap-2 rounded-xl bg-[#49243E] px-5 py-3 text-sm font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31] disabled:cursor-not-allowed disabled:bg-[#49243E]/25 disabled:text-[#49243E]/60"
                         >
-                          <MessageCircle className="h-4 w-4" aria-hidden="true" />
-                          <span>Enquire About This Product</span>
+                          {addedFeedback ? (
+                            <Check className="h-4 w-4" aria-hidden="true" />
+                          ) : (
+                            <ShoppingBag className="h-4 w-4" aria-hidden="true" />
+                          )}
+                          <span>
+                            {availableStock <= 0
+                              ? 'Out of Stock'
+                              : addedFeedback
+                                ? 'Added to Bag'
+                                : 'Add to Bag'}
+                          </span>
                         </button>
                       )}
 
@@ -317,22 +393,19 @@ export function QuickViewModal({
                       </button>
                     </div>
 
-                    {!whatsAppReady ? (
-                      <div className="rounded-xl border border-[#B76E79]/30 bg-[#F3D5DF]/25 p-3 text-xs leading-relaxed text-[#49243E]">
-                        <p className="font-semibold">
-                          WhatsApp enquiry setup required
-                        </p>
-                        <p className="mt-1 text-[#242124]/80">
-                          Add a real WhatsApp number in{' '}
-                          <code className="rounded bg-white/80 px-1 py-0.5 font-mono text-[11px]">
-                            src/config/site.ts
-                          </code>{' '}
-                          to activate one-tap product enquiries. Prepared draft: “{enquiryPreview}”
-                        </p>
-                      </div>
+                    {whatsAppReady && enquiryUrl ? (
+                      <a
+                        href={enquiryUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex min-h-[42px] w-full items-center justify-center gap-2 rounded-xl border border-[#49243E]/20 bg-white px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/25"
+                      >
+                        <MessageCircle className="h-4 w-4" aria-hidden="true" />
+                        <span>Enquire via WhatsApp ({selectedSize}, {selectedColor})</span>
+                      </a>
                     ) : (
-                      <p className="text-[11px] leading-relaxed text-[#242124]/65">
-                        Opens WhatsApp with your selected color ({selectedColor}) and size ({selectedSize}).
+                      <p className="text-[11px] leading-relaxed text-[#242124]/60">
+                        Direct styling draft: “{enquiryPreview}”
                       </p>
                     )}
                   </div>
