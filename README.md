@@ -2,6 +2,49 @@
 
 Boutique storefront and full-stack email authentication web application for **Sahithi Collections** (*“Style That Celebrates You.”*), built with React, Vite, Tailwind CSS, Express, and native Node.js SQLite (`node:sqlite`).
 
+## Vercel static deployment (sahithidesigns.online)
+
+Vercel serves the Vite `dist` directory; it does **not** start `server.ts`.
+Use the checked-in `vercel.json`: it installs with `npm ci`, runs
+`npm run build:static`, and rewrites page routes to `index.html`. API and
+asset paths are excluded from the page rewrite.
+
+The static build selects the existing Firebase Auth / Firestore browser adapter
+before any API request is sent. Login, session refresh, owner/admin operations,
+logout, and storefront reads use this same transport. It does not send passwords
+to missing same-origin Express endpoints. The regular `npm run build` retains
+the Express transport for full-stack deployments.
+
+Firebase remains responsible for authentication and Firestore rules remain
+responsible for data authorization. Keep Email/Password enabled, the actual
+website domain authorized in Firebase Authentication, and the project's
+`firestore.rules` deployed to the configured Firestore database. No service-account
+key, admin password, or SMTP secret belongs in the frontend. This change does not
+create accounts, verify emails, or grant admin privileges.
+
+### Apply this fix
+
+1. Commit the fixed source to the GitHub branch connected to the existing Vercel
+   project. Keep the Vercel project root at this repository root.
+2. In Vercel, use the repository settings: build command `npm run build:static`,
+   output directory `dist`, install command `npm ci`. Remove conflicting project
+   overrides if any. Deploy the new commit (redeploying an old commit won't apply
+   the fix).
+3. Open `/login` and `/admin/login` directly, then refresh each page. Check login
+   with your existing verified account and sign out. In browser Network tools,
+   static auth should call Firebase rather than `/api/auth/login` on this domain.
+4. Verify an admin change persists after refresh. If Firebase returns a provider
+   or permission error, inspect that error and the deployed Firebase configuration;
+   do not disable verification or relax Firestore rules to work around it.
+
+Validation commands: `npm test`, `npm run lint`, `npm run build:static`.
+The transport tests cover single dispatch, provider error preservation, uploads,
+static session/admin/storefront/logout routing, and unchanged server fetch options.
+A successful build and mocked tests do not establish a successful live owner login;
+that requires deployment and the owner's normal sign-in.
+
+---
+
 ## Key Features
 
 - **Public Fashion Storefront**: Collections showcase, category filters, search, sorting, Lookbook gallery + lightbox, quick-view product details, Three.js hero ribbon visual, and persistent browser-local wishlist (`localStorage`).
