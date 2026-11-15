@@ -1,3 +1,4 @@
+import { normalizeAdminOverview } from '../../services/adminOverview';
 import {
   AlertTriangle,
   ArrowUpRight,
@@ -61,7 +62,7 @@ export function AdminOverviewSection({
     );
   }
 
-  const { metrics, lowStockItems, recentOrders, recentMessages, recentAuditLogs } = overview;
+  const { metrics, lowStockItems, recentOrders, recentMessages, recentAuditLogs } = normalizeAdminOverview(overview);
 
   const cards = [
     {
