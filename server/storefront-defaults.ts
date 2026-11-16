@@ -127,6 +127,51 @@ export interface SeedCategoryDef {
 
 export const INITIAL_SEED_CATEGORIES: SeedCategoryDef[] = [
   {
+    id: 'kurtis',
+    name: 'Kurtis',
+    slug: 'kurtis',
+    subtitle: 'Breathable daily cotton kurtis, embroidered rayon & Anarkalis',
+    imageUrl: '/boutique-media/col_ethnic_wear_1794557657086.jpg',
+    altText: 'Hand-embroidered cotton and rayon kurtis',
+    position: 0,
+  },
+  {
+    id: 'kurta-sets',
+    name: 'Kurta Sets',
+    slug: 'kurta-sets',
+    subtitle: 'Coordinated kurta and pant sets, dupattas & three-piece styling',
+    imageUrl: '/boutique-media/spotlight_edit_1794557658400.jpg',
+    altText: 'Cotton kurta and pant set with dupatta',
+    position: 1,
+  },
+  {
+    id: 'sarees',
+    name: 'Sarees',
+    slug: 'sarees',
+    subtitle: 'Printed cotton sarees, soft silk-blends & festive woven borders',
+    imageUrl: '/boutique-media/prod_pearl_organza_saree_1794557659748.jpg',
+    altText: 'Soft silk-blend and printed cotton sarees',
+    position: 2,
+  },
+  {
+    id: 'co-ord-sets',
+    name: 'Co-ord Sets',
+    slug: 'co-ord-sets',
+    subtitle: 'Printed cotton and solid two-piece matching sets',
+    imageUrl: '/boutique-media/prod_co_ord_set_1794557660472.jpg',
+    altText: 'Two-piece matching co-ord sets',
+    position: 3,
+  },
+  {
+    id: 'dupattas',
+    name: 'Dupattas',
+    slug: 'dupattas',
+    subtitle: 'Embroidered chiffon & woven-border statement drapes',
+    imageUrl: '/boutique-media/col_festive_wear_1794557658541.jpg',
+    altText: 'Embroidered chiffon and woven dupattas',
+    position: 4,
+  },
+  {
     id: 'ethnic-wear',
     name: 'Ethnic Wear',
     slug: 'ethnic-wear',
@@ -134,7 +179,7 @@ export const INITIAL_SEED_CATEGORIES: SeedCategoryDef[] = [
     imageUrl: '/boutique-media/col_ethnic_wear_1794557657086.jpg',
     altText:
       'Young woman in a deep plum and muted rose silk Anarkali suit with delicate gold zari border',
-    position: 0,
+    position: 5,
   },
   {
     id: 'western-wear',
@@ -143,7 +188,7 @@ export const INITIAL_SEED_CATEGORIES: SeedCategoryDef[] = [
     subtitle: 'Tailored blazers, fluid co-ord sets & refined everyday separates',
     imageUrl: '/boutique-media/col_western_wear_1794557656476.jpg',
     altText: 'Young woman wearing a tailored warm ivory satin blazer and pleated trousers',
-    position: 1,
+    position: 6,
   },
   {
     id: 'dresses',
@@ -152,7 +197,7 @@ export const INITIAL_SEED_CATEGORIES: SeedCategoryDef[] = [
     subtitle: 'Tiered chiffon midis, floral wraps & sunlit occasion silhouettes',
     imageUrl: '/boutique-media/col_dresses_1794557657118.jpg',
     altText: 'Young woman twirling in a flowing blush pink tiered chiffon midi dress',
-    position: 2,
+    position: 7,
   },
   {
     id: 'festive-collection',
@@ -161,7 +206,7 @@ export const INITIAL_SEED_CATEGORIES: SeedCategoryDef[] = [
     subtitle: 'Velvet shararas, pearl-bordered sarees & evening statement capes',
     imageUrl: '/boutique-media/col_festive_wear_1794557658541.jpg',
     altText: 'Young woman wearing a rich mulberry plum velvet sharara set with scalloped dupatta',
-    position: 3,
+    position: 8,
   },
   {
     id: 'accessories',
@@ -170,7 +215,7 @@ export const INITIAL_SEED_CATEGORIES: SeedCategoryDef[] = [
     subtitle: 'Pearl-tasseled potlis, kundan drops, silk scarves & hair accents',
     imageUrl: '/boutique-media/col_accessories_1794557657836.jpg',
     altText: 'Pearl-embroidered blush potli clutch, rose-gold earrings, and silk scarf on travertine',
-    position: 4,
+    position: 9,
   },
 ];
 

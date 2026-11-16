@@ -25,6 +25,11 @@ import {
 } from './storefront-defaults.ts';
 
 export const ALLOWED_CATEGORIES = [
+  'Kurtis',
+  'Kurta Sets',
+  'Sarees',
+  'Co-ord Sets',
+  'Dupattas',
   'Ethnic Wear',
   'Western Wear',
   'Dresses',
