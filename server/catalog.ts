@@ -2598,6 +2598,13 @@ export function registerCatalogAndAdminRoutes(params: {
 
   app.use(
     '/boutique-media',
+    express.static('public/boutique-media', {
+      maxAge: '7d',
+      fallthrough: true,
+    })
+  );
+  app.use(
+    '/boutique-media',
     express.static('src/assets/images', {
       maxAge: '7d',
       fallthrough: true,

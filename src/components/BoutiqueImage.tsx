@@ -10,6 +10,16 @@ interface BoutiqueImageProps {
   fallbackTitle?: string;
 }
 
+const FALLBACK_MEDIA_URLS = [
+  '/boutique-media/col_ethnic_wear_1794557657086.jpg',
+  '/boutique-media/col_western_wear_1794557656476.jpg',
+  '/boutique-media/col_dresses_1794557657118.jpg',
+  '/boutique-media/col_festive_wear_1794557658541.jpg',
+  '/boutique-media/col_accessories_1794557657836.jpg',
+  '/boutique-media/hero_editorial_couture_1794557656265.jpg',
+  '/boutique-media/spotlight_edit_1794557658400.jpg',
+];
+
 export function BoutiqueImage({
   src,
   alt,
@@ -18,9 +28,24 @@ export function BoutiqueImage({
   fetchPriority = 'auto',
   fallbackTitle,
 }: BoutiqueImageProps) {
-  const [hasError, setHasError] = useState(false);
+  const [currentSrcIndex, setCurrentSrcIndex] = useState(0);
+  const [hasExhaustedFallbacks, setHasExhaustedFallbacks] = useState(false);
 
-  if (hasError || !src) {
+  const activeSrc = !src
+    ? FALLBACK_MEDIA_URLS[0]
+    : currentSrcIndex === 0
+      ? src
+      : FALLBACK_MEDIA_URLS[(currentSrcIndex - 1) % FALLBACK_MEDIA_URLS.length];
+
+  const handleImageError = () => {
+    if (currentSrcIndex < FALLBACK_MEDIA_URLS.length) {
+      setCurrentSrcIndex((prev) => prev + 1);
+    } else {
+      setHasExhaustedFallbacks(true);
+    }
+  };
+
+  if (hasExhaustedFallbacks) {
     return (
       <div
         role="img"
@@ -37,13 +62,14 @@ export function BoutiqueImage({
 
   return (
     <img
-      src={src}
+      key={activeSrc}
+      src={activeSrc}
       alt={alt}
       loading={loading}
       decoding={loading === 'eager' ? 'sync' : 'async'}
       fetchPriority={fetchPriority}
       referrerPolicy="no-referrer"
-      onError={() => setHasError(true)}
+      onError={handleImageError}
       className={className}
     />
   );
