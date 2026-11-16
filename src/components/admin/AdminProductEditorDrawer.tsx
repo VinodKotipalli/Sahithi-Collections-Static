@@ -60,6 +60,7 @@ interface ProductFormState {
   baseCompareAtInr: string;
   lowStockThreshold: string;
   featured: boolean;
+  visibilityStatus: 'published' | 'draft';
   sizesInput: string;
   colors: ProductColor[];
   variants: EditableVariant[];
@@ -105,6 +106,7 @@ function createInitialFormState(
       baseCompareAtInr: '',
       lowStockThreshold: '5',
       featured: false,
+      visibilityStatus: 'published',
       sizesInput: 'S, M, L',
       colors: [{ name: 'Blush Rose', hex: '#E8B8C8' }],
       variants: [
@@ -178,6 +180,7 @@ function createInitialFormState(
     baseCompareAtInr: paiseToInput(product.compareAtPaise),
     lowStockThreshold: String(product.lowStockThreshold ?? 5),
     featured: product.featured,
+    visibilityStatus: product.status === 'draft' ? 'draft' : 'published',
     sizesInput: product.sizes.join(', '),
     colors:
       product.colors.length > 0
@@ -556,8 +559,35 @@ export function AdminProductEditorDrawer({
     }
   };
 
-  const handleSave = async (targetStatus: 'draft' | 'published') => {
+  const handleApplyTotalStockToVariants = (rawTotalStock: string) => {
+    const parsedTotal = Number.parseInt(rawTotalStock, 10);
+    if (!Number.isFinite(parsedTotal) || parsedTotal < 0) {
+      setForm((prev) => ({
+        ...prev,
+        variants: prev.variants.map((v, idx) => (idx === 0 ? { ...v, stockQty: rawTotalStock } : { ...v, stockQty: '0' })),
+      }));
+      return;
+    }
+    const clampedTotal = Math.min(100_000, Math.max(0, parsedTotal));
+    setForm((prev) => {
+      const count = prev.variants.length;
+      if (count === 0) return prev;
+      const basePerVariant = Math.floor(clampedTotal / count);
+      const remainder = clampedTotal % count;
+      return {
+        ...prev,
+        variants: prev.variants.map((v, idx) => ({
+          ...v,
+          stockQty: String(basePerVariant + (idx < remainder ? 1 : 0)),
+        })),
+      };
+    });
+  };
+
+  const handleSave = async (targetStatusOverride?: 'draft' | 'published') => {
     if (saving || uploading) return;
+    const targetStatus: 'draft' | 'published' =
+      targetStatusOverride ?? form.visibilityStatus ?? 'published';
     setErrorText(null);
     setFieldErrors({});
     setVersionConflict(false);
@@ -735,9 +765,11 @@ export function AdminProductEditorDrawer({
       setBaselineSnapshot(JSON.stringify(nextBaseline));
       onSaved(
         res.data.product,
-        targetStatus === 'published'
-          ? `Published "${res.data.product.name}" live on the storefront.`
-          : `Saved draft "${res.data.product.name}".`
+        product
+          ? `Product updated — "${res.data.product.name}" (${targetStatus === 'published' ? 'Published' : 'Draft'}).`
+          : targetStatus === 'published'
+            ? `Published "${res.data.product.name}" live on the storefront.`
+            : `Saved draft "${res.data.product.name}".`
       );
     } finally {
       setSaving(false);
@@ -1025,7 +1057,28 @@ export function AdminProductEditorDrawer({
                         />
                       </div>
 
-                      <div className="grid grid-cols-2 gap-3">
+                      <div className="grid grid-cols-1 gap-3 sm:col-span-2 sm:grid-cols-3">
+                        <div>
+                          <label className="block text-xs font-medium text-[#49243E]">
+                            Storefront Visibility
+                          </label>
+                          <select
+                            aria-label="Storefront Visibility"
+                            value={form.visibilityStatus}
+                            onChange={(e) =>
+                              setForm((p) => ({
+                                ...p,
+                                visibilityStatus:
+                                  e.target.value === 'draft' ? 'draft' : 'published',
+                              }))
+                            }
+                            className="mt-1 h-11 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3 text-sm text-[#49243E] focus:border-[#49243E] focus:bg-white focus:outline-none"
+                          >
+                            <option value="published">Published (Visible on Storefront)</option>
+                            <option value="draft">Draft (Hidden from Storefront)</option>
+                          </select>
+                        </div>
+
                         <div>
                           <label className="block text-xs font-medium text-[#49243E]">
                             Low Stock Alert
@@ -1042,7 +1095,7 @@ export function AdminProductEditorDrawer({
                           />
                         </div>
 
-                        <div className="flex items-end pb-1">
+                        <div className="flex items-end pb-0.5">
                           <label className="flex min-h-[42px] w-full cursor-pointer items-center gap-2.5 rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3 text-xs font-medium text-[#49243E]">
                             <input
                               type="checkbox"
@@ -1237,20 +1290,48 @@ export function AdminProductEditorDrawer({
                       </div>
                     </div>
 
-                    {/* Base Price Helpers */}
-                    <div className="mt-4 grid grid-cols-1 gap-3 rounded-2xl border border-[#49243E]/10 bg-[#FFF9F5]/65 p-4 sm:grid-cols-3">
+                    {/* Base Price & Total Stock Helpers */}
+                    <div className="mt-4 grid grid-cols-1 gap-3 rounded-2xl border border-[#49243E]/10 bg-[#FFF9F5]/65 p-4 sm:grid-cols-2 lg:grid-cols-4">
                       <div>
                         <label className="block text-xs font-medium text-[#49243E]">
-                          Default Selling Price (INR)
+                          Selling Price (INR)
                         </label>
                         <input
                           type="number"
                           step="0.01"
                           min={1}
+                          aria-label="Selling Price (INR)"
                           value={form.basePriceInr}
                           onChange={(e) => {
+                            const nextVal = e.target.value;
+                            const nextNum = Number(nextVal);
                             clearFieldError('price');
-                            setForm((p) => ({ ...p, basePriceInr: e.target.value }));
+                            clearFieldError('compareAtPrice');
+                            clearFieldError('variants');
+                            setForm((p) => {
+                              const shouldClearBaseCompare =
+                                p.baseCompareAtInr.trim() !== '' &&
+                                Number.isFinite(nextNum) &&
+                                nextNum > 0 &&
+                                Number(p.baseCompareAtInr) <= nextNum;
+                              return {
+                                ...p,
+                                basePriceInr: nextVal,
+                                baseCompareAtInr: shouldClearBaseCompare ? '' : p.baseCompareAtInr,
+                                variants: p.variants.map((v) => {
+                                  const clearVarCompare =
+                                    v.compareAtInr.trim() !== '' &&
+                                    Number.isFinite(nextNum) &&
+                                    nextNum > 0 &&
+                                    Number(v.compareAtInr) <= nextNum;
+                                  return {
+                                    ...v,
+                                    priceInr: nextVal,
+                                    compareAtInr: clearVarCompare ? '' : v.compareAtInr,
+                                  };
+                                }),
+                              };
+                            });
                           }}
                           className={`mt-1 h-10 w-full rounded-xl border bg-white px-3 text-sm tabular-nums focus:outline-none ${
                             fieldErrors.price
@@ -1272,8 +1353,16 @@ export function AdminProductEditorDrawer({
                           min={0}
                           value={form.baseCompareAtInr}
                           onChange={(e) => {
+                            const nextCompare = e.target.value;
                             clearFieldError('compareAtPrice');
-                            setForm((p) => ({ ...p, baseCompareAtInr: e.target.value }));
+                            setForm((p) => ({
+                              ...p,
+                              baseCompareAtInr: nextCompare,
+                              variants: p.variants.map((v) => ({
+                                ...v,
+                                compareAtInr: nextCompare,
+                              })),
+                            }));
                           }}
                           placeholder="e.g. 3499"
                           className={`mt-1 h-10 w-full rounded-xl border bg-white px-3 text-sm tabular-nums focus:outline-none ${
@@ -1287,6 +1376,23 @@ export function AdminProductEditorDrawer({
                             {fieldErrors.compareAtPrice}
                           </p>
                         )}
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-[#49243E]">
+                          Total Stock Quantity
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={100000}
+                          aria-label="Total Stock Quantity"
+                          value={String(derivedTotals.totalStock)}
+                          onChange={(e) => {
+                            clearFieldError('variants');
+                            handleApplyTotalStockToVariants(e.target.value);
+                          }}
+                          className="mt-1 h-10 w-full rounded-xl border border-[#49243E]/18 bg-white px-3 text-sm font-semibold tabular-nums focus:border-[#49243E] focus:outline-none"
+                        />
                       </div>
                       <div className="flex items-end">
                         <button
@@ -1597,7 +1703,7 @@ export function AdminProductEditorDrawer({
                 <button
                   type="button"
                   disabled={saving || uploading}
-                  onClick={() => void handleSave('published')}
+                  onClick={() => void handleSave(product ? form.visibilityStatus : 'published')}
                   className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-[#49243E] px-5 text-sm font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31] disabled:opacity-50"
                 >
                   {saving ? (
@@ -1605,7 +1711,13 @@ export function AdminProductEditorDrawer({
                   ) : (
                     <Globe className="h-4 w-4" aria-hidden="true" />
                   )}
-                  <span>{product?.status === 'published' ? 'Save & Keep Live' : 'Publish to Storefront'}</span>
+                  <span>
+                    {product
+                      ? form.visibilityStatus === 'draft'
+                        ? 'Save Changes (Draft)'
+                        : 'Save Changes'
+                      : 'Publish to Storefront'}
+                  </span>
                 </button>
               </div>
             </div>

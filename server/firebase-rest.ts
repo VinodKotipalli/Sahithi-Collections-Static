@@ -1539,6 +1539,125 @@ export class FirestoreRestStore implements BoutiqueStore {
   // Seeding & Public/Admin Queries
   // -------------------------------------------------------------------------
 
+  private hiddenProductIds = new Set<string>();
+  private hiddenProductSlugs = new Set<string>();
+  private deletedProductIds = new Set<string>();
+
+  private async getCatalogVisibilityMeta(): Promise<{
+    hiddenIds: Set<string>;
+    hiddenSlugs: Set<string>;
+    deletedIds: Set<string>;
+  }> {
+    const hiddenIds = new Set<string>(this.hiddenProductIds);
+    const hiddenSlugs = new Set<string>(this.hiddenProductSlugs);
+    const deletedIds = new Set<string>(this.deletedProductIds);
+
+    try {
+      const settingsDoc = await this.getDoc('site_documents/settings');
+      if (settingsDoc && settingsDoc.data) {
+        const rawHiddenIds = settingsDoc.data.hidden_product_ids;
+        if (Array.isArray(rawHiddenIds)) {
+          for (const id of rawHiddenIds) {
+            if (typeof id === 'string' && id) {
+              hiddenIds.add(id);
+              this.hiddenProductIds.add(id);
+            }
+          }
+        }
+        const rawHiddenSlugs = settingsDoc.data.hidden_product_slugs;
+        if (Array.isArray(rawHiddenSlugs)) {
+          for (const slug of rawHiddenSlugs) {
+            if (typeof slug === 'string' && slug) {
+              hiddenSlugs.add(slug);
+              this.hiddenProductSlugs.add(slug);
+            }
+          }
+        }
+        const rawDeletedIds = settingsDoc.data.deleted_product_ids;
+        if (Array.isArray(rawDeletedIds)) {
+          for (const id of rawDeletedIds) {
+            if (typeof id === 'string' && id) {
+              deletedIds.add(id);
+              hiddenIds.add(id);
+              this.deletedProductIds.add(id);
+              this.hiddenProductIds.add(id);
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore transient settings read failure
+    }
+
+    if (getActiveFirestoreIdToken()) {
+      try {
+        const [allProductDocs, auditDocs] = await Promise.all([
+          this.runQuery('products'),
+          this.runQuery('product_audit_logs'),
+        ]);
+        for (const a of auditDocs) {
+          if (a.data.action === 'delete' && typeof a.data.product_id === 'string') {
+            const pid = a.data.product_id;
+            deletedIds.add(pid);
+            hiddenIds.add(pid);
+            this.deletedProductIds.add(pid);
+            this.hiddenProductIds.add(pid);
+            const starter = INITIAL_SEED_PRODUCTS.find((s) => s.id === pid);
+            if (starter) {
+              hiddenSlugs.add(starter.slug);
+              this.hiddenProductSlugs.add(starter.slug);
+            }
+          }
+        }
+        for (const d of allProductDocs) {
+          const p = d.data as unknown as FirestoreProductDoc;
+          if (p.status === 'published') {
+            deletedIds.delete(p.id);
+            this.deletedProductIds.delete(p.id);
+          } else {
+            hiddenIds.add(p.id);
+            hiddenSlugs.add(p.slug);
+            this.hiddenProductIds.add(p.id);
+            this.hiddenProductSlugs.add(p.slug);
+          }
+        }
+      } catch {
+        // Ignore transient owner query error
+      }
+    }
+
+    for (const id of deletedIds) {
+      const starter = INITIAL_SEED_PRODUCTS.find((s) => s.id === id);
+      if (starter) {
+        hiddenSlugs.add(starter.slug);
+        this.hiddenProductSlugs.add(starter.slug);
+      }
+    }
+
+    return { hiddenIds, hiddenSlugs, deletedIds };
+  }
+
+  private async persistCatalogVisibilityMeta(): Promise<void> {
+    if (!getActiveFirestoreIdToken()) return;
+    try {
+      const existing = await this.getDoc('site_documents/settings');
+      const currentValue =
+        existing && existing.data && existing.data.value
+          ? existing.data.value
+          : DEFAULT_SITE_SETTINGS;
+      await this.setDoc('site_documents/settings', {
+        key: 'settings',
+        value: currentValue,
+        hidden_product_ids: Array.from(this.hiddenProductIds),
+        hidden_product_slugs: Array.from(this.hiddenProductSlugs),
+        deleted_product_ids: Array.from(this.deletedProductIds),
+        updated_at: Date.now(),
+      });
+    } catch {
+      // Non-fatal if settings write fails
+    }
+  }
+
   async seedInitialCatalogIfEmpty(): Promise<void> {
     // Only writes when an authenticated owner token is present in request context.
     if (!getActiveFirestoreIdToken()) {
@@ -1546,12 +1665,14 @@ export class FirestoreRestStore implements BoutiqueStore {
     }
 
     const now = Date.now();
-    const [existingCats, existingProducts, existingSettings, existingContent] = await Promise.all([
-      this.runQuery('categories'),
-      this.runQuery('products'),
-      this.getDoc('site_documents/settings'),
-      this.getDoc('site_documents/content'),
-    ]);
+    const [existingCats, existingProducts, existingSettings, existingContent, meta] =
+      await Promise.all([
+        this.runQuery('categories'),
+        this.runQuery('products'),
+        this.getDoc('site_documents/settings'),
+        this.getDoc('site_documents/content'),
+        this.getCatalogVisibilityMeta(),
+      ]);
 
     const existingCatIds = new Set(existingCats.map((c) => c.id));
     const missingCats = INITIAL_SEED_CATEGORIES.filter((c) => !existingCatIds.has(c.id));
@@ -1579,6 +1700,9 @@ export class FirestoreRestStore implements BoutiqueStore {
       await this.setDoc('site_documents/settings', {
         key: 'settings',
         value: DEFAULT_SITE_SETTINGS,
+        hidden_product_ids: Array.from(meta.hiddenIds),
+        hidden_product_slugs: Array.from(meta.hiddenSlugs),
+        deleted_product_ids: Array.from(meta.deletedIds),
         updated_at: now,
       });
     }
@@ -1592,7 +1716,9 @@ export class FirestoreRestStore implements BoutiqueStore {
     }
 
     const existingProductIds = new Set(existingProducts.map((p) => p.id));
-    const missingProducts = INITIAL_SEED_PRODUCTS.filter((p) => !existingProductIds.has(p.id));
+    const missingProducts = INITIAL_SEED_PRODUCTS.filter(
+      (p) => !existingProductIds.has(p.id) && !meta.deletedIds.has(p.id)
+    );
     if (missingProducts.length > 0) {
       const writes = missingProducts.map((p, idx) => {
         const doc = buildSeedStarterProductDoc(p, idx, now);
@@ -1608,8 +1734,55 @@ export class FirestoreRestStore implements BoutiqueStore {
   }
 
   private async getAllProductDocs(): Promise<FirestoreProductDoc[]> {
-    const docs = await this.runQuery('products');
-    return docs.map((d) => d.data as unknown as FirestoreProductDoc);
+    const [docs, meta] = await Promise.all([
+      this.runQuery('products'),
+      this.getCatalogVisibilityMeta(),
+    ]);
+    const list = docs
+      .map((d) => d.data as unknown as FirestoreProductDoc)
+      .filter((d) => !meta.deletedIds.has(d.id));
+    const existingIds = new Set(list.map((d) => d.id));
+    const existingSlugs = new Set(list.map((d) => d.slug));
+    const now = Date.now();
+    INITIAL_SEED_PRODUCTS.forEach((p, idx) => {
+      if (
+        !existingIds.has(p.id) &&
+        !existingSlugs.has(p.slug) &&
+        !meta.deletedIds.has(p.id)
+      ) {
+        const doc = buildSeedStarterProductDoc(p, idx, now);
+        if (meta.hiddenIds.has(doc.id) && doc.status === 'published') {
+          doc.status = 'draft';
+        }
+        list.push(doc);
+      }
+    });
+    return list;
+  }
+
+  private async getOrMaterializeProductDoc(id: string): Promise<{
+    data: FirestoreProductDoc;
+    updateTime?: string;
+    isStarterFallback: boolean;
+  } | null> {
+    if (this.deletedProductIds.has(id)) return null;
+    const existing = await this.getDoc(`products/${id}`);
+    if (existing) {
+      return {
+        data: existing.data as unknown as FirestoreProductDoc,
+        updateTime: existing.updateTime,
+        isStarterFallback: false,
+      };
+    }
+    const meta = await this.getCatalogVisibilityMeta();
+    if (meta.deletedIds.has(id)) return null;
+    const seedIdx = INITIAL_SEED_PRODUCTS.findIndex((p) => p.id === id);
+    if (seedIdx < 0) return null;
+    const doc = buildSeedStarterProductDoc(INITIAL_SEED_PRODUCTS[seedIdx], seedIdx, Date.now());
+    return {
+      data: doc,
+      isStarterFallback: true,
+    };
   }
 
   private async getPublishedProductDocs(): Promise<FirestoreProductDoc[]> {
@@ -1698,14 +1871,25 @@ export class FirestoreRestStore implements BoutiqueStore {
     q?: string;
     featuredOnly?: boolean;
   }): Promise<ProductWithParts[]> {
-    const published = await this.getPublishedProductDocs();
-    let list = published.map((d) => fromFirestoreProduct(d));
+    const [published, meta] = await Promise.all([
+      this.getPublishedProductDocs(),
+      this.getCatalogVisibilityMeta(),
+    ]);
+    let list = published
+      .filter((d) => !meta.hiddenIds.has(d.id) && !meta.deletedIds.has(d.id))
+      .map((d) => fromFirestoreProduct(d));
 
-    // Ensure all starter/catalog products are available even if Firestore only had an older subset seeded
+    // Ensure starter/catalog products are available unless hidden, unpublished, archived, or deleted
     const existingIds = new Set(list.map((item) => item.product.id));
     const existingSlugs = new Set(list.map((item) => item.product.slug));
     for (const starter of buildStarterReadProducts(Date.now())) {
-      if (!existingIds.has(starter.product.id) && !existingSlugs.has(starter.product.slug)) {
+      if (
+        !existingIds.has(starter.product.id) &&
+        !existingSlugs.has(starter.product.slug) &&
+        !meta.hiddenIds.has(starter.product.id) &&
+        !meta.deletedIds.has(starter.product.id) &&
+        !meta.hiddenSlugs.has(starter.product.slug)
+      ) {
         list.push(starter);
       }
     }
@@ -1736,15 +1920,34 @@ export class FirestoreRestStore implements BoutiqueStore {
   }
 
   async getPublicProductByIdOrSlug(idOrSlug: string): Promise<ProductWithParts | null> {
-    const published = await this.getPublishedProductDocs();
-    const match = published.find((d) => d.id === idOrSlug || d.slug === idOrSlug);
+    const [published, meta] = await Promise.all([
+      this.getPublishedProductDocs(),
+      this.getCatalogVisibilityMeta(),
+    ]);
+    const match = published.find(
+      (d) =>
+        !meta.hiddenIds.has(d.id) &&
+        !meta.deletedIds.has(d.id) &&
+        (d.id === idOrSlug || d.slug === idOrSlug)
+    );
     if (match) return fromFirestoreProduct(match);
 
-    return (
-      buildStarterReadProducts(Date.now()).find(
-        (item) => item.product.id === idOrSlug || item.product.slug === idOrSlug
-      ) || null
+    const starter = buildStarterReadProducts(Date.now()).find(
+      (item) => item.product.id === idOrSlug || item.product.slug === idOrSlug
     );
+    if (!starter) return null;
+    if (
+      meta.hiddenIds.has(starter.product.id) ||
+      meta.deletedIds.has(starter.product.id) ||
+      meta.hiddenSlugs.has(starter.product.slug)
+    ) {
+      return null;
+    }
+    // Also check if another published product already replaced this starter ID with a different slug
+    if (published.some((d) => d.id === starter.product.id)) {
+      return null;
+    }
+    return starter;
   }
 
   async isProductSkuConflict(sku: string, excludeProductId?: string): Promise<boolean> {
@@ -1868,6 +2071,8 @@ export class FirestoreRestStore implements BoutiqueStore {
     let filtered = products;
     if (query.status && query.status !== 'all') {
       filtered = filtered.filter((p) => p.status === query.status);
+    } else {
+      filtered = filtered.filter((p) => p.status !== 'archived');
     }
     if (query.category && query.category !== 'All') {
       filtered = filtered.filter((p) => p.category === query.category);
@@ -1919,9 +2124,9 @@ export class FirestoreRestStore implements BoutiqueStore {
   }
 
   async getAdminProduct(id: string) {
-    const doc = await this.getDoc(`products/${id}`);
+    const doc = await this.getOrMaterializeProductDoc(id);
     if (!doc) return null;
-    const prodDoc = doc.data as unknown as FirestoreProductDoc;
+    const prodDoc = doc.data;
     const [orders, auditDocs] = await Promise.all([
       this.getAllOrderDocs(),
       this.runQuery('product_audit_logs', {
@@ -2023,6 +2228,15 @@ export class FirestoreRestStore implements BoutiqueStore {
       },
     ]);
 
+    this.deletedProductIds.delete(prodDoc.id);
+    if (prodDoc.status === 'published') {
+      this.hiddenProductIds.delete(prodDoc.id);
+      this.hiddenProductSlugs.delete(prodDoc.slug);
+    } else {
+      this.hiddenProductIds.add(prodDoc.id);
+      this.hiddenProductSlugs.add(prodDoc.slug);
+    }
+    await this.persistCatalogVisibilityMeta();
     await this.syncReferencedMediaPublicStatus();
     return { ...fromFirestoreProduct(prodDoc), orderCount: 0 };
   }
@@ -2054,9 +2268,9 @@ export class FirestoreRestStore implements BoutiqueStore {
     auditBefore: unknown;
     auditAfter: unknown;
   }) {
-    const existingDoc = await this.getDoc(`products/${input.productId}`);
+    const existingDoc = await this.getOrMaterializeProductDoc(input.productId);
     if (!existingDoc) return { ok: false as const, code: 'PRODUCT_NOT_FOUND' as const };
-    const current = existingDoc.data as unknown as FirestoreProductDoc;
+    const current = existingDoc.data;
     if (Number(current.version) !== input.expectedVersion) {
       return { ok: false as const, code: 'VERSION_CONFLICT' as const };
     }
@@ -2098,15 +2312,28 @@ export class FirestoreRestStore implements BoutiqueStore {
     };
 
     try {
-      await this.setDoc(`products/${input.productId}`, updated as unknown as Record<string, unknown>, {
-        updateTime: existingDoc.updateTime,
-      });
+      await this.setDoc(
+        `products/${input.productId}`,
+        updated as unknown as Record<string, unknown>,
+        existingDoc.updateTime ? { updateTime: existingDoc.updateTime } : undefined
+      );
     } catch (err) {
       if (err instanceof StoreHttpError && err.code === 'VERSION_CONFLICT') {
         return { ok: false as const, code: 'VERSION_CONFLICT' as const };
       }
       throw err;
     }
+
+    this.deletedProductIds.delete(input.productId);
+    if (input.nextStatus === 'published') {
+      this.hiddenProductIds.delete(input.productId);
+      this.hiddenProductSlugs.delete(updated.slug);
+    } else {
+      this.hiddenProductIds.add(input.productId);
+      this.hiddenProductSlugs.add(updated.slug);
+      this.hiddenProductSlugs.add(current.slug);
+    }
+    await this.persistCatalogVisibilityMeta();
 
     const auditId = crypto.randomUUID();
     await this.setDoc(`product_audit_logs/${auditId}`, {
@@ -2131,9 +2358,9 @@ export class FirestoreRestStore implements BoutiqueStore {
   }
 
   async duplicateProduct(sourceId: string, actorUserId: string): Promise<AdminProductRecord | null> {
-    const existingDoc = await this.getDoc(`products/${sourceId}`);
+    const existingDoc = await this.getOrMaterializeProductDoc(sourceId);
     if (!existingDoc) return null;
-    const src = existingDoc.data as unknown as FirestoreProductDoc;
+    const src = existingDoc.data;
 
     const now = Date.now();
     const newId = crypto.randomUUID();
@@ -2217,9 +2444,9 @@ export class FirestoreRestStore implements BoutiqueStore {
     actionName: 'publish' | 'unpublish' | 'archive' | 'restore';
     actorUserId: string;
   }) {
-    const existingDoc = await this.getDoc(`products/${input.productId}`);
+    const existingDoc = await this.getOrMaterializeProductDoc(input.productId);
     if (!existingDoc) return { ok: false as const, code: 'PRODUCT_NOT_FOUND' as const };
-    const current = existingDoc.data as unknown as FirestoreProductDoc;
+    const current = existingDoc.data;
     if (Number(current.version) !== input.expectedVersion) {
       return { ok: false as const, code: 'VERSION_CONFLICT' as const };
     }
@@ -2241,15 +2468,27 @@ export class FirestoreRestStore implements BoutiqueStore {
     };
 
     try {
-      await this.setDoc(`products/${input.productId}`, updated as unknown as Record<string, unknown>, {
-        updateTime: existingDoc.updateTime,
-      });
+      await this.setDoc(
+        `products/${input.productId}`,
+        updated as unknown as Record<string, unknown>,
+        existingDoc.updateTime ? { updateTime: existingDoc.updateTime } : undefined
+      );
     } catch (err) {
       if (err instanceof StoreHttpError && err.code === 'VERSION_CONFLICT') {
         return { ok: false as const, code: 'VERSION_CONFLICT' as const };
       }
       throw err;
     }
+
+    this.deletedProductIds.delete(input.productId);
+    if (input.targetStatus === 'published') {
+      this.hiddenProductIds.delete(input.productId);
+      this.hiddenProductSlugs.delete(updated.slug);
+    } else {
+      this.hiddenProductIds.add(input.productId);
+      this.hiddenProductSlugs.add(updated.slug);
+    }
+    await this.persistCatalogVisibilityMeta();
 
     const auditId = crypto.randomUUID();
     await this.setDoc(`product_audit_logs/${auditId}`, {
@@ -2274,13 +2513,14 @@ export class FirestoreRestStore implements BoutiqueStore {
   }
 
   async deleteOrArchiveProduct(productId: string, actorUserId: string) {
-    const existingDoc = await this.getDoc(`products/${productId}`);
+    const existingDoc = await this.getOrMaterializeProductDoc(productId);
     if (!existingDoc) return { ok: false as const, code: 'PRODUCT_NOT_FOUND' as const };
-    const current = existingDoc.data as unknown as FirestoreProductDoc;
+    const current = existingDoc.data;
 
     const orders = await this.getAllOrderDocs();
     const refCount = this.computeOrderCounts(orders).get(productId) || 0;
     const now = Date.now();
+    const starterMatch = INITIAL_SEED_PRODUCTS.find((p) => p.id === productId);
 
     if (refCount > 0) {
       const archived: FirestoreProductDoc = {
@@ -2290,6 +2530,13 @@ export class FirestoreRestStore implements BoutiqueStore {
         version: current.version + 1,
         updated_at: now,
       };
+      this.hiddenProductIds.add(productId);
+      this.hiddenProductSlugs.add(current.slug);
+      if (starterMatch) {
+        this.hiddenProductSlugs.add(starterMatch.slug);
+      }
+      await this.persistCatalogVisibilityMeta();
+
       const auditId = crypto.randomUUID();
       await this.commitBatch([
         {
@@ -2323,9 +2570,16 @@ export class FirestoreRestStore implements BoutiqueStore {
       };
     }
 
+    this.deletedProductIds.add(productId);
+    this.hiddenProductIds.add(productId);
+    this.hiddenProductSlugs.add(current.slug);
+    if (starterMatch) {
+      this.hiddenProductSlugs.add(starterMatch.slug);
+    }
+    await this.persistCatalogVisibilityMeta();
+
     const auditId = crypto.randomUUID();
-    await this.commitBatch([
-      { delete: `${this.dbRootResource}/${this.envRelPath}/products/${productId}` },
+    const writes: Array<Record<string, unknown>> = [
       {
         update: {
           name: `${this.dbRootResource}/${this.envRelPath}/product_audit_logs/${auditId}`,
@@ -2342,7 +2596,13 @@ export class FirestoreRestStore implements BoutiqueStore {
           }),
         },
       },
-    ]);
+    ];
+    if (!existingDoc.isStarterFallback) {
+      writes.unshift({
+        delete: `${this.dbRootResource}/${this.envRelPath}/products/${productId}`,
+      });
+    }
+    await this.commitBatch(writes);
     await this.syncReferencedMediaPublicStatus();
     return { ok: true as const, archivedInsteadOfDeleted: false };
   }
@@ -2848,9 +3108,13 @@ export class FirestoreRestStore implements BoutiqueStore {
 
   async saveSiteSettings(settings: SiteSettingsData): Promise<SiteSettingsData> {
     const merged = mergeSiteSettings(settings);
+    await this.getCatalogVisibilityMeta();
     await this.setDoc('site_documents/settings', {
       key: 'settings',
       value: merged,
+      hidden_product_ids: Array.from(this.hiddenProductIds),
+      hidden_product_slugs: Array.from(this.hiddenProductSlugs),
+      deleted_product_ids: Array.from(this.deletedProductIds),
       updated_at: Date.now(),
     });
     await this.syncReferencedMediaPublicStatus();

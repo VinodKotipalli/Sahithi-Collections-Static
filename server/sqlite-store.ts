@@ -539,6 +539,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
 
     if (query.status && query.status !== 'all') {
       rows = rows.filter((r) => r.status === query.status);
+    } else {
+      rows = rows.filter((r) => r.status !== 'archived');
     }
     if (query.category && query.category !== 'All') {
       rows = rows.filter((r) => r.category === query.category);

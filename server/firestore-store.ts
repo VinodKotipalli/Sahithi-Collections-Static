@@ -663,8 +663,15 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
   }
 
   async seedInitialCatalogIfEmpty(): Promise<void> {
-    const existingSnap = await this.productsCol().get();
+    const [existingSnap, deleteAuditsSnap] = await Promise.all([
+      this.productsCol().get(),
+      this.auditCol().where('action', '==', 'delete').get(),
+    ]);
     const existingIds = new Set(existingSnap.docs.map((d) => d.id));
+    for (const doc of deleteAuditsSnap.docs) {
+      const pid = String(doc.data().product_id || '');
+      if (pid) existingIds.add(pid);
+    }
     const missingItems = INITIAL_SEED_PRODUCTS.filter((item) => !existingIds.has(item.id));
     if (missingItems.length === 0) return;
 
@@ -945,6 +952,8 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
 
     if (query.status && query.status !== 'all') {
       items = items.filter((r) => r.product.status === query.status);
+    } else {
+      items = items.filter((r) => r.product.status !== 'archived');
     }
     if (query.category && query.category !== 'All') {
       items = items.filter((r) => r.product.category === query.category);

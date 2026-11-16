@@ -742,12 +742,18 @@ async function validateAndNormalizeProductInput(
     const colorsList =
       inputColors.length > 0 ? inputColors : [{ name: 'Signature', hex: '#49243E' }];
 
-    const singleStock =
-      typeof body.stockQty === 'number' &&
-      Number.isInteger(body.stockQty) &&
-      body.stockQty >= 0 &&
-      body.stockQty <= 100_000
+    const rawStockVal =
+      typeof body.stockQty === 'number'
         ? body.stockQty
+        : typeof body.stock === 'number'
+          ? body.stock
+          : undefined;
+    const singleStock =
+      typeof rawStockVal === 'number' &&
+      Number.isInteger(rawStockVal) &&
+      rawStockVal >= 0 &&
+      rawStockVal <= 100_000
+        ? rawStockVal
         : 0;
 
     let idx = 0;
@@ -1650,9 +1656,11 @@ export function registerCatalogAndAdminRoutes(params: {
         const d = parsed.data;
         const now = Date.now();
         const slug =
-          d.title === existing.title
-            ? existing.slug
-            : await store.makeUniqueSlug(d.title, existing.id);
+          typeof req.body?.slug === 'string' &&
+          req.body.slug.trim() &&
+          req.body.slug.trim() !== existing.slug
+            ? await store.makeUniqueSlug(req.body.slug.trim(), existing.id)
+            : existing.slug;
         const totalStock = d.variants.reduce((sum, v) => sum + v.stockQty, 0);
         const nextStatus: ProductStatus =
           req.body?.status === 'published' || req.body?.status === 'draft'

@@ -506,6 +506,15 @@ export function AdminProductTable({
                     >
                       <Copy className="h-4 w-4" aria-hidden="true" />
                     </button>
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => onRequestDelete(product)}
+                      aria-label={`Delete ${product.name}`}
+                      className="flex min-h-[42px] min-w-[42px] items-center justify-center rounded-xl border border-[#B76E79]/30 bg-white text-[#9B2C3E]"
+                    >
+                      <Trash2 className="h-4 w-4" aria-hidden="true" />
+                    </button>
                   </div>
                 </li>
               );

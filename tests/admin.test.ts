@@ -1583,6 +1583,227 @@ test('Sign out clears partitioned and unpartitioned cookies, enforces no-store c
   assert.equal(adminAfter.headers.get('location'), '/admin/login');
 });
 
+test('Edit Product and Delete Product: preserves existing URL on title edit, syncs storefront, removes deleted items from active list and cart, and enforces 401/403 RBAC', async () => {
+  const ownerEmail = 'saivinodkotipalli2003@gmail.com';
+  const ownerPass = 'RecoveredBoutique#2026!';
+  const ownerJar = new CookieJar();
+  const { csrfToken: initCsrf } = await getSession(ownerJar);
 
+  const loginRes = await jsonReq(
+    ownerJar,
+    'POST',
+    '/api/admin/login',
+    { email: ownerEmail, password: ownerPass },
+    initCsrf
+  );
+  assert.equal(loginRes.res.status, 200);
+  const ownerCsrf = String(loginRes.json.csrfToken);
 
+  // Create a published test product
+  const createRes = await jsonReq(
+    ownerJar,
+    'POST',
+    '/api/admin/products',
+    {
+      title: 'Test Boutique Kurti',
+      category: 'Kurtis',
+      sku: 'SC-TEST-EDIT-DEL',
+      description: 'Handcrafted test kurti for verifying edit and delete workflows.',
+      fabricNote: 'Pure Cotton',
+      pricePaise: 79900,
+      status: 'published',
+      images: [{ url: '/boutique-media/prod_hand_embroidered_kurti_1794557658962.jpg', alt: 'Test Boutique Kurti', isCover: true }],
+      variants: [
+        {
+          sku: 'SC-TEST-EDIT-DEL-S',
+          size: 'S',
+          colorName: 'Rose',
+          colorHex: '#E8B8C8',
+          pricePaise: 79900,
+          compareAtPaise: null,
+          stockQty: 10,
+        },
+      ],
+    },
+    ownerCsrf
+  );
+  assert.equal(createRes.res.status, 201);
+  const created = createRes.json.product as {
+    id: string;
+    slug: string;
+    name: string;
+    pricePaise: number;
+    stockQty: number;
+    version: number;
+    variants: Array<{ id: string; sku: string }>;
+  };
+  const originalSlug = created.slug;
+  assert.equal(originalSlug, 'test-boutique-kurti');
 
+  // Verify non-admins receive 401 (signed out) and 403 (customer) on direct edit and delete requests
+  const anonJar = new CookieJar();
+  const { csrfToken: anonCsrf } = await getSession(anonJar);
+  const anonEdit = await jsonReq(
+    anonJar,
+    'PATCH',
+    `/api/admin/products/${created.id}`,
+    { title: 'Hacked Title' },
+    anonCsrf
+  );
+  assert.equal(anonEdit.res.status, 401);
+  const anonDel = await jsonReq(
+    anonJar,
+    'DELETE',
+    `/api/admin/products/${created.id}`,
+    undefined,
+    anonCsrf
+  );
+  assert.equal(anonDel.res.status, 401);
+
+  const custJar = new CookieJar();
+  const cust = await registerAndVerifyCustomer(
+    custJar,
+    'Non Admin Shopper',
+    'non-admin-rbac@example.com',
+    'ShopperPass#2026!'
+  );
+  const custEdit = await jsonReq(
+    custJar,
+    'PATCH',
+    `/api/admin/products/${created.id}`,
+    { title: 'Hacked Title' },
+    cust.csrfToken
+  );
+  assert.equal(custEdit.res.status, 403);
+  const custDel = await jsonReq(
+    custJar,
+    'DELETE',
+    `/api/admin/products/${created.id}`,
+    undefined,
+    cust.csrfToken
+  );
+  assert.equal(custDel.res.status, 403);
+
+  // Edit product's name, price, and stock as admin
+  const patchRes = await jsonReq(
+    ownerJar,
+    'PATCH',
+    `/api/admin/products/${created.id}`,
+    {
+      expectedVersion: created.version,
+      title: 'Test Boutique Kurti Edited Edition',
+      category: 'Kurtis',
+      sku: 'SC-TEST-EDIT-DEL',
+      description: 'Updated description for the edited test kurti.',
+      fabricNote: 'Pure Mulmul Cotton',
+      pricePaise: 94900,
+      status: 'published',
+      images: [{ url: '/boutique-media/prod_hand_embroidered_kurti_1794557658962.jpg', alt: 'Test Boutique Kurti Edited Edition', isCover: true }],
+      variants: [
+        {
+          id: created.variants[0].id,
+          sku: 'SC-TEST-EDIT-DEL-S',
+          size: 'S',
+          colorName: 'Rose',
+          colorHex: '#E8B8C8',
+          pricePaise: 94900,
+          compareAtPaise: null,
+          stockQty: 18,
+        },
+      ],
+    },
+    ownerCsrf
+  );
+  assert.equal(patchRes.res.status, 200);
+  const updated = patchRes.json.product as {
+    id: string;
+    slug: string;
+    name: string;
+    pricePaise: number;
+    stockQty: number;
+  };
+  assert.equal(updated.name, 'Test Boutique Kurti Edited Edition');
+  assert.equal(updated.pricePaise, 94900);
+  assert.equal(updated.stockQty, 18);
+  // Existing URL slug MUST be preserved after title edit!
+  assert.equal(updated.slug, originalSlug);
+
+  // Verify at existing product URL (/api/products/<originalSlug>) and signed-out storefront list
+  const bySlugRes = await fetch(`${baseUrl}/api/products/${originalSlug}`);
+  assert.equal(bySlugRes.status, 200);
+  const bySlugData = (await bySlugRes.json()) as {
+    product: { id: string; name: string; pricePaise: number; stockQty: number };
+  };
+  assert.equal(bySlugData.product.name, 'Test Boutique Kurti Edited Edition');
+  assert.equal(bySlugData.product.pricePaise, 94900);
+  assert.equal(bySlugData.product.stockQty, 18);
+
+  // Now delete the test product as admin
+  const delRes = await jsonReq(
+    ownerJar,
+    'DELETE',
+    `/api/admin/products/${created.id}`,
+    undefined,
+    ownerCsrf
+  );
+  assert.equal(delRes.res.status, 200);
+  assert.equal(delRes.json.archivedInsteadOfDeleted, false);
+
+  // Verify removed from active admin list
+  const adminListRes = await fetch(`${baseUrl}/api/admin/products?pageSize=100`, {
+    headers: { Cookie: ownerJar.getHeader() },
+  });
+  const adminListData = (await adminListRes.json()) as { items: Array<{ id: string }> };
+  assert.ok(!adminListData.items.some((p) => p.id === created.id));
+
+  // Verify removed from public storefront & category filter & old product URL returns 404
+  const pubListRes = await fetch(`${baseUrl}/api/products?category=Kurtis`);
+  const pubListData = (await pubListRes.json()) as { items: Array<{ id: string }> };
+  assert.ok(!pubListData.items.some((p) => p.id === created.id));
+
+  const oldUrlRes = await fetch(`${baseUrl}/api/products/${originalSlug}`);
+  assert.equal(oldUrlRes.status, 404);
+
+  // Verify customer with the deleted product in their cart cannot order it
+  const cartCheckRes = await jsonReq(
+    anonJar,
+    'POST',
+    '/api/cart/validate',
+    {
+      items: [
+        {
+          productId: created.id,
+          variantId: created.variants[0].id,
+          quantity: 1,
+          seenPricePaise: 94900,
+        },
+      ],
+    },
+    anonCsrf
+  );
+  assert.equal(cartCheckRes.res.status, 200);
+  assert.equal(cartCheckRes.json.hasUnavailable, true);
+
+  const orderDeletedRes = await jsonReq(
+    anonJar,
+    'POST',
+    '/api/orders',
+    {
+      customerName: 'Test Shopper',
+      customerEmail: 'shopper@example.com',
+      customerPhone: '+91 9876543210',
+      shippingAddress: '12 Jubilee Hills, Hyderabad 500033',
+      items: [
+        {
+          productId: created.id,
+          variantId: created.variants[0].id,
+          quantity: 1,
+          expectedPricePaise: 94900,
+        },
+      ],
+    },
+    anonCsrf
+  );
+  assert.equal(orderDeletedRes.res.status, 409);
+  assert.equal(orderDeletedRes.json.code, 'PRODUCT_UNAVAILABLE');
+});

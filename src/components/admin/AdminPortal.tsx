@@ -842,14 +842,24 @@ export function AdminPortal({
     setDeleteCandidate(null);
     setBusyProductId(target.id);
     try {
-      const res = await apiRequest<{ message: string }>(`/api/admin/products/${target.id}`, {
+      const res = await apiRequest<{
+        message?: string;
+        deleted?: boolean;
+        archivedInsteadOfDeleted?: boolean;
+      }>(`/api/admin/products/${target.id}`, {
         method: 'DELETE',
       });
       if (!res.ok) {
         showToast('err', res.error);
         return;
       }
-      showToast('ok', res.data.message);
+      setProducts((prev) => prev.filter((p) => p.id !== target.id));
+      const outcomeMsg =
+        res.data.message ||
+        (res.data.archivedInsteadOfDeleted
+          ? `Archived "${target.name}" to preserve order history.`
+          : `Deleted "${target.name}" from the catalog.`);
+      showToast('ok', outcomeMsg);
       await refreshCatalogAndMetrics();
     } finally {
       setBusyProductId(null);
@@ -2067,12 +2077,12 @@ export function AdminPortal({
         >
           <div className="w-full max-w-md rounded-3xl border border-[#49243E]/15 bg-[#FFF9F5] p-6 shadow-2xl">
             <h2 id="delete-confirm-title" className="font-serif text-2xl font-semibold text-[#49243E]">
-              {deleteCandidate.orderCount > 0 ? 'Archive Referenced Product?' : 'Delete Product Permanently?'}
+              Delete &ldquo;{deleteCandidate.name}&rdquo;?
             </h2>
             <p className="mt-2 text-sm leading-relaxed text-[#242124]/75">
               {deleteCandidate.orderCount > 0
-                ? `"${deleteCandidate.name}" appears in ${deleteCandidate.orderCount} historical order item(s). Deleting it will automatically archive it so order snapshots remain intact.`
-                : `Permanently delete "${deleteCandidate.name}" (${deleteCandidate.sku}) from the catalog? This cannot be undone.`}
+                ? `"${deleteCandidate.name}" appears in ${deleteCandidate.orderCount} historical order item(s). Confirming Delete will archive it from the active catalog and storefront so order history remains intact.`
+                : `Permanently delete "${deleteCandidate.name}" (${deleteCandidate.sku}) from the catalog? This will remove it from the admin list and public storefront.`}
             </p>
             <div className="mt-6 flex justify-end gap-2.5">
               <button
@@ -2085,9 +2095,9 @@ export function AdminPortal({
               <button
                 type="button"
                 onClick={() => void handleConfirmDelete()}
-                className="min-h-[42px] rounded-xl bg-[#49243E] px-4 text-sm font-medium text-[#FFF9F5] hover:bg-[#3A1B31]"
+                className="min-h-[42px] rounded-xl bg-[#9B2C3E] px-4 text-sm font-medium text-[#FFF9F5] hover:bg-[#7D2231]"
               >
-                {deleteCandidate.orderCount > 0 ? 'Confirm Archive' : 'Confirm Delete'}
+                Delete
               </button>
             </div>
           </div>

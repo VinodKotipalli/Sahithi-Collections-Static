@@ -642,12 +642,15 @@ interface StoredProductDoc {
   images?: Array<{
     id: string;
     product_id: string;
+    media_id?: string | null;
     url: string;
     alt_text: string;
     is_cover: number | boolean;
     position: number;
     created_at: number;
   }>;
+  variant_skus?: string[];
+  image_urls?: string[];
 }
 
 function buildSeedProductsDocs(): StoredProductDoc[] {
@@ -675,7 +678,7 @@ function buildSeedProductsDocs(): StoredProductDoc[] {
           .toUpperCase();
         const sizeCode = size.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
         variants.push({
-          id: `${item.id}-v-${pos + 1}`,
+          id: `${item.id}-var-${pos + 1}`,
           product_id: item.id,
           sku: `${sku}-${sizeCode}-${colorCode}-${pos + 1}`,
           size,
@@ -696,9 +699,10 @@ function buildSeedProductsDocs(): StoredProductDoc[] {
     const images: NonNullable<StoredProductDoc['images']> = item.images.map((img, idx) => ({
       id: `${item.id}-img-${idx + 1}`,
       product_id: item.id,
+      media_id: null,
       url: img.src,
       alt_text: img.alt || item.name,
-      is_cover: idx === 0 ? 1 : 0,
+      is_cover: idx === 0,
       position: idx,
       created_at: ts,
     }));
@@ -712,7 +716,7 @@ function buildSeedProductsDocs(): StoredProductDoc[] {
       fabric_note: item.fabricNote,
       category: item.category,
       status: 'published',
-      featured: item.featured ? 1 : 0,
+      featured: Boolean(item.featured),
       price_paise: pricePaise,
       compare_at_paise: compareAtPaise,
       stock_qty: totalStock,
@@ -726,8 +730,110 @@ function buildSeedProductsDocs(): StoredProductDoc[] {
       updated_at: ts,
       variants,
       images,
+      variant_skus: variants.map((v) => v.sku),
+      image_urls: images.map((i) => i.url),
     };
   });
+}
+
+const CLIENT_VISIBILITY_STORAGE_KEY = 'sahithi_catalog_visibility_v1';
+
+interface ClientCatalogVisibilityMeta {
+  hiddenIds: Set<string>;
+  hiddenSlugs: Set<string>;
+  deletedIds: Set<string>;
+}
+
+async function getClientCatalogVisibilityMeta(
+  idToken?: string
+): Promise<ClientCatalogVisibilityMeta> {
+  const hiddenIds = new Set<string>();
+  const hiddenSlugs = new Set<string>();
+  const deletedIds = new Set<string>();
+
+  if (typeof window !== 'undefined') {
+    try {
+      const raw = window.localStorage.getItem(CLIENT_VISIBILITY_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as {
+          hiddenIds?: string[];
+          hiddenSlugs?: string[];
+          deletedIds?: string[];
+        };
+        (parsed.hiddenIds || []).forEach((id) => hiddenIds.add(id));
+        (parsed.hiddenSlugs || []).forEach((slug) => hiddenSlugs.add(slug));
+        (parsed.deletedIds || []).forEach((id) => {
+          deletedIds.add(id);
+          hiddenIds.add(id);
+        });
+      }
+    } catch {
+      // Ignore storage read errors
+    }
+  }
+
+  try {
+    const settingsDoc = await firestoreGetDoc<{
+      hidden_product_ids?: string[];
+      hidden_product_slugs?: string[];
+      deleted_product_ids?: string[];
+    }>('site_documents', 'settings', idToken);
+    if (settingsDoc) {
+      (settingsDoc.hidden_product_ids || []).forEach((id) => hiddenIds.add(id));
+      (settingsDoc.hidden_product_slugs || []).forEach((slug) => hiddenSlugs.add(slug));
+      (settingsDoc.deleted_product_ids || []).forEach((id) => {
+        deletedIds.add(id);
+        hiddenIds.add(id);
+      });
+    }
+  } catch {
+    // Ignore transient Firestore error
+  }
+
+  return { hiddenIds, hiddenSlugs, deletedIds };
+}
+
+async function saveClientCatalogVisibilityMeta(
+  meta: ClientCatalogVisibilityMeta,
+  idToken?: string
+): Promise<void> {
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.setItem(
+        CLIENT_VISIBILITY_STORAGE_KEY,
+        JSON.stringify({
+          hiddenIds: Array.from(meta.hiddenIds),
+          hiddenSlugs: Array.from(meta.hiddenSlugs),
+          deletedIds: Array.from(meta.deletedIds),
+        })
+      );
+    } catch {
+      // Ignore storage write errors
+    }
+  }
+  if (!idToken) return;
+  try {
+    const existing = await firestoreGetDoc<Record<string, unknown>>(
+      'site_documents',
+      'settings',
+      idToken
+    );
+    await firestoreSetDoc(
+      'site_documents',
+      'settings',
+      {
+        key: 'settings',
+        value: existing?.value ?? DEFAULT_SITE_SETTINGS,
+        hidden_product_ids: Array.from(meta.hiddenIds),
+        hidden_product_slugs: Array.from(meta.hiddenSlugs),
+        deleted_product_ids: Array.from(meta.deletedIds),
+        updated_at: Date.now(),
+      },
+      idToken
+    );
+  } catch {
+    // Ignore non-fatal write errors
+  }
 }
 
 async function firestoreListPublishedProducts(): Promise<StoredProductDoc[]> {
@@ -765,15 +871,27 @@ async function firestoreListPublishedProducts(): Promise<StoredProductDoc[]> {
 }
 
 async function getMergedProductDocs(idToken?: string): Promise<StoredProductDoc[]> {
-  const remoteDocs = idToken
-    ? await firestoreListDocs<StoredProductDoc>('products', idToken)
-    : await firestoreListPublishedProducts();
-  const seenIds = new Set(remoteDocs.map((d) => d.id));
-  const seenSlugs = new Set(remoteDocs.map((d) => d.slug));
-  const merged = [...remoteDocs];
+  const [remoteDocs, meta] = await Promise.all([
+    idToken
+      ? firestoreListDocs<StoredProductDoc>('products', idToken)
+      : firestoreListPublishedProducts(),
+    getClientCatalogVisibilityMeta(idToken),
+  ]);
+  const filteredRemote = remoteDocs.filter((d) => !meta.deletedIds.has(d.id));
+  const seenIds = new Set(filteredRemote.map((d) => d.id));
+  const seenSlugs = new Set(filteredRemote.map((d) => d.slug));
+  const merged = [...filteredRemote];
   for (const seed of buildSeedProductsDocs()) {
+    if (meta.deletedIds.has(seed.id)) continue;
+    if (!idToken && (meta.hiddenIds.has(seed.id) || meta.hiddenSlugs.has(seed.slug))) {
+      continue;
+    }
     if (!seenIds.has(seed.id) && !seenSlugs.has(seed.slug)) {
-      merged.push(seed);
+      if (idToken && meta.hiddenIds.has(seed.id)) {
+        merged.push({ ...seed, status: 'draft' });
+      } else {
+        merged.push(seed);
+      }
     }
   }
   return merged;
@@ -2216,12 +2334,77 @@ export async function handleClientlessApiRequest<T>(
 
       if (cleanPath === '/api/admin/products' && upperMethod === 'GET') {
         const docs = await getMergedProductDocs(idToken);
+        const queryString = rawPath.includes('?') ? rawPath.slice(rawPath.indexOf('?') + 1) : '';
+        const params = new URLSearchParams(queryString);
+        const statusFilter = params.get('status') || 'all';
+        const categoryFilter = params.get('category') || 'All';
+        const stockFilter = params.get('stock') || 'all';
+        const sortFilter = params.get('sort') || 'updated';
+        const qTerm = (params.get('q') || '').trim().toLowerCase();
+        const page = Math.max(1, Number.parseInt(params.get('page') || '1', 10) || 1);
+        const pageSize = Math.max(
+          1,
+          Math.min(100, Number.parseInt(params.get('pageSize') || '15', 10) || 15)
+        );
+
+        let filtered = docs.map((d) => ({
+          ...d,
+          status: (d.status === 'active' ? 'published' : d.status) as StoredProductDoc['status'],
+        }));
+        if (statusFilter !== 'all') {
+          filtered = filtered.filter((p) => p.status === statusFilter);
+        } else {
+          filtered = filtered.filter((p) => p.status !== 'archived');
+        }
+        if (categoryFilter && categoryFilter !== 'All') {
+          filtered = filtered.filter((p) => p.category === categoryFilter);
+        }
+        if (stockFilter === 'low') {
+          filtered = filtered.filter(
+            (p) =>
+              p.status !== 'archived' &&
+              Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 5)
+          );
+        } else if (stockFilter === 'out') {
+          filtered = filtered.filter((p) => p.status !== 'archived' && Number(p.stock_qty) === 0);
+        }
+        if (qTerm) {
+          filtered = filtered.filter(
+            (p) =>
+              p.title.toLowerCase().includes(qTerm) ||
+              p.sku.toLowerCase().includes(qTerm) ||
+              p.category.toLowerCase().includes(qTerm)
+          );
+        }
+
+        filtered.sort((a, b) => {
+          switch (sortFilter) {
+            case 'price_asc':
+              return Number(a.price_paise) - Number(b.price_paise);
+            case 'price_desc':
+              return Number(b.price_paise) - Number(a.price_paise);
+            case 'stock_asc':
+              return Number(a.stock_qty) - Number(b.stock_qty);
+            case 'newest':
+              return Number(b.created_at || 0) - Number(a.created_at || 0);
+            case 'updated':
+            default:
+              return Number(b.updated_at || 0) - Number(a.updated_at || 0);
+          }
+        });
+
+        const total = filtered.length;
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        const offset = (page - 1) * pageSize;
+
         return {
           ok: true,
           data: {
-            items: docs
-              .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0))
-              .map((d) => formatProductDto(d, true)),
+            items: filtered.slice(offset, offset + pageSize).map((d) => formatProductDto(d, true)),
+            total,
+            page,
+            pageSize,
+            totalPages,
           } as unknown as T,
         };
       }
@@ -2492,16 +2675,64 @@ export async function handleClientlessApiRequest<T>(
         const sku =
           (typeof body.sku === 'string' && body.sku.trim().toUpperCase()) ||
           `SC-${now.toString(36).toUpperCase()}`;
-        const pricePaise = Math.max(100, Math.round(Number(body.pricePaise || 100000)));
-        const compareAtPaise =
+        const basePricePaise = Math.max(100, Math.round(Number(body.pricePaise || 100000)));
+        const baseCompareAtPaise =
           body.compareAtPaise !== null && body.compareAtPaise !== undefined
             ? Math.round(Number(body.compareAtPaise))
             : null;
-        const stockQty = Math.max(0, Math.round(Number(body.stockQty ?? 1)));
-        const status =
-          body.status === 'draft' || body.status === 'archived' ? body.status : 'active';
+        const status: 'draft' | 'published' | 'archived' =
+          body.status === 'draft' || body.status === 'archived' ? body.status : 'published';
         const rawImages = Array.isArray(body.images) ? body.images : [];
         const rawVariants = Array.isArray(body.variants) ? body.variants : [];
+        const variants = rawVariants.map((v: Record<string, unknown>, idx: number) => ({
+          id: typeof v.id === 'string' && v.id ? v.id : `var_${id}_${idx + 1}`,
+          product_id: id,
+          sku: String(v.sku || `${sku}-${idx + 1}`).toUpperCase(),
+          size: String(v.size || 'Free Size'),
+          color_name: String(v.colorName || 'Signature'),
+          color_hex: String(v.colorHex || '#49243E'),
+          price_paise: Math.max(100, Math.round(Number(v.pricePaise || basePricePaise))),
+          compare_at_paise:
+            v.compareAtPaise !== null && v.compareAtPaise !== undefined
+              ? Math.round(Number(v.compareAtPaise))
+              : baseCompareAtPaise,
+          stock_qty: Math.max(0, Math.round(Number(v.stockQty ?? body.stockQty ?? 1))),
+          position: idx,
+        }));
+        const images = rawImages.map((img: Record<string, unknown>, idx: number) => ({
+          id: `img_${id}_${idx + 1}`,
+          product_id: id,
+          media_id: null,
+          url: String(img.url || img.src || ''),
+          alt_text: String(img.alt || title),
+          is_cover: Boolean(img.isCover ?? idx === 0),
+          position: idx,
+          created_at: now,
+        }));
+        const totalStock =
+          variants.length > 0
+            ? variants.reduce((sum, v) => sum + v.stock_qty, 0)
+            : Math.max(0, Math.round(Number(body.stockQty ?? 1)));
+        const minPricePaise =
+          variants.length > 0
+            ? Math.min(...variants.map((v) => v.price_paise))
+            : basePricePaise;
+        const derivedColors =
+          variants.length > 0
+            ? Array.from(
+                new Map(
+                  variants.map((v) => [v.color_name, { name: v.color_name, hex: v.color_hex }])
+                ).values()
+              )
+            : Array.isArray(body.colors)
+              ? body.colors
+              : [];
+        const derivedSizes =
+          variants.length > 0
+            ? Array.from(new Set(variants.map((v) => v.size)))
+            : Array.isArray(body.sizes)
+              ? body.sizes
+              : [];
         const doc: StoredProductDoc = {
           id,
           sku,
@@ -2509,46 +2740,24 @@ export async function handleClientlessApiRequest<T>(
           title,
           description: typeof body.description === 'string' ? body.description.trim() : '',
           fabric_note: typeof body.fabricNote === 'string' ? body.fabricNote.trim() : '',
-          category: typeof body.category === 'string' ? body.category : 'Dresses',
+          category: typeof body.category === 'string' ? body.category : 'Kurtis',
           status,
-          featured: body.featured ? 1 : 0,
-          price_paise: pricePaise,
-          compare_at_paise: compareAtPaise,
-          stock_qty: stockQty,
-          low_stock_threshold: Math.max(0, Number(body.lowStockThreshold ?? 2)),
-          colors_json: JSON.stringify(Array.isArray(body.colors) ? body.colors : []),
-          sizes_json: JSON.stringify(Array.isArray(body.sizes) ? body.sizes : []),
+          featured: Boolean(body.featured),
+          price_paise: minPricePaise,
+          compare_at_paise: baseCompareAtPaise,
+          stock_qty: totalStock,
+          low_stock_threshold: Math.max(0, Number(body.lowStockThreshold ?? 5)),
+          colors_json: JSON.stringify(derivedColors),
+          sizes_json: JSON.stringify(derivedSizes),
           version: 1,
-          published_at: status === 'active' ? now : null,
+          published_at: status === 'published' ? now : null,
           archived_at: status === 'archived' ? now : null,
           created_at: now,
           updated_at: now,
-          images: rawImages.map((img: Record<string, unknown>, idx: number) => ({
-            id: `img_${id}_${idx + 1}`,
-            product_id: id,
-            url: String(img.url || ''),
-            alt_text: String(img.alt || title),
-            is_cover: img.isCover || idx === 0 ? 1 : 0,
-            position: idx,
-            created_at: now,
-          })),
-          variants: rawVariants.map((v: Record<string, unknown>, idx: number) => ({
-            id: `var_${id}_${idx + 1}`,
-            product_id: id,
-            sku: String(v.sku || `${sku}-${idx + 1}`),
-            size: String(v.size || 'Free Size'),
-            color_name: String(v.colorName || 'Signature'),
-            color_hex: String(v.colorHex || '#49243E'),
-            price_paise: Math.max(100, Math.round(Number(v.pricePaise || pricePaise))),
-            compare_at_paise:
-              v.compareAtPaise !== null && v.compareAtPaise !== undefined
-                ? Math.round(Number(v.compareAtPaise))
-                : compareAtPaise,
-            stock_qty: Math.max(0, Math.round(Number(v.stockQty ?? stockQty))),
-            position: idx,
-            created_at: now,
-            updated_at: now,
-          })),
+          images,
+          variants,
+          variant_skus: variants.map((v) => v.sku),
+          image_urls: images.map((i) => i.url),
         };
         const saved = await firestoreSetDoc(
           'products',
@@ -2564,10 +2773,141 @@ export async function handleClientlessApiRequest<T>(
             error: 'Failed to save product to Firestore.',
           };
         }
+        const dto = formatProductDto(doc, true);
         return {
           ok: true,
-          data: { item: formatProductDto(doc, true) } as unknown as T,
+          data: { product: dto, item: dto } as unknown as T,
         };
+      }
+
+      if (cleanPath.startsWith('/api/admin/products/') && upperMethod === 'GET') {
+        const productId = decodeURIComponent(cleanPath.slice('/api/admin/products/'.length));
+        const allDocs = await getMergedProductDocs(idToken);
+        const found = allDocs.find((d) => d.id === productId);
+        if (!found) {
+          return {
+            ok: false,
+            status: 404,
+            code: 'PRODUCT_NOT_FOUND',
+            error: 'Product not found.',
+          };
+        }
+        return {
+          ok: true,
+          data: {
+            product: formatProductDto(found, true),
+            auditLogs: [],
+          } as unknown as T,
+        };
+      }
+
+      if (cleanPath.startsWith('/api/admin/products/') && upperMethod === 'POST') {
+        const sub = cleanPath.slice('/api/admin/products/'.length);
+        const slashIdx = sub.lastIndexOf('/');
+        if (slashIdx > 0) {
+          const productId = decodeURIComponent(sub.slice(0, slashIdx));
+          const action = sub.slice(slashIdx + 1);
+          const allDocs = await getMergedProductDocs(idToken);
+          const existing = allDocs.find((d) => d.id === productId);
+          if (!existing) {
+            return {
+              ok: false,
+              status: 404,
+              code: 'PRODUCT_NOT_FOUND',
+              error: 'Product not found.',
+            };
+          }
+          const now = Date.now();
+          if (action === 'duplicate') {
+            const newId = `prod_${now.toString(36)}_${randomHex(3)}`;
+            const newTitle = `${existing.title} (Copy)`;
+            const newSku = `${existing.sku}-COPY`.slice(0, 48);
+            const copyDoc: StoredProductDoc = {
+              ...existing,
+              id: newId,
+              slug: `${existing.slug}-copy-${randomHex(2)}`,
+              title: newTitle,
+              sku: newSku,
+              featured: Boolean(existing.featured),
+              status: 'draft',
+              version: 1,
+              published_at: null,
+              archived_at: null,
+              created_at: now,
+              updated_at: now,
+              variants: (existing.variants || []).map((v, idx) => ({
+                ...v,
+                id: `${newId}-var-${idx + 1}`,
+                product_id: newId,
+                sku: `${newSku}-V${idx + 1}`,
+              })),
+              images: (existing.images || []).map((img, idx) => ({
+                ...img,
+                id: `${newId}-img-${idx + 1}`,
+                product_id: newId,
+                media_id: img.media_id ?? null,
+                is_cover: Boolean(img.is_cover),
+              })),
+              variant_skus: (existing.variants || []).map((_, idx) => `${newSku}-V${idx + 1}`),
+              image_urls: (existing.images || []).map((i) => i.url),
+            };
+            await firestoreSetDoc(
+              'products',
+              newId,
+              copyDoc as unknown as Record<string, unknown>,
+              idToken
+            );
+            const dto = formatProductDto(copyDoc, true);
+            return { ok: true, data: { product: dto, item: dto } as unknown as T };
+          }
+
+          if (
+            action === 'publish' ||
+            action === 'unpublish' ||
+            action === 'archive' ||
+            action === 'restore'
+          ) {
+            const targetStatus: 'published' | 'draft' | 'archived' =
+              action === 'publish'
+                ? 'published'
+                : action === 'archive'
+                  ? 'archived'
+                  : 'draft';
+            const updated: StoredProductDoc = {
+              ...existing,
+              featured: Boolean(existing.featured),
+              status: targetStatus,
+              version: Number(existing.version || 1) + 1,
+              published_at:
+                targetStatus === 'published'
+                  ? existing.published_at ?? now
+                  : existing.published_at,
+              archived_at: targetStatus === 'archived' ? now : null,
+              updated_at: now,
+              variant_skus:
+                existing.variant_skus || (existing.variants || []).map((v) => v.sku),
+              image_urls: existing.image_urls || (existing.images || []).map((i) => i.url),
+            };
+            await firestoreSetDoc(
+              'products',
+              productId,
+              updated as unknown as Record<string, unknown>,
+              idToken
+            );
+            const meta = await getClientCatalogVisibilityMeta(idToken);
+            if (targetStatus === 'published') {
+              meta.hiddenIds.delete(productId);
+              meta.deletedIds.delete(productId);
+              meta.hiddenSlugs.delete(updated.slug);
+            } else {
+              meta.hiddenIds.add(productId);
+              meta.hiddenSlugs.add(updated.slug);
+            }
+            await saveClientCatalogVisibilityMeta(meta, idToken);
+            const dto = formatProductDto(updated, true);
+            return { ok: true, data: { product: dto, item: dto } as unknown as T };
+          }
+        }
       }
 
       if (cleanPath.startsWith('/api/admin/products/') && upperMethod === 'PATCH') {
@@ -2576,11 +2916,8 @@ export async function handleClientlessApiRequest<T>(
         const productId = decodeURIComponent(
           isStatusPatch ? sub.slice(0, -'/status'.length) : sub
         );
-        const existing = await firestoreGetDoc<StoredProductDoc>(
-          'products',
-          productId,
-          idToken
-        );
+        const allDocs = await getMergedProductDocs(idToken);
+        const existing = allDocs.find((d) => d.id === productId);
         if (!existing) {
           return {
             ok: false,
@@ -2590,27 +2927,128 @@ export async function handleClientlessApiRequest<T>(
           };
         }
         const now = Date.now();
-        const nextStatus =
-          body.status === 'draft' || body.status === 'archived' || body.status === 'active'
-            ? body.status
-            : existing.status;
+        const rawStatus = body.status;
+        const nextStatus: 'draft' | 'published' | 'archived' =
+          rawStatus === 'draft' || rawStatus === 'archived'
+            ? rawStatus
+            : rawStatus === 'published' || rawStatus === 'active'
+              ? 'published'
+              : existing.status === 'active'
+                ? 'published'
+                : (existing.status as 'draft' | 'published' | 'archived');
+
+        const nextTitle =
+          typeof body.title === 'string' && body.title.trim()
+            ? body.title.trim()
+            : existing.title;
+        const nextSku =
+          typeof body.sku === 'string' && body.sku.trim()
+            ? body.sku.trim().toUpperCase()
+            : existing.sku;
+        const nextSlug =
+          typeof body.slug === 'string' && body.slug.trim()
+            ? body.slug.trim()
+            : existing.slug;
+        const basePricePaise =
+          body.pricePaise !== undefined
+            ? Math.max(100, Math.round(Number(body.pricePaise)))
+            : existing.price_paise;
+        const baseCompareAtPaise =
+          body.compareAtPaise !== undefined
+            ? body.compareAtPaise !== null
+              ? Math.round(Number(body.compareAtPaise))
+              : null
+            : existing.compare_at_paise;
+
+        const nextVariants = Array.isArray(body.variants)
+          ? body.variants.map((v: Record<string, unknown>, idx: number) => ({
+              id:
+                typeof v.id === 'string' && v.id && !v.id.startsWith('new-')
+                  ? v.id
+                  : `${productId}-var-${idx + 1}`,
+              product_id: productId,
+              sku: String(v.sku || `${nextSku}-${idx + 1}`).toUpperCase(),
+              size: String(v.size || 'Free Size'),
+              color_name: String(v.colorName || 'Signature'),
+              color_hex: String(v.colorHex || '#49243E'),
+              price_paise: Math.max(100, Math.round(Number(v.pricePaise ?? basePricePaise))),
+              compare_at_paise:
+                v.compareAtPaise !== null && v.compareAtPaise !== undefined
+                  ? Math.round(Number(v.compareAtPaise))
+                  : null,
+              stock_qty: Math.max(0, Math.round(Number(v.stockQty ?? 0))),
+              position: idx,
+            }))
+          : (existing.variants || []).map((v, idx) => ({
+              ...v,
+              position: idx,
+              price_paise:
+                body.pricePaise !== undefined ? basePricePaise : Number(v.price_paise),
+              stock_qty:
+                body.stockQty !== undefined && idx === 0
+                  ? Math.max(0, Math.round(Number(body.stockQty)))
+                  : Number(v.stock_qty),
+            }));
+
+        const nextImages = Array.isArray(body.images)
+          ? body.images.map((img: Record<string, unknown>, idx: number) => ({
+              id: `${productId}-img-${idx + 1}`,
+              product_id: productId,
+              media_id: null,
+              url: String(img.url || img.src || ''),
+              alt_text: String(img.alt || nextTitle),
+              is_cover: Boolean(img.isCover ?? idx === 0),
+              position: idx,
+              created_at: now,
+            }))
+          : (existing.images || []).map((img, idx) => ({
+              ...img,
+              media_id: img.media_id ?? null,
+              is_cover: Boolean(img.is_cover),
+              position: idx,
+            }));
+
+        const totalStock =
+          nextVariants.length > 0
+            ? nextVariants.reduce((sum, v) => sum + Number(v.stock_qty || 0), 0)
+            : body.stockQty !== undefined
+              ? Math.max(0, Math.round(Number(body.stockQty)))
+              : existing.stock_qty;
+        const effectivePricePaise =
+          nextVariants.length > 0
+            ? Math.min(...nextVariants.map((v) => Number(v.price_paise)))
+            : basePricePaise;
+        const derivedColors =
+          nextVariants.length > 0
+            ? Array.from(
+                new Map(
+                  nextVariants.map((v) => [
+                    v.color_name,
+                    { name: v.color_name, hex: v.color_hex },
+                  ])
+                ).values()
+              )
+            : undefined;
+        const derivedSizes =
+          nextVariants.length > 0
+            ? Array.from(new Set(nextVariants.map((v) => v.size)))
+            : undefined;
+
         const updated: StoredProductDoc = isStatusPatch
           ? {
               ...existing,
+              featured: Boolean(existing.featured),
               status: nextStatus,
               version: Number(existing.version || 1) + 1,
               updated_at: now,
+              variant_skus: nextVariants.map((v) => v.sku),
+              image_urls: nextImages.map((i) => i.url),
             }
           : {
               ...existing,
-              title:
-                typeof body.title === 'string' ? body.title.trim() : existing.title,
-              sku:
-                typeof body.sku === 'string'
-                  ? body.sku.trim().toUpperCase()
-                  : existing.sku,
-              slug:
-                typeof body.slug === 'string' ? body.slug.trim() : existing.slug,
+              title: nextTitle,
+              sku: nextSku,
+              slug: nextSlug,
               description:
                 typeof body.description === 'string'
                   ? body.description.trim()
@@ -2623,33 +3061,37 @@ export async function handleClientlessApiRequest<T>(
                 typeof body.category === 'string' ? body.category : existing.category,
               status: nextStatus,
               featured:
-                body.featured !== undefined ? (body.featured ? 1 : 0) : existing.featured,
-              price_paise:
-                body.pricePaise !== undefined
-                  ? Math.max(100, Math.round(Number(body.pricePaise)))
-                  : existing.price_paise,
-              compare_at_paise:
-                body.compareAtPaise !== undefined
-                  ? body.compareAtPaise !== null
-                    ? Math.round(Number(body.compareAtPaise))
-                    : null
-                  : existing.compare_at_paise,
-              stock_qty:
-                body.stockQty !== undefined
-                  ? Math.max(0, Math.round(Number(body.stockQty)))
-                  : existing.stock_qty,
+                body.featured !== undefined
+                  ? Boolean(body.featured)
+                  : Boolean(existing.featured),
+              price_paise: effectivePricePaise,
+              compare_at_paise: baseCompareAtPaise,
+              stock_qty: totalStock,
               low_stock_threshold:
                 body.lowStockThreshold !== undefined
                   ? Math.max(0, Math.round(Number(body.lowStockThreshold)))
                   : existing.low_stock_threshold,
-              colors_json: Array.isArray(body.colors)
-                ? JSON.stringify(body.colors)
-                : existing.colors_json,
-              sizes_json: Array.isArray(body.sizes)
-                ? JSON.stringify(body.sizes)
-                : existing.sizes_json,
+              colors_json: derivedColors
+                ? JSON.stringify(derivedColors)
+                : Array.isArray(body.colors)
+                  ? JSON.stringify(body.colors)
+                  : existing.colors_json,
+              sizes_json: derivedSizes
+                ? JSON.stringify(derivedSizes)
+                : Array.isArray(body.sizes)
+                  ? JSON.stringify(body.sizes)
+                  : existing.sizes_json,
               version: Number(existing.version || 1) + 1,
+              published_at:
+                nextStatus === 'published'
+                  ? existing.published_at ?? now
+                  : existing.published_at,
+              archived_at: nextStatus === 'archived' ? now : null,
               updated_at: now,
+              variants: nextVariants,
+              images: nextImages,
+              variant_skus: nextVariants.map((v) => v.sku),
+              image_urls: nextImages.map((i) => i.url),
             };
         const saved = await firestoreSetDoc(
           'products',
@@ -2665,18 +3107,51 @@ export async function handleClientlessApiRequest<T>(
             error: 'Failed to update product in Firestore.',
           };
         }
+        const meta = await getClientCatalogVisibilityMeta(idToken);
+        meta.deletedIds.delete(productId);
+        if (nextStatus === 'published') {
+          meta.hiddenIds.delete(productId);
+          meta.hiddenSlugs.delete(updated.slug);
+        } else {
+          meta.hiddenIds.add(productId);
+          meta.hiddenSlugs.add(updated.slug);
+          meta.hiddenSlugs.add(existing.slug);
+        }
+        await saveClientCatalogVisibilityMeta(meta, idToken);
+
+        const dto = formatProductDto(updated, true);
         return {
           ok: true,
-          data: { item: formatProductDto(updated, true) } as unknown as T,
+          data: { product: dto, item: dto } as unknown as T,
         };
       }
 
       if (cleanPath.startsWith('/api/admin/products/') && upperMethod === 'DELETE') {
         const productId = decodeURIComponent(cleanPath.slice('/api/admin/products/'.length));
+        const allDocs = await getMergedProductDocs(idToken);
+        const existing = allDocs.find((d) => d.id === productId);
+        if (!existing) {
+          return {
+            ok: false,
+            status: 404,
+            code: 'PRODUCT_NOT_FOUND',
+            error: 'Product not found.',
+          };
+        }
+        const meta = await getClientCatalogVisibilityMeta(idToken);
+        meta.deletedIds.add(productId);
+        meta.hiddenIds.add(productId);
+        meta.hiddenSlugs.add(existing.slug);
+        await saveClientCatalogVisibilityMeta(meta, idToken);
         await firestoreDeleteDoc('products', productId, idToken);
         return {
           ok: true,
-          data: { deleted: true, id: productId } as unknown as T,
+          data: {
+            deleted: true,
+            archivedInsteadOfDeleted: false,
+            id: productId,
+            message: `Deleted "${existing.title}".`,
+          } as unknown as T,
         };
       }
 

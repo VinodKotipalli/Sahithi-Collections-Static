@@ -1193,8 +1193,12 @@ export function seedInitialCatalogIfEmpty(db: DatabaseSync): void {
   const checkExisting = db.prepare(
     `SELECT id FROM products WHERE id = ? OR sku = ? OR slug = ? LIMIT 1`
   );
+  const checkDeleted = db.prepare(
+    `SELECT id FROM product_audit_logs WHERE product_id = ? AND action = 'delete' LIMIT 1`
+  );
   const missingItems = INITIAL_SEED_PRODUCTS.filter(
-    (item) => !checkExisting.get(item.id, item.sku, item.slug)
+    (item) =>
+      !checkExisting.get(item.id, item.sku, item.slug) && !checkDeleted.get(item.id)
   );
   if (missingItems.length === 0) return;
 

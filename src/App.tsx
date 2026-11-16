@@ -83,18 +83,6 @@ function normalizeStaticProducts(items: Product[]): Product[] {
 
 const DEFAULT_NORMALIZED_PRODUCTS = normalizeStaticProducts(PRODUCTS);
 
-function mergeWithStarterProducts(remoteItems: Product[]): Product[] {
-  const seenIds = new Set(remoteItems.map((p) => p.id));
-  const seenSlugs = new Set(remoteItems.map((p) => (p.slug || '').toLowerCase()).filter(Boolean));
-  const merged = [...remoteItems];
-  for (const starter of DEFAULT_NORMALIZED_PRODUCTS) {
-    if (!seenIds.has(starter.id) && !seenSlugs.has((starter.slug || '').toLowerCase())) {
-      merged.push(starter);
-    }
-  }
-  return merged;
-}
-
 function BoutiqueShell() {
   const prefersReducedMotion = usePrefersReducedMotion();
   const { user, isLoadingSession, refreshSession } = useAuth();
@@ -124,6 +112,8 @@ function BoutiqueShell() {
 
   const searchInputRef = useRef<HTMLInputElement>(null);
 
+  const [unavailableProductSlug, setUnavailableProductSlug] = useState<string | null>(null);
+
   const fetchPublicCatalog = useCallback(async () => {
     try {
       const res = await fetchApi('/api/products', {
@@ -134,11 +124,10 @@ function BoutiqueShell() {
       const contentType = (res.headers.get('content-type') || '').toLowerCase();
       if (res.ok && contentType.includes('application/json')) {
         const data = (await res.json()) as { items?: Product[] };
-        if (Array.isArray(data.items) && data.items.length > 0) {
-          const merged = mergeWithStarterProducts(data.items);
-          setProducts(merged);
+        if (Array.isArray(data.items)) {
+          setProducts(data.items);
           setQuickViewProduct((current) =>
-            current ? merged.find((p) => p.id === current.id) || null : null
+            current ? data.items!.find((p) => p.id === current.id) || null : null
           );
           return;
         }
@@ -147,11 +136,10 @@ function BoutiqueShell() {
         '/api/products',
         'GET'
       );
-      if (fallback.ok && Array.isArray(fallback.data.items) && fallback.data.items.length > 0) {
-        const merged = mergeWithStarterProducts(fallback.data.items);
-        setProducts(merged);
+      if (fallback.ok && Array.isArray(fallback.data.items)) {
+        setProducts(fallback.data.items);
         setQuickViewProduct((current) =>
-          current ? merged.find((p) => p.id === current.id) || null : null
+          current ? fallback.data.items!.find((p) => p.id === current.id) || null : null
         );
       }
     } catch {
@@ -166,7 +154,11 @@ function BoutiqueShell() {
   }, [fetchPublicCatalog]);
 
   useEffect(() => {
-    if (!productSlug || products.length === 0) return;
+    if (!productSlug) {
+      setUnavailableProductSlug(null);
+      return;
+    }
+    if (loadingCatalog) return;
     const normalizedSlug = productSlug.toLowerCase();
     const matched = products.find(
       (p) =>
@@ -174,9 +166,13 @@ function BoutiqueShell() {
         (p.slug || '').toLowerCase() === normalizedSlug
     );
     if (matched) {
+      setUnavailableProductSlug(null);
       setQuickViewProduct(matched);
+    } else {
+      setQuickViewProduct(null);
+      setUnavailableProductSlug(productSlug);
     }
-  }, [productSlug, products]);
+  }, [productSlug, products, loadingCatalog]);
 
   // Mark private routes (/admin, /account) noindex client-side in addition to server headers
   useEffect(() => {
@@ -406,6 +402,36 @@ function BoutiqueShell() {
           />
 
           <main id="main-content">
+            {unavailableProductSlug && (
+              <div
+                role="status"
+                className="border-b border-[#B76E79]/30 bg-[#F3D5DF]/40 px-4 py-6 text-center"
+              >
+                <div className="mx-auto max-w-xl">
+                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#9B2C3E]">
+                    Product Unavailable
+                  </p>
+                  <h2 className="mt-1 font-serif text-2xl font-semibold text-[#49243E]">
+                    This piece is no longer available in our active collection
+                  </h2>
+                  <p className="mt-1.5 text-sm text-[#242124]/75">
+                    The item you requested (&ldquo;{unavailableProductSlug}&rdquo;) has been removed or archived. Explore our current curated designs below.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUnavailableProductSlug(null);
+                      navigate('/', { replace: true });
+                      scrollToShowcase();
+                    }}
+                    className="mt-4 inline-flex min-h-[40px] items-center justify-center rounded-xl bg-[#49243E] px-5 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31]"
+                  >
+                    Browse Active Collection
+                  </button>
+                </div>
+              </div>
+            )}
+
             <HeroSection />
 
             <CollectionsSection onSelectCollection={handleSelectCollection} />
