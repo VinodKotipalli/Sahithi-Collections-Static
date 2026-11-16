@@ -85,7 +85,7 @@ export function AuthPage({
           <BoutiqueImage
             src={BOUTIQUE_MEDIA.spotlightEdit}
             alt="Editorial boutique styling portrait from Sahithi Collections"
-            className="h-full w-full object-cover object-center opacity-85"
+            className="h-full w-full object-cover object-top opacity-85"
           />
           <div
             aria-hidden="true"
