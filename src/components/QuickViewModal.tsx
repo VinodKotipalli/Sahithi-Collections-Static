@@ -26,6 +26,9 @@ interface QuickViewModalProps {
   isWishlisted: boolean;
   onToggleWishlist: (id: string) => void;
   onAddToBag?: (item: Omit<BagItem, 'quantity'> & { quantity?: number }) => void;
+  onBuyNow?: (item: Omit<BagItem, 'quantity'> & { quantity?: number }) => void;
+  relatedProducts?: Product[];
+  onSelectProduct?: (product: Product) => void;
   onClose: () => void;
 }
 
@@ -34,6 +37,9 @@ export function QuickViewModal({
   isWishlisted,
   onToggleWishlist,
   onAddToBag,
+  onBuyNow,
+  relatedProducts = [],
+  onSelectProduct,
   onClose,
 }: QuickViewModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
@@ -88,7 +94,7 @@ export function QuickViewModal({
     activeVariant?.compareAtPaise ??
     product?.compareAtPaise ??
     (product?.compareAtPrice ? Math.round(product.compareAtPrice * 100) : null);
-  const availableStock = activeVariant?.stockQty ?? product?.stockQty ?? 0;
+  const availableStock = activeVariant?.stockQty ?? product?.stockQty ?? 1;
 
   const whatsAppReady = isWhatsAppConfigured(settings.contact);
   const enquiryUrl = product
@@ -109,19 +115,37 @@ export function QuickViewModal({
       })
     : '';
 
-  const handleAddToBagClick = () => {
-    if (!product || !onAddToBag || availableStock <= 0) return;
-    onAddToBag({
+  const buildBagPayload = () => {
+    if (!product) return null;
+    return {
       productId: product.id,
-      variantId: activeVariant?.id || product.id,
+      variantId: activeVariant?.id || `${product.id}-v-1`,
       seenPricePaise: displayPricePaise,
       fallbackTitle: product.name,
       fallbackVariant: `${selectedSize} · ${selectedColor}`,
       fallbackImage: product.images[0]?.src || '',
       quantity: 1,
-    });
+    };
+  };
+
+  const handleAddToBagClick = () => {
+    if (!product || !onAddToBag || availableStock <= 0) return;
+    const payload = buildBagPayload();
+    if (!payload) return;
+    onAddToBag(payload);
     setAddedFeedback(true);
     window.setTimeout(() => setAddedFeedback(false), 1800);
+  };
+
+  const handleBuyNowClick = () => {
+    if (!product || availableStock <= 0) return;
+    const payload = buildBagPayload();
+    if (!payload) return;
+    if (onBuyNow) {
+      onBuyNow(payload);
+    } else if (onAddToBag) {
+      onAddToBag(payload);
+    }
   };
 
   return (
@@ -350,7 +374,7 @@ export function QuickViewModal({
                     </div>
                   </div>
 
-                  {/* Actions: Add to Bag, Wishlist & WhatsApp Enquiry */}
+                  {/* Actions: Add to Bag, Buy Now, Wishlist & WhatsApp Enquiry */}
                   <div className="mt-7 space-y-3 border-t border-[#49243E]/10 pt-5">
                     <div className="flex flex-col gap-2.5 sm:flex-row">
                       {onAddToBag && (
@@ -372,6 +396,16 @@ export function QuickViewModal({
                                 ? 'Added to Bag'
                                 : 'Add to Bag'}
                           </span>
+                        </button>
+                      )}
+
+                      {(onBuyNow || onAddToBag) && availableStock > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleBuyNowClick}
+                          className="flex min-h-[46px] flex-1 items-center justify-center gap-2 rounded-xl border border-[#49243E] bg-[#F3D5DF]/40 px-5 py-3 text-sm font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/70"
+                        >
+                          <span>Buy Now</span>
                         </button>
                       )}
 
@@ -411,6 +445,50 @@ export function QuickViewModal({
                   </div>
                 </div>
               </div>
+
+              {/* Related Products Section */}
+              {relatedProducts.length > 0 && (
+                <div className="mt-8 border-t border-[#49243E]/10 pt-6">
+                  <div className="flex items-center justify-between">
+                    <h3 className="font-serif text-lg font-semibold text-[#49243E]">
+                      Related Products in {product.category}
+                    </h3>
+                    <span className="text-xs text-[#242124]/60">
+                      Pair or explore similar silhouettes
+                    </span>
+                  </div>
+                  <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    {relatedProducts.slice(0, 4).map((rel) => {
+                      const relPricePaise = rel.pricePaise ?? Math.round(rel.price * 100);
+                      return (
+                        <button
+                          key={rel.id}
+                          type="button"
+                          onClick={() => onSelectProduct?.(rel)}
+                          className="group flex flex-col overflow-hidden rounded-2xl border border-[#49243E]/10 bg-white text-left transition-all hover:border-[#49243E]/30 hover:shadow-md"
+                        >
+                          <div className="aspect-[3/4] w-full overflow-hidden bg-[#F8F1ED]">
+                            <BoutiqueImage
+                              src={rel.images[0]?.src || ''}
+                              alt={rel.images[0]?.alt || rel.name}
+                              fallbackTitle={rel.name}
+                              className="h-full w-full object-cover object-top transition-transform duration-300 group-hover:scale-105"
+                            />
+                          </div>
+                          <div className="p-2.5">
+                            <p className="truncate font-serif text-sm font-semibold text-[#49243E]">
+                              {rel.name}
+                            </p>
+                            <p className="mt-0.5 text-xs font-semibold tabular-nums text-[#242124]">
+                              {formatPaiseINR(relPricePaise)}
+                            </p>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
           </motion.div>
         </motion.div>
@@ -418,3 +496,4 @@ export function QuickViewModal({
     </AnimatePresence>
   );
 }
+

@@ -1001,7 +1001,7 @@ function buildSeedStarterProductDoc(
   for (const size of p.sizes) {
     for (const color of p.colors) {
       variants.push({
-        id: crypto.randomUUID(),
+        id: `${productId}-var-${pos + 1}`,
         product_id: productId,
         sku: `${sku}-${size.replace(/[^A-Z0-9]/gi, '').toUpperCase() || 'SZ'}-${pos + 1}`,
         size,
@@ -1017,7 +1017,7 @@ function buildSeedStarterProductDoc(
   }
 
   const images = p.images.map((img, imgIdx) => ({
-    id: crypto.randomUUID(),
+    id: `${productId}-img-${imgIdx + 1}`,
     product_id: productId,
     media_id: null,
     url: img.url,
@@ -1547,14 +1547,16 @@ export class FirestoreRestStore implements BoutiqueStore {
 
     const now = Date.now();
     const [existingCats, existingProducts, existingSettings, existingContent] = await Promise.all([
-      this.runQuery('categories', { limit: 1 }),
-      this.runQuery('products', { limit: 1 }),
+      this.runQuery('categories'),
+      this.runQuery('products'),
       this.getDoc('site_documents/settings'),
       this.getDoc('site_documents/content'),
     ]);
 
-    if (existingCats.length === 0) {
-      const catWrites = INITIAL_SEED_CATEGORIES.map((c, idx) => ({
+    const existingCatIds = new Set(existingCats.map((c) => c.id));
+    const missingCats = INITIAL_SEED_CATEGORIES.filter((c) => !existingCatIds.has(c.id));
+    if (missingCats.length > 0) {
+      const catWrites = missingCats.map((c, idx) => ({
         update: {
           name: `${this.dbRootResource}/${this.envRelPath}/categories/${c.id}`,
           fields: toFsFields({
@@ -1564,7 +1566,7 @@ export class FirestoreRestStore implements BoutiqueStore {
             subtitle: c.subtitle,
             image_url: c.imageUrl,
             alt_text: c.altText,
-            position: idx,
+            position: c.position ?? idx,
             created_at: now - idx * 1000,
             updated_at: now - idx * 1000,
           }),
@@ -1589,8 +1591,10 @@ export class FirestoreRestStore implements BoutiqueStore {
       });
     }
 
-    if (existingProducts.length === 0) {
-      const writes = INITIAL_SEED_PRODUCTS.map((p, idx) => {
+    const existingProductIds = new Set(existingProducts.map((p) => p.id));
+    const missingProducts = INITIAL_SEED_PRODUCTS.filter((p) => !existingProductIds.has(p.id));
+    if (missingProducts.length > 0) {
+      const writes = missingProducts.map((p, idx) => {
         const doc = buildSeedStarterProductDoc(p, idx, now);
         return {
           update: {
@@ -1697,12 +1701,12 @@ export class FirestoreRestStore implements BoutiqueStore {
     const published = await this.getPublishedProductDocs();
     let list = published.map((d) => fromFirestoreProduct(d));
 
-    // If database has not yet been seeded by owner's first dashboard login,
-    // gracefully show starter boutique products on read unless owner already cleared/created products.
-    if (list.length === 0) {
-      const cats = await this.runQuery('categories', { limit: 1 });
-      if (cats.length === 0) {
-        list = buildStarterReadProducts(Date.now());
+    // Ensure all starter/catalog products are available even if Firestore only had an older subset seeded
+    const existingIds = new Set(list.map((item) => item.product.id));
+    const existingSlugs = new Set(list.map((item) => item.product.slug));
+    for (const starter of buildStarterReadProducts(Date.now())) {
+      if (!existingIds.has(starter.product.id) && !existingSlugs.has(starter.product.slug)) {
+        list.push(starter);
       }
     }
 
@@ -1736,17 +1740,11 @@ export class FirestoreRestStore implements BoutiqueStore {
     const match = published.find((d) => d.id === idOrSlug || d.slug === idOrSlug);
     if (match) return fromFirestoreProduct(match);
 
-    if (published.length === 0) {
-      const cats = await this.runQuery('categories', { limit: 1 });
-      if (cats.length === 0) {
-        return (
-          buildStarterReadProducts(Date.now()).find(
-            (item) => item.product.id === idOrSlug || item.product.slug === idOrSlug
-          ) || null
-        );
-      }
-    }
-    return null;
+    return (
+      buildStarterReadProducts(Date.now()).find(
+        (item) => item.product.id === idOrSlug || item.product.slug === idOrSlug
+      ) || null
+    );
   }
 
   async isProductSkuConflict(sku: string, excludeProductId?: string): Promise<boolean> {
@@ -2517,7 +2515,9 @@ export class FirestoreRestStore implements BoutiqueStore {
           'An item in your bag is no longer available.'
         );
       }
-      const variant = prodWrap.variants.find((v) => v.id === reqItem.variantId);
+      const variant =
+        prodWrap.variants.find((v) => v.id === reqItem.variantId || v.sku === reqItem.variantId) ||
+        prodWrap.variants[0];
       if (!variant) {
         throw new StoreHttpError(
           409,
@@ -2667,9 +2667,17 @@ export class FirestoreRestStore implements BoutiqueStore {
     if (docs.length === 0 && !getActiveFirestoreIdToken()) {
       return buildStarterReadCategories(Date.now());
     }
-    return docs
-      .map((d) => d.data as unknown as CategoryRow)
-      .sort((a, b) => a.position - b.position || a.created_at - b.created_at);
+    const rows = docs.map((d) => d.data as unknown as CategoryRow);
+    if (!getActiveFirestoreIdToken()) {
+      const seenIds = new Set(rows.map((r) => r.id));
+      const seenNames = new Set(rows.map((r) => r.name.toLowerCase()));
+      for (const starter of buildStarterReadCategories(Date.now())) {
+        if (!seenIds.has(starter.id) && !seenNames.has(starter.name.toLowerCase())) {
+          rows.push(starter);
+        }
+      }
+    }
+    return rows.sort((a, b) => a.position - b.position || a.created_at - b.created_at);
   }
 
   async getCategoryById(id: string): Promise<CategoryRow | null> {

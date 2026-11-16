@@ -37,4 +37,40 @@ export const COLLECTIONS: CollectionItem[] = [
     image: BOUTIQUE_MEDIA.colAccessories,
     alt: 'Pearl-embroidered blush potli clutch, rose-gold earrings, and silk scarf on travertine',
   },
+  {
+    id: 'kurtis',
+    category: 'Kurtis',
+    subtitle: 'Breathable floral cottons, embroidered rayons & everyday straight-cut silhouettes',
+    image: BOUTIQUE_MEDIA.colEthnicWear,
+    alt: 'Handcrafted floral and embroidered kurtis for everyday elegance',
+  },
+  {
+    id: 'kurta-sets',
+    category: 'Kurta Sets',
+    subtitle: 'Coordinated cotton kurta-pant sets & three-piece ensembles with matching dupattas',
+    image: BOUTIQUE_MEDIA.spotlightEdit,
+    alt: 'Coordinated kurta and dupatta sets in soft festive tones',
+  },
+  {
+    id: 'sarees',
+    category: 'Sarees',
+    subtitle: 'Printed handloom cottons, soft silk-blends, floral georgettes & festive woven borders',
+    image: BOUTIQUE_MEDIA.heroEditorialCouture,
+    alt: 'Graceful silk-blend and printed sarees with woven borders',
+  },
+  {
+    id: 'co-ord-sets',
+    category: 'Co-ord Sets',
+    subtitle: 'Contemporary printed cotton & solid two-piece tailored co-ord sets',
+    image: BOUTIQUE_MEDIA.prodCoOrdSet,
+    alt: 'Tailored printed and solid two-piece co-ord sets',
+  },
+  {
+    id: 'dupattas',
+    category: 'Dupattas',
+    subtitle: 'Sheer embroidered chiffons & woven-border festive drapes',
+    image: BOUTIQUE_MEDIA.prodSilkPotliBag,
+    alt: 'Embroidered chiffon and woven-border dupattas',
+  },
 ];
+

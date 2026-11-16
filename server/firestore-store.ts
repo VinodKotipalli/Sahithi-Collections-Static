@@ -663,8 +663,10 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
   }
 
   async seedInitialCatalogIfEmpty(): Promise<void> {
-    const existingSnap = await this.productsCol().limit(1).get();
-    if (!existingSnap.empty) return;
+    const existingSnap = await this.productsCol().get();
+    const existingIds = new Set(existingSnap.docs.map((d) => d.id));
+    const missingItems = INITIAL_SEED_PRODUCTS.filter((item) => !existingIds.has(item.id));
+    if (missingItems.length === 0) return;
 
     const batch = this.firestore.batch();
     batch.set(
@@ -673,7 +675,7 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
       { merge: true }
     );
 
-    for (const item of INITIAL_SEED_PRODUCTS) {
+    for (const item of missingItems) {
       const ts = new Date(`${item.dateAdded}T10:00:00Z`).getTime() || Date.now();
       const pricePaise = Math.round(item.priceInr * 100);
       const compareAtPaise = item.compareAtInr ? Math.round(item.compareAtInr * 100) : null;
@@ -1743,12 +1745,14 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
   }
 
   private async ensureDefaultCategoriesSeeded(): Promise<void> {
-    const existing = await this.categoriesCol().limit(1).get();
-    if (!existing.empty) return;
+    const existing = await this.categoriesCol().get();
+    const existingIds = new Set(existing.docs.map((d) => d.id));
+    const missingCats = INITIAL_SEED_CATEGORIES.filter((c) => !existingIds.has(c.id));
+    if (missingCats.length === 0) return;
 
     const now = Date.now();
     const batch = this.firestore.batch();
-    for (const cat of INITIAL_SEED_CATEGORIES) {
+    for (const cat of missingCats) {
       const doc: CategoryRow = {
         id: cat.id,
         name: cat.name,

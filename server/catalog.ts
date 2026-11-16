@@ -1139,7 +1139,7 @@ export function registerCatalogAndAdminRoutes(params: {
           const { product, variants, images } = entry;
           const coverImg = images[0];
           const variant = variantId
-            ? variants.find((v) => v.id === variantId)
+            ? variants.find((v) => v.id === variantId || v.sku === variantId) || variants[0]
             : variants[0];
 
           if (!variant) {

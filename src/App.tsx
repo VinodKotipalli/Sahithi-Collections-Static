@@ -18,6 +18,7 @@ import { QuickViewModal } from './components/QuickViewModal';
 import { ScrollProgressAndTop } from './components/ScrollProgressAndTop';
 import { SpotlightEditSection } from './components/SpotlightEditSection';
 import { WishlistDrawer } from './components/WishlistDrawer';
+import { PRODUCTS } from './config/products';
 import { AuthProvider, useAuth, type AuthUser } from './context/AuthContext';
 import { StorefrontProvider, useStorefront } from './context/StorefrontContext';
 import { useBoutiqueRouter } from './hooks/useBoutiqueRouter';
@@ -27,14 +28,89 @@ import { useWishlist } from './hooks/useWishlist';
 import { handleClientlessApiRequest } from './services/firebaseClientApi';
 import type { CollectionCategory, Product } from './types/boutique';
 
+function normalizeStaticProducts(items: Product[]): Product[] {
+  return items.map((item) => {
+    const slug =
+      item.slug ||
+      item.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '');
+    const pricePaise = item.pricePaise ?? Math.round(item.price * 100);
+    const compareAtPaise =
+      item.compareAtPaise ??
+      (item.compareAtPrice ? Math.round(item.compareAtPrice * 100) : null);
+
+    let pos = 0;
+    const variants =
+      item.variants && item.variants.length > 0
+        ? item.variants
+        : item.sizes.flatMap((size) =>
+            item.colors.map((color) => {
+              pos += 1;
+              const colorCode = color.name
+                .replace(/[^a-zA-Z0-9]/g, '')
+                .slice(0, 3)
+                .toUpperCase();
+              const sizeCode = size.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+              return {
+                id: `${item.id}-v-${pos}`,
+                sku: `SC-${item.id.toUpperCase()}-${sizeCode}-${colorCode}-${pos}`,
+                size,
+                colorName: color.name,
+                colorHex: color.hex,
+                pricePaise,
+                compareAtPaise,
+                stockQty: 6,
+                position: pos - 1,
+              };
+            })
+          );
+    const stockQty =
+      item.stockQty ?? variants.reduce((sum, v) => sum + v.stockQty, 0);
+
+    return {
+      ...item,
+      slug,
+      pricePaise,
+      compareAtPaise,
+      stockQty,
+      inStock: stockQty > 0,
+      variants,
+    };
+  });
+}
+
+const DEFAULT_NORMALIZED_PRODUCTS = normalizeStaticProducts(PRODUCTS);
+
+function mergeWithStarterProducts(remoteItems: Product[]): Product[] {
+  const seenIds = new Set(remoteItems.map((p) => p.id));
+  const seenSlugs = new Set(remoteItems.map((p) => (p.slug || '').toLowerCase()).filter(Boolean));
+  const merged = [...remoteItems];
+  for (const starter of DEFAULT_NORMALIZED_PRODUCTS) {
+    if (!seenIds.has(starter.id) && !seenSlugs.has((starter.slug || '').toLowerCase())) {
+      merged.push(starter);
+    }
+  }
+  return merged;
+}
+
 function BoutiqueShell() {
   const prefersReducedMotion = usePrefersReducedMotion();
   const { user, isLoadingSession, refreshSession } = useAuth();
   const { settings, refreshStorefront } = useStorefront();
-  const { route, adminSubPath, queryToken, queryMode, nextPath, navigate, navigateToSection } =
-    useBoutiqueRouter();
+  const {
+    route,
+    adminSubPath,
+    queryToken,
+    queryMode,
+    nextPath,
+    productSlug,
+    navigate,
+    navigateToSection,
+  } = useBoutiqueRouter();
 
-  const [products, setProducts] = useState<Product[]>([]);
+  const [products, setProducts] = useState<Product[]>(() => DEFAULT_NORMALIZED_PRODUCTS);
   const [loadingCatalog, setLoadingCatalog] = useState(true);
 
   const [selectedCategory, setSelectedCategory] = useState<'All' | CollectionCategory>('All');
@@ -58,10 +134,11 @@ function BoutiqueShell() {
       const contentType = (res.headers.get('content-type') || '').toLowerCase();
       if (res.ok && contentType.includes('application/json')) {
         const data = (await res.json()) as { items?: Product[] };
-        if (Array.isArray(data.items)) {
-          setProducts(data.items);
+        if (Array.isArray(data.items) && data.items.length > 0) {
+          const merged = mergeWithStarterProducts(data.items);
+          setProducts(merged);
           setQuickViewProduct((current) =>
-            current ? data.items!.find((p) => p.id === current.id) || null : null
+            current ? merged.find((p) => p.id === current.id) || null : null
           );
           return;
         }
@@ -70,10 +147,11 @@ function BoutiqueShell() {
         '/api/products',
         'GET'
       );
-      if (fallback.ok && Array.isArray(fallback.data.items)) {
-        setProducts(fallback.data.items);
+      if (fallback.ok && Array.isArray(fallback.data.items) && fallback.data.items.length > 0) {
+        const merged = mergeWithStarterProducts(fallback.data.items);
+        setProducts(merged);
         setQuickViewProduct((current) =>
-          current ? fallback.data.items!.find((p) => p.id === current.id) || null : null
+          current ? merged.find((p) => p.id === current.id) || null : null
         );
       }
     } catch {
@@ -86,6 +164,19 @@ function BoutiqueShell() {
   useEffect(() => {
     void fetchPublicCatalog();
   }, [fetchPublicCatalog]);
+
+  useEffect(() => {
+    if (!productSlug || products.length === 0) return;
+    const normalizedSlug = productSlug.toLowerCase();
+    const matched = products.find(
+      (p) =>
+        p.id.toLowerCase() === normalizedSlug ||
+        (p.slug || '').toLowerCase() === normalizedSlug
+    );
+    if (matched) {
+      setQuickViewProduct(matched);
+    }
+  }, [productSlug, products]);
 
   // Mark private routes (/admin, /account) noindex client-side in addition to server headers
   useEffect(() => {
@@ -332,7 +423,13 @@ function BoutiqueShell() {
               searchInputRef={searchInputRef}
               isWishlisted={isWishlisted}
               onToggleWishlist={toggleWishlist}
-              onQuickView={setQuickViewProduct}
+              onQuickView={(product) => {
+                setQuickViewProduct(product);
+                if (typeof window !== 'undefined') {
+                  const slugOrId = product.slug || product.id;
+                  window.history.replaceState(null, '', `/products/${encodeURIComponent(slugOrId)}`);
+                }
+              }}
             />
 
             <SpotlightEditSection onExploreEdit={handleSelectCollection} />
@@ -362,7 +459,34 @@ function BoutiqueShell() {
         isWishlisted={quickViewProduct ? isWishlisted(quickViewProduct.id) : false}
         onToggleWishlist={toggleWishlist}
         onAddToBag={addToBag}
-        onClose={() => setQuickViewProduct(null)}
+        onBuyNow={(item) => {
+          addToBag(item);
+          setQuickViewProduct(null);
+          if (typeof window !== 'undefined' && window.location.pathname.startsWith('/products/')) {
+            window.history.replaceState(null, '', '/');
+          }
+          setBagOpen(true);
+        }}
+        relatedProducts={
+          quickViewProduct
+            ? products.filter(
+                (p) => p.id !== quickViewProduct.id && p.category === quickViewProduct.category
+              )
+            : []
+        }
+        onSelectProduct={(product) => {
+          setQuickViewProduct(product);
+          if (typeof window !== 'undefined') {
+            const slugOrId = product.slug || product.id;
+            window.history.replaceState(null, '', `/products/${encodeURIComponent(slugOrId)}`);
+          }
+        }}
+        onClose={() => {
+          setQuickViewProduct(null);
+          if (typeof window !== 'undefined' && window.location.pathname.startsWith('/products/')) {
+            window.history.replaceState(null, '', '/');
+          }
+        }}
       />
 
       <WishlistDrawer
@@ -371,7 +495,13 @@ function BoutiqueShell() {
         onClose={() => setWishlistOpen(false)}
         onRemoveItem={removeFromWishlist}
         onClearAll={clearWishlist}
-        onQuickView={setQuickViewProduct}
+        onQuickView={(product) => {
+          setQuickViewProduct(product);
+          if (typeof window !== 'undefined') {
+            const slugOrId = product.slug || product.id;
+            window.history.replaceState(null, '', `/products/${encodeURIComponent(slugOrId)}`);
+          }
+        }}
       />
 
       <BagDrawer

@@ -382,9 +382,6 @@ export function initAuthDatabase(
 }
 
 export function seedStorefrontCategoriesIfEmpty(db: DatabaseSync): void {
-  const existing = db.prepare(`SELECT COUNT(*) AS cnt FROM categories`).get() as { cnt: number };
-  if (existing.cnt > 0) return;
-
   const now = Date.now();
   const insert = db.prepare(
     `INSERT OR IGNORE INTO categories (
@@ -1193,15 +1190,18 @@ export const INITIAL_SEED_PRODUCTS: SeedProductDef[] = [
 ];
 
 export function seedInitialCatalogIfEmpty(db: DatabaseSync): void {
-  const existingCount = db
-    .prepare(`SELECT COUNT(*) AS cnt FROM products`)
-    .get() as { cnt: number };
-  if (existingCount.cnt > 0) return;
+  const checkExisting = db.prepare(
+    `SELECT id FROM products WHERE id = ? OR sku = ? OR slug = ? LIMIT 1`
+  );
+  const missingItems = INITIAL_SEED_PRODUCTS.filter(
+    (item) => !checkExisting.get(item.id, item.sku, item.slug)
+  );
+  if (missingItems.length === 0) return;
 
   db.exec('BEGIN IMMEDIATE;');
   try {
     const insertProduct = db.prepare(
-      `INSERT INTO products (
+      `INSERT OR IGNORE INTO products (
         id, slug, title, description, fabric_note, category, sku,
         price_paise, compare_at_paise, stock_qty, low_stock_threshold,
         featured, status, colors_json, sizes_json, version,
@@ -1210,19 +1210,19 @@ export function seedInitialCatalogIfEmpty(db: DatabaseSync): void {
     );
 
     const insertVariant = db.prepare(
-      `INSERT INTO product_variants (
+      `INSERT OR IGNORE INTO product_variants (
         id, product_id, sku, size, color_name, color_hex,
         price_paise, compare_at_paise, stock_qty, position
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
 
     const insertImage = db.prepare(
-      `INSERT INTO product_images (
+      `INSERT OR IGNORE INTO product_images (
         id, product_id, media_id, url, alt_text, is_cover, position, created_at
       ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?)`
     );
 
-    for (const item of INITIAL_SEED_PRODUCTS) {
+    for (const item of missingItems) {
       const ts = new Date(`${item.dateAdded}T10:00:00Z`).getTime() || Date.now();
       const pricePaise = Math.round(item.priceInr * 100);
       const compareAtPaise = item.compareAtInr ? Math.round(item.compareAtInr * 100) : null;

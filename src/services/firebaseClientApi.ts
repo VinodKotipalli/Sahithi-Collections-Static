@@ -7,6 +7,7 @@ import {
   mergeSiteSettings,
   mergeStorefrontContent,
 } from '../../server/storefront-defaults.ts';
+import { PRODUCTS } from '../config/products';
 import type { AuthCapabilities, AuthUser, ApiResult } from '../context/AuthContext';
 
 export const AUTHORIZED_OWNER_EMAIL = 'saivinodkotipalli2003@gmail.com';
@@ -611,8 +612,8 @@ interface StoredProductDoc {
   description: string;
   fabric_note: string;
   category: string;
-  status: 'draft' | 'active' | 'archived';
-  featured: number;
+  status: 'draft' | 'active' | 'published' | 'archived';
+  featured: number | boolean;
   price_paise: number;
   compare_at_paise: number | null;
   stock_qty: number;
@@ -635,22 +636,147 @@ interface StoredProductDoc {
     compare_at_paise: number | null;
     stock_qty: number;
     position: number;
-    created_at: number;
-    updated_at: number;
+    created_at?: number;
+    updated_at?: number;
   }>;
   images?: Array<{
     id: string;
     product_id: string;
     url: string;
     alt_text: string;
-    is_cover: number;
+    is_cover: number | boolean;
     position: number;
     created_at: number;
   }>;
 }
 
 function buildSeedProductsDocs(): StoredProductDoc[] {
-  return [];
+  return PRODUCTS.map((item) => {
+    const ts = new Date(`${item.dateAdded}T10:00:00Z`).getTime() || Date.now();
+    const slug =
+      item.slug ||
+      item.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '');
+    const sku = `SC-${item.id.toUpperCase()}`;
+    const pricePaise = item.pricePaise ?? Math.round(item.price * 100);
+    const compareAtPaise =
+      item.compareAtPaise ??
+      (item.compareAtPrice ? Math.round(item.compareAtPrice * 100) : null);
+
+    let pos = 0;
+    const variants: NonNullable<StoredProductDoc['variants']> = [];
+    for (const size of item.sizes) {
+      for (const color of item.colors) {
+        const colorCode = color.name
+          .replace(/[^a-zA-Z0-9]/g, '')
+          .slice(0, 3)
+          .toUpperCase();
+        const sizeCode = size.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+        variants.push({
+          id: `${item.id}-v-${pos + 1}`,
+          product_id: item.id,
+          sku: `${sku}-${sizeCode}-${colorCode}-${pos + 1}`,
+          size,
+          color_name: color.name,
+          color_hex: color.hex,
+          price_paise: pricePaise,
+          compare_at_paise: compareAtPaise,
+          stock_qty: 6,
+          position: pos,
+          created_at: ts,
+          updated_at: ts,
+        });
+        pos += 1;
+      }
+    }
+
+    const totalStock = variants.reduce((sum, v) => sum + v.stock_qty, 0);
+    const images: NonNullable<StoredProductDoc['images']> = item.images.map((img, idx) => ({
+      id: `${item.id}-img-${idx + 1}`,
+      product_id: item.id,
+      url: img.src,
+      alt_text: img.alt || item.name,
+      is_cover: idx === 0 ? 1 : 0,
+      position: idx,
+      created_at: ts,
+    }));
+
+    return {
+      id: item.id,
+      sku,
+      slug,
+      title: item.name,
+      description: item.description,
+      fabric_note: item.fabricNote,
+      category: item.category,
+      status: 'published',
+      featured: item.featured ? 1 : 0,
+      price_paise: pricePaise,
+      compare_at_paise: compareAtPaise,
+      stock_qty: totalStock,
+      low_stock_threshold: 5,
+      colors_json: JSON.stringify(item.colors),
+      sizes_json: JSON.stringify(item.sizes),
+      version: 1,
+      published_at: ts,
+      archived_at: null,
+      created_at: ts,
+      updated_at: ts,
+      variants,
+      images,
+    };
+  });
+}
+
+async function firestoreListPublishedProducts(): Promise<StoredProductDoc[]> {
+  try {
+    const res = await fetch(`${firestoreBaseUrl()}:runQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'products' }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: 'status' },
+              op: 'EQUAL',
+              value: { stringValue: 'published' },
+            },
+          },
+        },
+      }),
+    });
+    if (res.ok) {
+      const rows = (await res.json()) as Array<{ document?: FirestoreDocResponse }>;
+      const results: StoredProductDoc[] = [];
+      for (const row of rows) {
+        if (!row.document) continue;
+        const parsed = docToRecord<StoredProductDoc>(row.document);
+        if (parsed) results.push(parsed);
+      }
+      if (results.length > 0) return results;
+    }
+  } catch {
+    // Fallback to standard list below
+  }
+  return firestoreListDocs<StoredProductDoc>('products');
+}
+
+async function getMergedProductDocs(idToken?: string): Promise<StoredProductDoc[]> {
+  const remoteDocs = idToken
+    ? await firestoreListDocs<StoredProductDoc>('products', idToken)
+    : await firestoreListPublishedProducts();
+  const seenIds = new Set(remoteDocs.map((d) => d.id));
+  const seenSlugs = new Set(remoteDocs.map((d) => d.slug));
+  const merged = [...remoteDocs];
+  for (const seed of buildSeedProductsDocs()) {
+    if (!seenIds.has(seed.id) && !seenSlugs.has(seed.slug)) {
+      merged.push(seed);
+    }
+  }
+  return merged;
 }
 
 function formatProductDto(doc: StoredProductDoc, includeAdmin = false) {
@@ -1618,28 +1744,33 @@ export async function handleClientlessApiRequest<T>(
       const content = mergeStorefrontContent(
         contentDoc?.data ?? DEFAULT_STOREFRONT_CONTENT
       );
-      const categories =
-        categoriesDocs.length > 0
-          ? [...categoriesDocs]
-              .sort((a, b) => Number(a.position || 0) - Number(b.position || 0))
-              .map((c) => ({
-                id: c.id,
-                name: c.name,
-                slug: c.slug,
-                subtitle: c.subtitle || '',
-                imageUrl: c.image_url || '',
-                altText: c.alt_text || c.name,
-                position: Number(c.position || 0),
-              }))
-          : INITIAL_SEED_CATEGORIES.map((c) => ({
-              id: c.id,
-              name: c.name,
-              slug: c.slug,
-              subtitle: c.subtitle,
-              imageUrl: c.imageUrl,
-              altText: c.altText,
-              position: c.position,
-            }));
+      const mappedRemoteCats = [...categoriesDocs]
+        .sort((a, b) => Number(a.position || 0) - Number(b.position || 0))
+        .map((c) => ({
+          id: c.id,
+          name: c.name,
+          slug: c.slug,
+          subtitle: c.subtitle || '',
+          imageUrl: c.image_url || '',
+          altText: c.alt_text || c.name,
+          position: Number(c.position || 0),
+        }));
+      const seenCatIds = new Set(mappedRemoteCats.map((c) => c.id));
+      const seenCatNames = new Set(mappedRemoteCats.map((c) => c.name.toLowerCase()));
+      for (const seedCat of INITIAL_SEED_CATEGORIES) {
+        if (!seenCatIds.has(seedCat.id) && !seenCatNames.has(seedCat.name.toLowerCase())) {
+          mappedRemoteCats.push({
+            id: seedCat.id,
+            name: seedCat.name,
+            slug: seedCat.slug,
+            subtitle: seedCat.subtitle,
+            imageUrl: seedCat.imageUrl,
+            altText: seedCat.altText,
+            position: seedCat.position,
+          });
+        }
+      }
+      const categories = mappedRemoteCats.sort((a, b) => a.position - b.position);
 
       return {
         ok: true,
@@ -1648,17 +1779,296 @@ export async function handleClientlessApiRequest<T>(
     }
 
     if (cleanPath === '/api/products' && upperMethod === 'GET') {
-      let docs = await firestoreListDocs<StoredProductDoc>('products');
-      if (docs.length === 0) {
-        docs = buildSeedProductsDocs();
-      }
+      const docs = await getMergedProductDocs();
       const activeItems = docs
-        .filter((d) => d.status === 'active')
+        .filter((d) => d.status === 'active' || d.status === 'published')
         .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0))
         .map((d) => formatProductDto(d, false));
       return {
         ok: true,
         data: { items: activeItems } as unknown as T,
+      };
+    }
+
+    if (cleanPath.startsWith('/api/products/') && upperMethod === 'GET') {
+      const idOrSlug = decodeURIComponent(cleanPath.slice('/api/products/'.length));
+      const docs = await getMergedProductDocs();
+      const match = docs.find(
+        (d) =>
+          (d.status === 'active' || d.status === 'published') &&
+          (d.id === idOrSlug || d.slug === idOrSlug)
+      );
+      if (!match) {
+        return {
+          ok: false,
+          status: 404,
+          code: 'PRODUCT_NOT_FOUND',
+          error: 'Product not found.',
+        };
+      }
+      return {
+        ok: true,
+        data: { product: formatProductDto(match, false) } as unknown as T,
+      };
+    }
+
+    if (cleanPath === '/api/cart/validate' && upperMethod === 'POST') {
+      const rawItems = Array.isArray(body.items) ? body.items : [];
+      const docs = await getMergedProductDocs();
+      const productMap = new Map(
+        docs
+          .filter((d) => d.status === 'active' || d.status === 'published')
+          .map((d) => [d.id, d])
+      );
+
+      let subtotalPaise = 0;
+      let hasUnavailable = false;
+      let hasPriceChanges = false;
+
+      const validatedItems = rawItems.map((raw: Record<string, unknown>) => {
+        const productId = String(raw.productId || '');
+        const variantId = raw.variantId ? String(raw.variantId) : null;
+        const quantity = Math.max(1, Math.min(20, Math.round(Number(raw.quantity || 1))));
+        const seenPricePaise = Math.round(Number(raw.seenPricePaise || 0));
+
+        const doc = productMap.get(productId);
+        if (!doc) {
+          hasUnavailable = true;
+          return {
+            productId,
+            variantId,
+            requestedQty: quantity,
+            availableQty: 0,
+            quantity,
+            available: false,
+            statusReason: 'This item is no longer available.',
+            reason: 'This item is no longer available.',
+            title: String(raw.fallbackTitle || 'Unavailable Item'),
+            productTitle: String(raw.fallbackTitle || 'Unavailable Item'),
+            variantLabel: String(raw.fallbackVariant || ''),
+            sku: '',
+            imageUrl: String(raw.fallbackImage || ''),
+            currentPricePaise: null,
+            previousPricePaise: seenPricePaise,
+            priceChanged: false,
+            availableStock: 0,
+            lineTotalPaise: 0,
+          };
+        }
+
+        const variants = Array.isArray(doc.variants) ? doc.variants : [];
+        const variant =
+          (variantId ? variants.find((v) => v.id === variantId) : variants[0]) ||
+          variants[0] ||
+          null;
+        const unitPricePaise = variant ? Number(variant.price_paise) : Number(doc.price_paise);
+        const availableStock = variant ? Number(variant.stock_qty) : Number(doc.stock_qty);
+        const available = availableStock >= quantity && availableStock > 0;
+        if (!available) hasUnavailable = true;
+
+        const priceChanged = seenPricePaise > 0 && seenPricePaise !== unitPricePaise;
+        if (priceChanged) hasPriceChanges = true;
+
+        const lineTotalPaise = available ? unitPricePaise * quantity : 0;
+        subtotalPaise += lineTotalPaise;
+        const statusReason = !available
+          ? availableStock <= 0
+            ? 'Currently out of stock.'
+            : `Only ${availableStock} left in stock.`
+          : null;
+
+        return {
+          productId: doc.id,
+          variantId: variant?.id || doc.id,
+          requestedQty: quantity,
+          availableQty: availableStock,
+          quantity,
+          available,
+          statusReason,
+          reason: statusReason,
+          title: doc.title,
+          productTitle: doc.title,
+          variantLabel: variant ? `${variant.size} · ${variant.color_name}` : 'Standard',
+          sku: variant?.sku || doc.sku,
+          imageUrl: doc.images?.[0]?.url || '',
+          currentPricePaise: unitPricePaise,
+          previousPricePaise: seenPricePaise || unitPricePaise,
+          priceChanged,
+          availableStock,
+          lineTotalPaise,
+        };
+      });
+
+      return {
+        ok: true,
+        data: {
+          items: validatedItems,
+          subtotalPaise,
+          hasUnavailable,
+          hasPriceChanges,
+        } as unknown as T,
+      };
+    }
+
+    if (cleanPath === '/api/orders' && upperMethod === 'POST') {
+      const customerName = typeof body.customerName === 'string' ? body.customerName.trim() : '';
+      const customerEmail =
+        typeof body.customerEmail === 'string' ? body.customerEmail.trim().toLowerCase() : '';
+      const customerPhone = typeof body.customerPhone === 'string' ? body.customerPhone.trim() : '';
+      const shippingAddress =
+        typeof body.shippingAddress === 'string' ? body.shippingAddress.trim() : '';
+      const rawItems = Array.isArray(body.items) ? body.items : [];
+
+      if (
+        customerName.length < 2 ||
+        !EMAIL_REGEX.test(customerEmail) ||
+        customerPhone.length < 7 ||
+        shippingAddress.length < 8 ||
+        rawItems.length === 0
+      ) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          error: 'Please complete your name, email, phone number, and delivery address.',
+        };
+      }
+
+      const docs = await getMergedProductDocs();
+      const productMap = new Map(
+        docs
+          .filter((d) => d.status === 'active' || d.status === 'published')
+          .map((d) => [d.id, d])
+      );
+
+      const now = Date.now();
+      const orderId = `ord_${now.toString(36)}_${randomHex(4)}`;
+      const orderNumber = `SC-${now.toString(36).toUpperCase().slice(-5)}${randomHex(2).toUpperCase()}`;
+      let subtotalPaise = 0;
+      const productIds = new Set<string>();
+      const orderItems: Array<{
+        id: string;
+        order_id: string;
+        product_id: string;
+        variant_id: string;
+        product_title: string;
+        variant_label: string;
+        sku: string;
+        unit_price_paise: number;
+        quantity: number;
+        line_total_paise: number;
+      }> = [];
+
+      for (const raw of rawItems as Array<Record<string, unknown>>) {
+        const productId = String(raw.productId || '');
+        const variantId = raw.variantId ? String(raw.variantId) : '';
+        const quantity = Math.max(1, Math.min(20, Math.round(Number(raw.quantity || 1))));
+        const expectedPricePaise =
+          raw.expectedPricePaise !== undefined && raw.expectedPricePaise !== null
+            ? Math.round(Number(raw.expectedPricePaise))
+            : null;
+
+        const doc = productMap.get(productId);
+        if (!doc) {
+          return {
+            ok: false,
+            status: 409,
+            code: 'PRODUCT_UNAVAILABLE',
+            error: 'One of the items in your bag is no longer available.',
+          };
+        }
+
+        const variants = Array.isArray(doc.variants) ? doc.variants : [];
+        const variant =
+          (variantId ? variants.find((v) => v.id === variantId) : variants[0]) ||
+          variants[0] ||
+          null;
+        const unitPricePaise = variant ? Number(variant.price_paise) : Number(doc.price_paise);
+        const availableStock = variant ? Number(variant.stock_qty) : Number(doc.stock_qty);
+
+        if (expectedPricePaise !== null && expectedPricePaise !== unitPricePaise) {
+          return {
+            ok: false,
+            status: 409,
+            code: 'PRICE_CHANGED',
+            error: `The price for "${doc.title}" has been updated. Please review your bag.`,
+          };
+        }
+
+        if (availableStock < quantity) {
+          return {
+            ok: false,
+            status: 409,
+            code: 'INSUFFICIENT_STOCK',
+            error: `Only ${availableStock} piece(s) left for "${doc.title}".`,
+          };
+        }
+
+        const lineTotalPaise = unitPricePaise * quantity;
+        subtotalPaise += lineTotalPaise;
+        productIds.add(doc.id);
+        orderItems.push({
+          id: `item_${orderId}_${orderItems.length + 1}`,
+          order_id: orderId,
+          product_id: doc.id,
+          variant_id: variant?.id || doc.id,
+          product_title: doc.title,
+          variant_label: variant ? `${variant.size} / ${variant.color_name}` : 'Standard',
+          sku: variant?.sku || doc.sku,
+          unit_price_paise: unitPricePaise,
+          quantity,
+          line_total_paise: lineTotalPaise,
+        });
+      }
+
+      const activeSession = await getValidClientSession().catch(() => null);
+      await firestoreSetDoc(
+        'orders',
+        orderId,
+        {
+          id: orderId,
+          order_number: orderNumber,
+          customer_user_id: activeSession ? activeSession.uid : null,
+          customer_name: customerName,
+          customer_email: customerEmail,
+          customer_phone: customerPhone,
+          shipping_address: shippingAddress,
+          status: 'pending',
+          subtotal_paise: subtotalPaise,
+          total_paise: subtotalPaise,
+          currency: 'INR',
+          created_at: now,
+          product_ids: Array.from(productIds),
+          items: orderItems,
+        },
+        activeSession?.idToken
+      ).catch(() => false);
+
+      return {
+        ok: true,
+        data: {
+          order: {
+            id: orderId,
+            orderNumber,
+            customerName,
+            customerEmail,
+            customerPhone,
+            shippingAddress,
+            status: 'pending',
+            subtotalPaise,
+            totalPaise: subtotalPaise,
+            currency: 'INR',
+            createdAt: now,
+            items: orderItems.map((it) => ({
+              productTitle: it.product_title,
+              variantLabel: it.variant_label,
+              sku: it.sku,
+              unitPricePaise: it.unit_price_paise,
+              quantity: it.quantity,
+              lineTotalPaise: it.line_total_paise,
+            })),
+          },
+        } as unknown as T,
       };
     }
 
@@ -1726,20 +2136,7 @@ export async function handleClientlessApiRequest<T>(
       const idToken = session.idToken;
 
       if (cleanPath === '/api/admin/overview' && upperMethod === 'GET') {
-        let products = await firestoreListDocs<StoredProductDoc>('products', idToken);
-        if (products.length === 0) {
-          products = buildSeedProductsDocs();
-          await Promise.all(
-            products.map((p) =>
-              firestoreSetDoc(
-                'products',
-                p.id,
-                p as unknown as Record<string, unknown>,
-                idToken
-              )
-            )
-          );
-        }
+        const products = await firestoreListDocs<StoredProductDoc>('products', idToken);
         const categories = await firestoreListDocs<{ id: string }>('categories', idToken);
         const messages = await firestoreListDocs<{ status?: string }>(
           'contact_messages',
@@ -1759,14 +2156,14 @@ export async function handleClientlessApiRequest<T>(
           created_at: number;
         }>('admin_audit_log', idToken);
 
-        const activeCount = products.filter((p) => (p.status === 'active' || (p.status as string) === 'published')).length;
+        const activeCount = products.filter((p) => (p.status === 'active' || p.status === 'published')).length;
         const draftCount = products.filter((p) => p.status === 'draft').length;
         const archivedCount = products.filter((p) => p.status === 'archived').length;
         const lowStockCount = products.filter(
-          (p) => (p.status === 'active' || (p.status as string) === 'published') && Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 2)
+          (p) => (p.status === 'active' || p.status === 'published') && Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 2)
         ).length;
         const outOfStockCount = products.filter(
-          (p) => (p.status === 'active' || (p.status as string) === 'published') && Number(p.stock_qty) <= 0
+          (p) => (p.status === 'active' || p.status === 'published') && Number(p.stock_qty) <= 0
         ).length;
 
         const paidOrders = orders.filter(
@@ -1797,7 +2194,7 @@ export async function handleClientlessApiRequest<T>(
               totalAuditEvents: auditLogs.length,
             },
             lowStockItems: products
-              .filter(p => (p.status === 'active' || (p.status as string) === 'published') && Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 2))
+              .filter(p => (p.status === 'active' || p.status === 'published') && Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 2))
               .slice(0, 8).map(p => formatProductDto(p, true)),
             recentOrders: [...orders].sort((a, b) => Number((b as any).created_at || 0) - Number((a as any).created_at || 0)).slice(0, 8),
             recentMessages: [...messages].sort((a, b) => Number((b as any).created_at || 0) - Number((a as any).created_at || 0)).slice(0, 8),
@@ -1818,10 +2215,7 @@ export async function handleClientlessApiRequest<T>(
       }
 
       if (cleanPath === '/api/admin/products' && upperMethod === 'GET') {
-        let docs = await firestoreListDocs<StoredProductDoc>('products', idToken);
-        if (docs.length === 0) {
-          docs = buildSeedProductsDocs();
-        }
+        const docs = await getMergedProductDocs(idToken);
         return {
           ok: true,
           data: {

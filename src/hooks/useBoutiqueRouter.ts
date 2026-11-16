@@ -36,14 +36,23 @@ interface ParsedLocation {
   token: string;
   queryMode: string;
   nextPath: string;
+  productSlug: string;
 }
 
 function readLocation(): ParsedLocation {
   if (typeof window === 'undefined') {
-    return { route: '/', adminSubPath: '', token: '', queryMode: '', nextPath: '/account' };
+    return {
+      route: '/',
+      adminSubPath: '',
+      token: '',
+      queryMode: '',
+      nextPath: '/account',
+      productSlug: '',
+    };
   }
   const pathname = window.location.pathname.replace(/\/+$/, '') || '/';
   const isAdmin = pathname === '/admin' || pathname.startsWith('/admin/');
+  const isProductPath = pathname.startsWith('/products/');
   const route: BoutiqueRoute = isAdmin
     ? '/admin'
     : KNOWN_ROUTES.has(pathname)
@@ -54,7 +63,11 @@ function readLocation(): ParsedLocation {
   const token = params.get('token') || params.get('oobCode') || '';
   const queryMode = params.get('mode') || '';
   const nextPath = sanitizeNextPath(params.get('next'), '');
-  return { route, adminSubPath, token, queryMode, nextPath };
+  const pathProductSlug = isProductPath
+    ? decodeURIComponent(pathname.slice('/products/'.length)).replace(/\/+$/, '')
+    : '';
+  const productSlug = pathProductSlug || (params.get('product') || '').trim();
+  return { route, adminSubPath, token, queryMode, nextPath, productSlug };
 }
 
 export function useBoutiqueRouter() {
@@ -120,6 +133,7 @@ export function useBoutiqueRouter() {
     queryToken: locationState.token,
     queryMode: locationState.queryMode,
     nextPath: locationState.nextPath,
+    productSlug: locationState.productSlug,
     navigate,
     navigateToSection,
   };
