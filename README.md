@@ -9,6 +9,11 @@ Use the checked-in `vercel.json`: it installs with `npm ci`, runs
 `npm run build:static`, and rewrites page routes to `index.html`. API and
 asset paths are excluded from the page rewrite.
 
+The committed `npm-shrinkwrap.json` pins the dependency tree for `npm ci`.
+npm gives this file precedence over a generated `package-lock.json`. When
+changing dependencies, commit the updated `npm-shrinkwrap.json` alongside
+`package.json` and verify a clean `npm ci`.
+
 The static build selects the existing Firebase Auth / Firestore browser adapter
 before any API request is sent. Login, session refresh, owner/admin operations,
 logout, and storefront reads use this same transport. It does not send passwords
