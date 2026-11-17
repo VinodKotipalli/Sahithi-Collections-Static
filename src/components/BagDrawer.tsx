@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
+  CreditCard,
   Loader2,
   Minus,
   Plus,
@@ -14,6 +15,11 @@ import { AnimatePresence, motion } from 'motion/react';
 import { useAuth } from '../context/AuthContext';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
+import {
+  createRazorpayOrder,
+  ensureRazorpayCheckoutScript,
+  verifyRazorpayPayment,
+} from '../services/razorpayCheckout';
 import type { BagItem, BagValidationResult, PlacedOrderReceipt } from '../types/boutique';
 import { formatPaiseINR, formatTimestamp } from '../utils/format';
 import { BoutiqueImage } from './BoutiqueImage';
@@ -122,10 +128,26 @@ export function BagDrawer({
     );
   };
 
+  const displaySubtotalPaise =
+    validation?.subtotalPaise ??
+    items.reduce((sum, it) => sum + it.seenPricePaise * it.quantity, 0);
+
   const handlePlaceOrder = async (e: FormEvent) => {
     e.preventDefault();
     if (submitting) return;
     setErrorText(null);
+
+    if (displaySubtotalPaise < 100) {
+      setErrorText('Minimum order amount is ₹1.00 (100 paise).');
+      return;
+    }
+
+    const razorpayKeyId = (import.meta.env.VITE_RAZORPAY_KEY_ID || '').trim();
+    if (!razorpayKeyId) {
+      setErrorText('Razorpay key is not configured (VITE_RAZORPAY_KEY_ID).');
+      return;
+    }
+
     setSubmitting(true);
 
     try {
@@ -141,35 +163,128 @@ export function BagDrawer({
         };
       });
 
-      const res = await apiRequest<{ order: PlacedOrderReceipt }>('/api/orders', {
-        method: 'POST',
-        body: JSON.stringify({
-          customerName,
-          customerEmail,
-          customerPhone,
-          shippingAddress,
-          items: payloadItems,
-        }),
-      });
-
-      if (!res.ok) {
-        setErrorText(res.error);
-        void revalidateBag();
+      const scriptLoaded = await ensureRazorpayCheckoutScript();
+      if (!scriptLoaded || typeof window.Razorpay !== 'function') {
+        setErrorText('Failed to load Razorpay Checkout SDK. Please check your connection and try again.');
+        setSubmitting(false);
         return;
       }
 
-      setReceipt(res.data.order);
-      setCheckoutOpen(false);
-      onClearBag();
-      onOrderCompleted();
-    } finally {
+      const orderRes = await createRazorpayOrder({
+        amount: displaySubtotalPaise,
+        currency: 'INR',
+        receipt: `sc_rcpt_${Date.now()}`,
+      });
+
+      if (!orderRes.ok) {
+        setErrorText(orderRes.error);
+        setSubmitting(false);
+        return;
+      }
+
+      const { order_id, amount, currency } = orderRes.data;
+
+      const rzp = new window.Razorpay({
+        key: razorpayKeyId,
+        amount,
+        currency,
+        name: 'Sahithi Collections',
+        description: 'Boutique Order Checkout',
+        order_id,
+        prefill: {
+          name: customerName.trim(),
+          email: customerEmail.trim(),
+          contact: customerPhone.trim(),
+        },
+        theme: {
+          color: '#49243E',
+        },
+        modal: {
+          ondismiss: () => {
+            setSubmitting(false);
+            setErrorText('Payment was cancelled. Your bag items are still saved.');
+          },
+        },
+        handler: async (paymentResponse) => {
+          setSubmitting(true);
+          setErrorText(null);
+          const verifyRes = await verifyRazorpayPayment({
+            razorpay_order_id: paymentResponse.razorpay_order_id,
+            razorpay_payment_id: paymentResponse.razorpay_payment_id,
+            razorpay_signature: paymentResponse.razorpay_signature,
+            orderData: {
+              customerName: customerName.trim(),
+              customerEmail: customerEmail.trim(),
+              customerPhone: customerPhone.trim(),
+              shippingAddress: shippingAddress.trim(),
+              items: payloadItems,
+            },
+          });
+
+          setSubmitting(false);
+
+          if (!verifyRes.ok) {
+            setErrorText(verifyRes.error);
+            void revalidateBag();
+            return;
+          }
+
+          if (verifyRes.data.order) {
+            setReceipt(verifyRes.data.order);
+          } else {
+            setReceipt({
+              id: verifyRes.data.order_id,
+              orderNumber: verifyRes.data.order_id,
+              status: 'confirmed',
+              subtotalPaise: amount,
+              totalPaise: amount,
+              currency,
+              createdAt: Date.now(),
+              paymentMethod: 'razorpay',
+              razorpayOrderId: verifyRes.data.order_id,
+              razorpayPaymentId: verifyRes.data.payment_id,
+              items: items.map((it) => {
+                const vItem = validation?.items.find(
+                  (v) => v.productId === it.productId && v.variantId === it.variantId
+                );
+                const unitPricePaise = vItem?.currentPricePaise ?? it.seenPricePaise;
+                return {
+                  productId: it.productId,
+                  variantId: it.variantId,
+                  productTitle: vItem?.title || it.fallbackTitle,
+                  variantLabel: vItem?.variantLabel || it.fallbackVariant,
+                  sku: it.variantId,
+                  unitPricePaise,
+                  quantity: it.quantity,
+                  lineTotalPaise: unitPricePaise * it.quantity,
+                };
+              }),
+            });
+          }
+
+          setCheckoutOpen(false);
+          onClearBag();
+          onOrderCompleted();
+        },
+      });
+
+      rzp.on('payment.failed', (failure) => {
+        setSubmitting(false);
+        const failureMsg =
+          failure?.error?.description ||
+          failure?.error?.reason ||
+          'Payment failed. Please try again with another payment method.';
+        setErrorText(failureMsg);
+      });
+
+      rzp.open();
+    } catch (err) {
       setSubmitting(false);
+      setErrorText(
+        err instanceof Error ? err.message : 'Something went wrong while starting payment.'
+      );
     }
   };
-
-  const displaySubtotalPaise =
-    validation?.subtotalPaise ??
-    items.reduce((sum, it) => sum + it.seenPricePaise * it.quantity, 0);
 
   return (
     <AnimatePresence>
@@ -230,13 +345,14 @@ export function BagDrawer({
                     </div>
                     <div>
                       <p className="text-xs font-medium tracking-wider uppercase text-[#B76E79]">
-                        Order Confirmed
+                        Payment &amp; Order Confirmed
                       </p>
                       <h3 className="font-serif text-2xl font-semibold text-[#49243E]">
                         {receipt.orderNumber}
                       </h3>
                       <p className="mt-1 text-xs text-[#242124]/70">
-                        Placed {formatTimestamp(receipt.createdAt)} · Cash on Delivery / Boutique Reservation
+                        Placed {formatTimestamp(receipt.createdAt)} · Paid via Razorpay
+                        {receipt.razorpayPaymentId ? ` (${receipt.razorpayPaymentId})` : ''}
                       </p>
                     </div>
                   </div>
@@ -495,8 +611,12 @@ export function BagDrawer({
                         disabled={submitting || validating}
                         className="inline-flex min-h-[46px] w-full items-center justify-center gap-2 rounded-xl bg-[#49243E] px-5 text-sm font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31] disabled:opacity-60"
                       >
-                        {submitting && <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />}
-                        <span>Place Order ({formatPaiseINR(displaySubtotalPaise)})</span>
+                        {submitting ? (
+                          <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                        ) : (
+                          <CreditCard className="h-4 w-4" aria-hidden="true" />
+                        )}
+                        <span>Pay with Razorpay ({formatPaiseINR(displaySubtotalPaise)})</span>
                       </button>
                     </form>
                   )}

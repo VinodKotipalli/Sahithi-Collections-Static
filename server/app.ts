@@ -712,6 +712,10 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
       return next();
     }
+    const cleanSubPath = req.path.replace(/\/+$/, '');
+    if (cleanSubPath === '/create-order' || cleanSubPath === '/verify-payment') {
+      return next();
+    }
 
     const origin = req.get('origin');
     if (origin) {

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { NextFunction, Request, RequestHandler, Response, Router } from 'express';
 import express from 'express';
 import multer from 'multer';
+import Razorpay from 'razorpay';
 import {
   StoreHttpError,
   type AdminProductRecord,
@@ -1332,6 +1333,280 @@ export function registerCatalogAndAdminRoutes(params: {
       return next(err);
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Razorpay Standard Web Checkout Endpoints (/api/create-order, /api/verify-payment)
+  // -------------------------------------------------------------------------
+
+  app.post(
+    '/api/create-order',
+    async (req: AuthedCatalogRequest, res: Response) => {
+      const keyId = (process.env.RAZORPAY_KEY_ID || '').trim();
+      const keySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
+
+      if (!keyId || !keySecret) {
+        return res.status(401).json({
+          status: 401,
+          code: 'RAZORPAY_AUTH_FAILED',
+          error: 'Razorpay API credentials are not configured.',
+        });
+      }
+
+      const rawAmount = req.body?.amount;
+      const amountPaise =
+        typeof rawAmount === 'number' && Number.isFinite(rawAmount)
+          ? Math.round(rawAmount)
+          : typeof rawAmount === 'string' && rawAmount.trim() !== ''
+            ? Math.round(Number(rawAmount))
+            : NaN;
+
+      if (!Number.isInteger(amountPaise) || amountPaise < MIN_PRICE_PAISE) {
+        return res.status(400).json({
+          status: 400,
+          code: 'INVALID_AMOUNT',
+          error: 'Amount must be at least 100 paise (₹1.00).',
+        });
+      }
+
+      const currency =
+        typeof req.body?.currency === 'string' && req.body.currency.trim()
+          ? req.body.currency.trim().toUpperCase()
+          : 'INR';
+      const receipt =
+        typeof req.body?.receipt === 'string' && req.body.receipt.trim()
+          ? req.body.receipt.trim().slice(0, 40)
+          : `rcpt_${Date.now()}`;
+
+      try {
+        const razorpay = new Razorpay({
+          key_id: keyId,
+          key_secret: keySecret,
+        });
+
+        const order = await razorpay.orders.create({
+          amount: amountPaise,
+          currency,
+          receipt,
+        });
+
+        return res.status(200).json({
+          order_id: order.id,
+          id: order.id,
+          amount: Number(order.amount),
+          currency: String(order.currency || currency),
+          receipt: String(order.receipt || receipt),
+        });
+      } catch (err: unknown) {
+        const errObj = err && typeof err === 'object' ? (err as Record<string, unknown>) : {};
+        const statusCode = typeof errObj.statusCode === 'number' ? errObj.statusCode : 500;
+        const innerErr =
+          errObj.error && typeof errObj.error === 'object'
+            ? (errObj.error as Record<string, unknown>)
+            : {};
+        const description =
+          typeof innerErr.description === 'string' && innerErr.description
+            ? innerErr.description
+            : err instanceof Error
+              ? err.message
+              : 'Failed to create Razorpay order.';
+
+        if (statusCode === 401 || description.toLowerCase().includes('authentication failed')) {
+          return res.status(401).json({
+            status: 401,
+            code: 'RAZORPAY_AUTH_FAILED',
+            error: description || 'Razorpay authentication failed.',
+          });
+        }
+
+        return res.status(500).json({
+          status: 500,
+          code: 'RAZORPAY_ORDER_FAILED',
+          error: description,
+        });
+      }
+    }
+  );
+
+  app.post(
+    '/api/verify-payment',
+    async (req: AuthedCatalogRequest, res: Response) => {
+      const razorpayOrderId =
+        typeof req.body?.razorpay_order_id === 'string'
+          ? req.body.razorpay_order_id.trim()
+          : typeof req.body?.order_id === 'string'
+            ? req.body.order_id.trim()
+            : '';
+      const razorpayPaymentId =
+        typeof req.body?.razorpay_payment_id === 'string'
+          ? req.body.razorpay_payment_id.trim()
+          : typeof req.body?.payment_id === 'string'
+            ? req.body.payment_id.trim()
+            : '';
+      const razorpaySignature =
+        typeof req.body?.razorpay_signature === 'string'
+          ? req.body.razorpay_signature.trim()
+          : typeof req.body?.signature === 'string'
+            ? req.body.signature.trim()
+            : '';
+
+      if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+        return res.status(400).json({
+          status: 400,
+          success: false,
+          verified: false,
+          code: 'MISSING_FIELDS',
+          error:
+            'Missing required payment verification fields (razorpay_order_id, razorpay_payment_id, razorpay_signature).',
+        });
+      }
+
+      const keySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
+      if (!keySecret) {
+        return res.status(401).json({
+          status: 401,
+          success: false,
+          verified: false,
+          code: 'RAZORPAY_AUTH_FAILED',
+          error: 'Razorpay API credentials are not configured.',
+        });
+      }
+
+      const expectedSignature = crypto
+        .createHmac('sha256', keySecret)
+        .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+        .digest('hex');
+
+      const expectedBuf = Buffer.from(expectedSignature, 'utf8');
+      const actualBuf = Buffer.from(razorpaySignature, 'utf8');
+      const isValidSignature =
+        expectedBuf.length === actualBuf.length &&
+        crypto.timingSafeEqual(expectedBuf, actualBuf);
+
+      if (!isValidSignature) {
+        return res.status(400).json({
+          status: 400,
+          success: false,
+          verified: false,
+          code: 'INVALID_SIGNATURE',
+          error: 'Invalid payment signature. Payment could not be verified.',
+        });
+      }
+
+      const rawOrderData =
+        req.body?.orderData && typeof req.body.orderData === 'object'
+          ? (req.body.orderData as Record<string, unknown>)
+          : null;
+
+      if (rawOrderData) {
+        const customerName =
+          typeof rawOrderData.customerName === 'string' ? rawOrderData.customerName.trim() : '';
+        const customerEmail =
+          typeof rawOrderData.customerEmail === 'string'
+            ? rawOrderData.customerEmail.trim().toLowerCase()
+            : '';
+        const customerPhone =
+          typeof rawOrderData.customerPhone === 'string' ? rawOrderData.customerPhone.trim() : '';
+        const shippingAddress =
+          typeof rawOrderData.shippingAddress === 'string'
+            ? rawOrderData.shippingAddress.trim()
+            : '';
+        const rawItems = Array.isArray(rawOrderData.items) ? rawOrderData.items : [];
+
+        if (
+          customerName.length >= 2 &&
+          customerEmail &&
+          customerPhone.length >= 7 &&
+          shippingAddress.length >= 8 &&
+          rawItems.length > 0
+        ) {
+          const parsedItems = rawItems
+            .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+            .map((obj) => ({
+              productId: typeof obj.productId === 'string' ? obj.productId : '',
+              variantId: typeof obj.variantId === 'string' ? obj.variantId : '',
+              quantity: typeof obj.quantity === 'number' ? Math.round(obj.quantity) : 1,
+              expectedPricePaise:
+                typeof obj.expectedPricePaise === 'number' && Number.isFinite(obj.expectedPricePaise)
+                  ? Math.round(obj.expectedPricePaise)
+                  : null,
+            }))
+            .filter((item) => item.productId && item.quantity >= 1);
+
+          if (parsedItems.length > 0) {
+            try {
+              const { order, items } = await store.placeOrder({
+                customerUserId: req.authUser?.id || null,
+                customerName,
+                customerEmail,
+                customerPhone,
+                shippingAddress,
+                items: parsedItems,
+              });
+              await store.updateOrderStatus(order.id, 'confirmed').catch(() => false);
+
+              return res.status(200).json({
+                success: true,
+                verified: true,
+                order_id: razorpayOrderId,
+                payment_id: razorpayPaymentId,
+                message: 'Payment verified and order confirmed.',
+                order: {
+                  id: order.id,
+                  orderNumber: order.order_number,
+                  status: 'confirmed',
+                  subtotalPaise: order.subtotal_paise,
+                  totalPaise: order.total_paise,
+                  currency: order.currency,
+                  createdAt: order.created_at,
+                  paymentMethod: 'razorpay',
+                  razorpayOrderId,
+                  razorpayPaymentId,
+                  items: items.map((l) => ({
+                    productId: l.product_id,
+                    variantId: l.variant_id,
+                    productTitle: l.product_title,
+                    variantLabel: l.variant_label,
+                    sku: l.sku,
+                    unitPricePaise: l.unit_price_paise,
+                    quantity: l.quantity,
+                    lineTotalPaise: l.line_total_paise,
+                  })),
+                },
+              });
+            } catch (orderErr) {
+              if (orderErr instanceof StoreHttpError) {
+                return sendJsonError(
+                  req,
+                  res,
+                  orderErr.httpStatus,
+                  orderErr.code,
+                  orderErr.message
+                );
+              }
+              return res.status(500).json({
+                status: 500,
+                success: false,
+                verified: true,
+                code: 'ORDER_RECORD_FAILED',
+                error:
+                  orderErr instanceof Error
+                    ? orderErr.message
+                    : 'Payment verified, but order recording failed.',
+              });
+            }
+          }
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        verified: true,
+        order_id: razorpayOrderId,
+        payment_id: razorpayPaymentId,
+        message: 'Payment verified successfully.',
+      });
+    }
+  );
 
   // -------------------------------------------------------------------------
   // Private Owner-Only Admin Authentication & Dashboard Endpoints (/api/admin/*)

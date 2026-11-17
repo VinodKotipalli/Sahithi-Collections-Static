@@ -89,6 +89,9 @@ export interface PlacedOrderReceipt {
   totalPaise: number;
   currency: string;
   createdAt: number;
+  paymentMethod?: 'razorpay' | 'cod';
+  razorpayOrderId?: string;
+  razorpayPaymentId?: string;
   items: Array<{
     productId: string;
     variantId: string;
