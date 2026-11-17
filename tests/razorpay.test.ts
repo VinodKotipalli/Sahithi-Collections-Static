@@ -455,3 +455,144 @@ test('Vercel Node.js Serverless Functions (/api/create-order.ts & /api/verify-pa
     clearRazorpayCheckoutCachesForTest();
   }
 });
+
+test('Razorpay credential sanitization strips quotes/newlines, rejects malformed keys, and reports actionable masked 401 errors', async () => {
+  clearRazorpayCheckoutCachesForTest();
+  const prevKeyId = process.env.RAZORPAY_KEY_ID;
+  const prevKeySecret = process.env.RAZORPAY_KEY_SECRET;
+
+  try {
+    // 1. Quoted & newline-padded credentials are sanitized cleanly before SDK usage
+    let capturedKeyId = '';
+    let capturedKeySecret = '';
+    const captureHandler = createCreateOrderHandler({
+      razorpayClientFactory: (keyId, keySecret) => {
+        capturedKeyId = keyId;
+        capturedKeySecret = keySecret;
+        return {
+          orders: {
+            async create(params) {
+              return { id: 'order_clean_1', amount: params.amount, currency: params.currency };
+            },
+            async fetch() {
+              return { id: 'order_clean_1', amount: 74900, currency: 'INR' };
+            },
+          },
+          payments: {
+            async fetch() {
+              return { id: 'pay_1', amount: 74900, currency: 'INR', status: 'captured', captured: true };
+            },
+            async capture() {
+              return { id: 'pay_1', amount: 74900, currency: 'INR', status: 'captured', captured: true };
+            },
+          },
+        };
+      },
+    });
+
+    const srv = http.createServer((req, res) => {
+      void captureHandler(req, res);
+    });
+    await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', () => resolve()));
+    const { port } = srv.address() as { port: number };
+    const url = `http://127.0.0.1:${port}/api/create-order`;
+
+    try {
+      process.env.RAZORPAY_KEY_ID = '  "rzp_test_CleanKey1234" \n';
+      process.env.RAZORPAY_KEY_SECRET = " 'SecretClean999'\r\n";
+
+      const cleanRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+      });
+      assert.equal(cleanRes.status, 200);
+      assert.equal(capturedKeyId, 'rzp_test_CleanKey1234');
+      assert.equal(capturedKeySecret, 'SecretClean999');
+
+      // 2. Malformed key ID returns 401 RAZORPAY_AUTH_FAILED
+      process.env.RAZORPAY_KEY_ID = 'invalid_key_prefix';
+      process.env.RAZORPAY_KEY_SECRET = 'SecretClean999';
+      const badFormatRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+      });
+      assert.equal(badFormatRes.status, 401);
+      const badFormatBody = (await badFormatRes.json()) as { code?: string; error?: string };
+      assert.equal(badFormatBody.code, 'RAZORPAY_AUTH_FAILED');
+      assert.match(badFormatBody.error || '', /RAZORPAY_KEY_ID/);
+
+      // 2b. Key ID accidentally pasted into RAZORPAY_KEY_SECRET returns clear 401 guidance
+      process.env.RAZORPAY_KEY_ID = 'rzp_live_SampleLiveKey1';
+      process.env.RAZORPAY_KEY_SECRET = 'rzp_live_SampleLiveKey1';
+      const swappedRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+      });
+      assert.equal(swappedRes.status, 401);
+      const swappedBody = (await swappedRes.json()) as { code?: string; error?: string };
+      assert.equal(swappedBody.code, 'RAZORPAY_AUTH_FAILED');
+      assert.match(swappedBody.error || '', /RAZORPAY_KEY_SECRET/);
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
+
+    // 3. Upstream 401 returns masked keyPrefix diagnostic and never leaks secret
+    const authFailHandler = createCreateOrderHandler({
+      razorpayClientFactory: () => ({
+        orders: {
+          async create() {
+            throw { statusCode: 401, error: { description: 'Authentication failed' } };
+          },
+          async fetch() {
+            return { id: 'o', amount: 100 };
+          },
+        },
+        payments: {
+          async fetch() {
+            return { id: 'p', amount: 100 };
+          },
+          async capture() {
+            return { id: 'p', amount: 100 };
+          },
+        },
+      }),
+    });
+    const srv2 = http.createServer((req, res) => {
+      void authFailHandler(req, res);
+    });
+    await new Promise<void>((resolve) => srv2.listen(0, '127.0.0.1', () => resolve()));
+    const { port: port2 } = srv2.address() as { port: number };
+    try {
+      process.env.RAZORPAY_KEY_ID = 'rzp_test_SampleKey9876';
+      process.env.RAZORPAY_KEY_SECRET = 'SuperSecretNeverExpose';
+      const failRes = await fetch(`http://127.0.0.1:${port2}/api/create-order`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+      });
+      assert.equal(failRes.status, 401);
+      const failBody = (await failRes.json()) as {
+        code?: string;
+        keyMode?: string;
+        keyPrefix?: string;
+        error?: string;
+      };
+      assert.equal(failBody.code, 'RAZORPAY_AUTH_FAILED');
+      assert.equal(failBody.keyMode, 'test');
+      assert.equal(failBody.keyPrefix, 'rzp_test_Sam…9876');
+      assert.equal((failBody.error || '').includes('SuperSecretNeverExpose'), false);
+    } finally {
+      await new Promise<void>((resolve) => srv2.close(() => resolve()));
+    }
+  } finally {
+    if (prevKeyId === undefined) delete process.env.RAZORPAY_KEY_ID;
+    else process.env.RAZORPAY_KEY_ID = prevKeyId;
+    if (prevKeySecret === undefined) delete process.env.RAZORPAY_KEY_SECRET;
+    else process.env.RAZORPAY_KEY_SECRET = prevKeySecret;
+    clearRazorpayCheckoutCachesForTest();
+  }
+});
+

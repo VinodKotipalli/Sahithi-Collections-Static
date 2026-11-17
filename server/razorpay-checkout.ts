@@ -1197,6 +1197,102 @@ function parseCustomerDetails(raw: unknown): OrderCustomerDetails | null {
   return null;
 }
 
+function sanitizeEnvCredential(raw: string | undefined): string {
+  if (!raw) return '';
+  let val = raw.trim();
+  if (
+    (val.startsWith('"') && val.endsWith('"')) ||
+    (val.startsWith("'") && val.endsWith("'"))
+  ) {
+    val = val.slice(1, -1).trim();
+  }
+  return val.replace(/[\r\n]+/g, '').trim();
+}
+
+function maskRazorpayKeyId(keyId: string): string {
+  if (keyId.length <= 12) return keyId;
+  return `${keyId.slice(0, 12)}…${keyId.slice(-4)}`;
+}
+
+export function resolveRazorpayCredentials():
+  | { ok: true; keyId: string; keySecret: string; mode: 'test' | 'live' }
+  | { ok: false; code: string; error: string } {
+  const keyId = sanitizeEnvCredential(process.env.RAZORPAY_KEY_ID);
+  const keySecret = sanitizeEnvCredential(
+    process.env.RAZORPAY_KEY_SECRET || process.env.RAZORPAY_SECRET
+  );
+
+  if (!keyId || !keySecret) {
+    return {
+      ok: false,
+      code: 'RAZORPAY_AUTH_FAILED',
+      error:
+        'Razorpay API credentials (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET) are not configured on the server.',
+    };
+  }
+
+  const keyMatch = /^rzp_(test|live)_[A-Za-z0-9_-]+$/.exec(keyId);
+  if (!keyMatch) {
+    return {
+      ok: false,
+      code: 'RAZORPAY_AUTH_FAILED',
+      error:
+        'Invalid RAZORPAY_KEY_ID format on server. Expected a valid Razorpay key starting with rzp_test_ or rzp_live_.',
+    };
+  }
+
+  if (keySecret === keyId || /^rzp_(test|live)_/i.test(keySecret)) {
+    return {
+      ok: false,
+      code: 'RAZORPAY_AUTH_FAILED',
+      error:
+        'RAZORPAY_KEY_SECRET appears to contain a Razorpay Key ID instead of the Key Secret. Set RAZORPAY_KEY_SECRET to the matching secret generated alongside RAZORPAY_KEY_ID.',
+    };
+  }
+
+  return {
+    ok: true,
+    keyId,
+    keySecret,
+    mode: keyMatch[1] === 'live' ? 'live' : 'test',
+  };
+}
+
+function extractRazorpayApiError(
+  err: unknown,
+  fallbackMessage: string
+): { statusCode: number; description: string; isAuthFailure: boolean } {
+  const errObj = err && typeof err === 'object' ? (err as Record<string, unknown>) : {};
+  const axiosResponse =
+    errObj.response && typeof errObj.response === 'object'
+      ? (errObj.response as Record<string, unknown>)
+      : {};
+  const statusCode =
+    typeof errObj.statusCode === 'number'
+      ? errObj.statusCode
+      : typeof axiosResponse.status === 'number'
+        ? axiosResponse.status
+        : 500;
+  const innerErr =
+    errObj.error && typeof errObj.error === 'object'
+      ? (errObj.error as Record<string, unknown>)
+      : axiosResponse.data &&
+          typeof axiosResponse.data === 'object' &&
+          (axiosResponse.data as Record<string, unknown>).error &&
+          typeof (axiosResponse.data as Record<string, unknown>).error === 'object'
+        ? ((axiosResponse.data as Record<string, unknown>).error as Record<string, unknown>)
+        : {};
+  const description =
+    typeof innerErr.description === 'string' && innerErr.description
+      ? innerErr.description
+      : err instanceof Error
+        ? err.message
+        : fallbackMessage;
+  const isAuthFailure =
+    statusCode === 401 || description.toLowerCase().includes('authentication failed');
+  return { statusCode, description, isAuthFailure };
+}
+
 export async function handleCreateOrderRequest(params: {
   body: Record<string, unknown>;
   store?: BoutiqueStore | null;
@@ -1205,19 +1301,18 @@ export async function handleCreateOrderRequest(params: {
 }): Promise<CheckoutHandlerResponse> {
   const { body, store = null, customerUserId = null, razorpayClientFactory } = params;
 
-  const keyId = (process.env.RAZORPAY_KEY_ID || '').trim();
-  const keySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
-
-  if (!keyId || !keySecret) {
+  const creds = resolveRazorpayCredentials();
+  if (!creds.ok) {
     return {
       status: 401,
       body: {
         status: 401,
-        code: 'RAZORPAY_AUTH_FAILED',
-        error: 'Razorpay API credentials are not configured on the server.',
+        code: creds.code,
+        error: creds.error,
       },
     };
   }
+  const { keyId, keySecret, mode: keyMode } = creds;
 
   const currency =
     typeof body.currency === 'string' && body.currency.trim()
@@ -1354,26 +1449,21 @@ export async function handleCreateOrderRequest(params: {
       },
     };
   } catch (err: unknown) {
-    const errObj = err && typeof err === 'object' ? (err as Record<string, unknown>) : {};
-    const statusCode = typeof errObj.statusCode === 'number' ? errObj.statusCode : 500;
-    const innerErr =
-      errObj.error && typeof errObj.error === 'object'
-        ? (errObj.error as Record<string, unknown>)
-        : {};
-    const description =
-      typeof innerErr.description === 'string' && innerErr.description
-        ? innerErr.description
-        : err instanceof Error
-          ? err.message
-          : 'Failed to create Razorpay order.';
+    const { description, isAuthFailure } = extractRazorpayApiError(
+      err,
+      'Failed to create Razorpay order.'
+    );
 
-    if (statusCode === 401 || description.toLowerCase().includes('authentication failed')) {
+    if (isAuthFailure) {
+      const masked = maskRazorpayKeyId(keyId);
       return {
         status: 401,
         body: {
           status: 401,
           code: 'RAZORPAY_AUTH_FAILED',
-          error: description || 'Razorpay authentication failed.',
+          keyMode,
+          keyPrefix: masked,
+          error: `Razorpay API authentication failed for ${keyMode} key "${masked}". Update RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in your server / Vercel environment variables with an active matching key pair from Razorpay Dashboard → Account & Settings → API Keys.`,
         },
       };
     }
@@ -1434,20 +1524,20 @@ export async function handleVerifyPaymentRequest(params: {
     };
   }
 
-  const keyId = (process.env.RAZORPAY_KEY_ID || '').trim();
-  const keySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
-  if (!keyId || !keySecret) {
+  const creds = resolveRazorpayCredentials();
+  if (!creds.ok) {
     return {
       status: 401,
       body: {
         status: 401,
         success: false,
         verified: false,
-        code: 'RAZORPAY_AUTH_FAILED',
-        error: 'Razorpay API credentials are not configured on the server.',
+        code: creds.code,
+        error: creds.error,
       },
     };
   }
+  const { keyId, keySecret } = creds;
 
   if (expectedOrderIdParam && expectedOrderIdParam !== razorpayOrderId) {
     return {
@@ -1695,17 +1785,25 @@ export async function handleVerifyPaymentRequest(params: {
         };
       }
     } catch (rzpErr: unknown) {
-      const errObj = rzpErr && typeof rzpErr === 'object' ? (rzpErr as Record<string, unknown>) : {};
-      const innerErr =
-        errObj.error && typeof errObj.error === 'object'
-          ? (errObj.error as Record<string, unknown>)
-          : {};
-      const msg =
-        typeof innerErr.description === 'string' && innerErr.description
-          ? innerErr.description
-          : rzpErr instanceof Error
-            ? rzpErr.message
-            : 'Unable to verify payment status with Razorpay.';
+      const { description, isAuthFailure } = extractRazorpayApiError(
+        rzpErr,
+        'Unable to verify payment status with Razorpay.'
+      );
+      if (isAuthFailure) {
+        const masked = maskRazorpayKeyId(keyId);
+        return {
+          status: 401,
+          body: {
+            status: 401,
+            success: false,
+            verified: false,
+            code: 'RAZORPAY_AUTH_FAILED',
+            keyMode: creds.mode,
+            keyPrefix: masked,
+            error: `Razorpay API authentication failed for ${creds.mode} key "${masked}" while verifying payment. Ensure RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET match your active Razorpay key pair.`,
+          },
+        };
+      }
       return {
         status: 400,
         body: {
@@ -1713,7 +1811,7 @@ export async function handleVerifyPaymentRequest(params: {
           success: false,
           verified: false,
           code: 'RAZORPAY_PAYMENT_VERIFY_FAILED',
-          error: msg,
+          error: description,
         },
       };
     }
