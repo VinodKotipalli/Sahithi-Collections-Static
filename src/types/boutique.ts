@@ -131,8 +131,10 @@ export interface PlacedOrderReceipt {
   createdAt: number;
   updatedAt?: number;
   paymentMethod?: 'razorpay' | 'cod';
-  razorpayOrderId?: string;
-  razorpayPaymentId?: string;
+  paymentCollectedAt?: number | null;
+  idempotencyKey?: string | null;
+  razorpayOrderId?: string | null;
+  razorpayPaymentId?: string | null;
   returnRequest?: OrderReturnRequest | null;
   items: Array<{
     productId: string;
@@ -316,6 +318,8 @@ export interface AdminOrder {
   paymentStatus?: OrderPaymentStatus;
   fulfillmentStatus?: OrderFulfillmentStatus;
   paymentMethod?: 'razorpay' | 'cod';
+  paymentCollectedAt?: number | null;
+  idempotencyKey?: string | null;
   razorpayOrderId?: string | null;
   razorpayPaymentId?: string | null;
   couponCode?: string | null;

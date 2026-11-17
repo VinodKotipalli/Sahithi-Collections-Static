@@ -104,6 +104,8 @@ service cloud.firestore {
           'id', 'order_number', 'customer_user_id', 'customer_name',
           'customer_email', 'customer_phone', 'shipping_address', 'status',
           'payment_status', 'fulfillment_status', 'payment_method',
+          'razorpay_order_id', 'razorpay_payment_id',
+          'idempotency_key', 'payment_collected_at', 'payment_collected_by',
           'status_history', 'status_history_json',
           'subtotal_paise', 'discount_paise', 'gift_card_paise', 'total_paise',
           'coupon_code', 'gift_card_code', 'currency', 'created_at', 'updated_at',
@@ -116,7 +118,7 @@ service cloud.firestore {
         && data.customer_email is string && data.customer_email.size() >= 5 && data.customer_email.size() <= 254
         && data.customer_phone is string && data.customer_phone.size() >= 5 && data.customer_phone.size() <= 32
         && data.shipping_address is string && data.shipping_address.size() >= 5 && data.shipping_address.size() <= 600
-        && data.status == 'pending'
+        && data.status in ['pending', 'placed']
         && (!('payment_status' in data) || data.payment_status in ['unpaid', 'pending'])
         && data.subtotal_paise is number && data.subtotal_paise >= 100 && data.subtotal_paise <= 500000000
         && data.total_paise is number && data.total_paise >= 0 && data.total_paise <= data.subtotal_paise
@@ -218,8 +220,8 @@ service cloud.firestore {
           && (
             (
               isOwner()
-              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'fulfillment_status', 'payment_status', 'status_history', 'status_history_json', 'return_request', 'return_request_json', 'updated_at'])
-              && request.resource.data.status in ['pending', 'confirmed', 'packed', 'shipped', 'delivered', 'cancelled', 'return_requested', 'returned']
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'fulfillment_status', 'payment_status', 'payment_collected_at', 'payment_collected_by', 'status_history', 'status_history_json', 'return_request', 'return_request_json', 'updated_at'])
+              && request.resource.data.status in ['pending', 'placed', 'confirmed', 'packed', 'shipped', 'delivered', 'cancelled', 'return_requested', 'returned']
             )
             || (
               isSignedIn()

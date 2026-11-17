@@ -139,6 +139,7 @@ export interface PlaceOrderInput {
   paymentMethod?: 'razorpay' | 'cod';
   razorpayOrderId?: string | null;
   razorpayPaymentId?: string | null;
+  idempotencyKey?: string | null;
   couponCode?: string | null;
   giftCardCode?: string | null;
   discountPaise?: number;
@@ -371,6 +372,11 @@ export interface BoutiqueStore {
   resolveOrderReturnRequest(input: {
     orderId: string;
     decision: 'approved' | 'rejected';
+    note?: string;
+  }): Promise<OrderWithItems | null>;
+  collectOrderPayment(input: {
+    orderId: string;
+    actorUserId?: string | null;
     note?: string;
   }): Promise<OrderWithItems | null>;
 

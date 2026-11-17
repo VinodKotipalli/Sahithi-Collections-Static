@@ -161,6 +161,9 @@ export interface OrderRow {
   gift_card_paise?: number;
   status_history_json?: string;
   return_request_json?: string | null;
+  idempotency_key?: string | null;
+  payment_collected_at?: number | null;
+  payment_collected_by?: string | null;
   subtotal_paise: number;
   total_paise: number;
   currency: string;
@@ -418,6 +421,9 @@ export function initAuthDatabase(
       gift_card_paise INTEGER NOT NULL DEFAULT 0,
       status_history_json TEXT NOT NULL DEFAULT '[]',
       return_request_json TEXT,
+      idempotency_key TEXT,
+      payment_collected_at INTEGER,
+      payment_collected_by TEXT,
       subtotal_paise INTEGER NOT NULL CHECK (subtotal_paise >= 0),
       total_paise INTEGER NOT NULL CHECK (total_paise >= 0),
       currency TEXT NOT NULL DEFAULT 'INR',
@@ -567,7 +573,6 @@ export function initAuthDatabase(
     CREATE INDEX IF NOT EXISTS idx_images_product_id ON product_images(product_id);
     CREATE INDEX IF NOT EXISTS idx_audit_created_at ON product_audit_logs(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_order_items_product_id ON order_items(product_id);
-    CREATE INDEX IF NOT EXISTS idx_orders_customer_user_id ON orders(customer_user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_customer_addresses_user ON customer_addresses(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_customer_notif_user ON customer_notifications(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_categories_position ON categories(position ASC, created_at ASC);
@@ -582,6 +587,7 @@ export function initAuthDatabase(
       db.exec(`ALTER TABLE orders ADD COLUMN ${ddl};`);
     }
   };
+  ensureOrderCol('customer_user_id', `customer_user_id TEXT REFERENCES users(id) ON DELETE SET NULL`);
   ensureOrderCol('payment_status', `payment_status TEXT NOT NULL DEFAULT 'unpaid'`);
   ensureOrderCol('fulfillment_status', `fulfillment_status TEXT NOT NULL DEFAULT 'placed'`);
   ensureOrderCol('payment_method', `payment_method TEXT NOT NULL DEFAULT 'cod'`);
@@ -593,10 +599,15 @@ export function initAuthDatabase(
   ensureOrderCol('gift_card_paise', `gift_card_paise INTEGER NOT NULL DEFAULT 0`);
   ensureOrderCol('status_history_json', `status_history_json TEXT NOT NULL DEFAULT '[]'`);
   ensureOrderCol('return_request_json', `return_request_json TEXT`);
+  ensureOrderCol('idempotency_key', `idempotency_key TEXT`);
+  ensureOrderCol('payment_collected_at', `payment_collected_at INTEGER`);
+  ensureOrderCol('payment_collected_by', `payment_collected_by TEXT`);
   ensureOrderCol('updated_at', `updated_at INTEGER`);
 
   db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_orders_customer_user_id ON orders(customer_user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_orders_razorpay_order_id ON orders(razorpay_order_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL;
   `);
 
   seedStorefrontCategoriesIfEmpty(db);

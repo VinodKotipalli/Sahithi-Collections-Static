@@ -47,12 +47,17 @@
     },
     "Order": {
       "title": "Order",
-      "description": "Server-validated customer boutique order.",
+      "description": "Server-validated customer boutique order (online Razorpay or Cash on Delivery).",
       "type": "object",
       "properties": {
         "id": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
         "order_number": { "type": "string", "maxLength": 64 },
-        "status": { "type": "string", "enum": ["pending", "confirmed", "shipped", "delivered", "cancelled"] },
+        "status": { "type": "string", "enum": ["pending", "placed", "confirmed", "packed", "shipped", "delivered", "cancelled", "return_requested", "returned"] },
+        "payment_method": { "type": "string", "enum": ["razorpay", "cod"] },
+        "payment_status": { "type": "string", "enum": ["unpaid", "pending", "paid", "failed", "refunded"] },
+        "fulfillment_status": { "type": "string" },
+        "idempotency_key": { "type": "string", "maxLength": 128 },
+        "payment_collected_at": { "type": "number" },
         "total_paise": { "type": "number" },
         "created_at": { "type": "number" }
       },

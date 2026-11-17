@@ -102,6 +102,14 @@ export function normalizeAdminOverview(value: unknown): AdminOverviewResponse {
         paymentStatus,
         fulfillmentStatus,
         paymentMethod,
+        paymentCollectedAt:
+          typeof (o.paymentCollectedAt ?? o.payment_collected_at) === 'number'
+            ? Number(o.paymentCollectedAt ?? o.payment_collected_at)
+            : null,
+        idempotencyKey:
+          typeof (o.idempotencyKey ?? o.idempotency_key) === 'string'
+            ? String(o.idempotencyKey ?? o.idempotency_key)
+            : null,
         razorpayOrderId:
           typeof (o.razorpayOrderId ?? o.razorpay_order_id) === 'string'
             ? String(o.razorpayOrderId ?? o.razorpay_order_id)

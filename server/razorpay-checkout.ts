@@ -141,9 +141,12 @@ export interface SerializedOrderReceipt {
   totalPaise: number;
   currency: string;
   createdAt: number;
-  paymentMethod: 'razorpay';
-  razorpayOrderId: string;
-  razorpayPaymentId: string;
+  updatedAt?: number;
+  paymentCollectedAt?: number | null;
+  idempotencyKey?: string | null;
+  paymentMethod: 'razorpay' | 'cod';
+  razorpayOrderId: string | null;
+  razorpayPaymentId: string | null;
   statusHistory: OrderStatusHistoryEntry[];
   items: Array<{
     productId: string;
@@ -1429,16 +1432,27 @@ async function fetchExistingFirestoreOrder(
     const doc = (await res.json()) as { fields?: Record<string, FsFieldValue> };
     const data = fromFsFields(doc.fields);
     if (typeof data.id !== 'string') return null;
-    const rawItems = Array.isArray(data.items) ? data.items : [];
+      const rawItems = Array.isArray(data.items) ? data.items : [];
     const createdAt = Number(data.created_at || Date.now());
+    const paymentMethodRaw = typeof data.payment_method === 'string' ? data.payment_method : '';
+    const rzpOid = typeof data.razorpay_order_id === 'string' && data.razorpay_order_id ? data.razorpay_order_id : null;
+    const rzpPid = typeof data.razorpay_payment_id === 'string' && data.razorpay_payment_id ? data.razorpay_payment_id : null;
+    const paymentMethod: 'razorpay' | 'cod' =
+      paymentMethodRaw === 'cod' || (!rzpOid && !rzpPid && paymentMethodRaw !== 'razorpay')
+        ? 'cod'
+        : 'razorpay';
     return {
       id: data.id,
       orderNumber: String(data.order_number || orderDocId),
       customerUserId:
         typeof data.customer_user_id === 'string' ? data.customer_user_id : null,
-      status: String(data.status || 'confirmed'),
-      paymentStatus: String(data.payment_status || 'paid'),
-      fulfillmentStatus: String(data.fulfillment_status || data.status || 'confirmed'),
+      status: String(data.status || (paymentMethod === 'cod' ? 'placed' : 'confirmed')),
+      paymentStatus: String(
+        data.payment_status || (paymentMethod === 'razorpay' ? 'paid' : 'unpaid')
+      ),
+      fulfillmentStatus: String(
+        data.fulfillment_status || data.status || (paymentMethod === 'cod' ? 'placed' : 'confirmed')
+      ),
       subtotalPaise: Number(data.subtotal_paise || 0),
       discountPaise: Number(data.discount_paise || 0),
       giftCardPaise: Number(data.gift_card_paise || 0),
@@ -1447,9 +1461,14 @@ async function fetchExistingFirestoreOrder(
       totalPaise: Number(data.total_paise || 0),
       currency: String(data.currency || 'INR'),
       createdAt,
-      paymentMethod: 'razorpay',
-      razorpayOrderId: String(data.razorpay_order_id || razorpayOrderId),
-      razorpayPaymentId: String(data.razorpay_payment_id || razorpayPaymentId),
+      updatedAt: Number(data.updated_at || createdAt),
+      paymentCollectedAt:
+        typeof data.payment_collected_at === 'number' ? data.payment_collected_at : null,
+      idempotencyKey:
+        typeof data.idempotency_key === 'string' ? data.idempotency_key : null,
+      paymentMethod,
+      razorpayOrderId: rzpOid || (razorpayOrderId || null),
+      razorpayPaymentId: rzpPid || (razorpayPaymentId || null),
       statusHistory: parseStatusHistorySafe(data.status_history_json),
       items: rawItems
         .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
@@ -2411,12 +2430,12 @@ async function finalizePaidRazorpayOrder(params: {
           verified: true,
           already_processed: true,
           order_id: razorpayOrderId,
-          payment_id: serialized.razorpayPaymentId,
+          payment_id: serialized.razorpayPaymentId || razorpayPaymentId,
           message: 'Payment already verified and order confirmed.',
           order: serialized,
         };
         completedCheckoutsMemory.set(razorpayOrderId, {
-          paymentId: serialized.razorpayPaymentId,
+          paymentId: serialized.razorpayPaymentId || razorpayPaymentId,
           order: serialized,
           responseBody,
         });
@@ -3358,6 +3377,677 @@ export async function handleRecoverRazorpayOrder(params: {
     razorpayClientFactory,
     source: 'recover',
   });
+}
+
+function buildDeterministicCodOrderId(idempotencyKey: string): string {
+  const hash = crypto.createHash('sha256').update(`cod:${idempotencyKey}`).digest('hex').slice(0, 24);
+  return `ord_cod_${hash}`;
+}
+
+async function persistCodOrderToFirestoreOnce(params: {
+  orderDocId: string;
+  orderNumber: string;
+  idempotencyKey: string | null;
+  customerUserId: string | null;
+  customer: OrderCustomerDetails;
+  lines: ValidatedOrderLine[];
+  subtotalPaise: number;
+  discountPaise: number;
+  giftCardPaise: number;
+  couponCode: string | null;
+  giftCardCode: string | null;
+  totalPaise: number;
+  customerIdToken?: string | null;
+  strictPersistence?: boolean;
+}): Promise<{ receipt: SerializedOrderReceipt; duplicate: boolean }> {
+  const {
+    orderDocId,
+    orderNumber,
+    idempotencyKey,
+    customerUserId,
+    customer,
+    lines,
+    subtotalPaise,
+    discountPaise,
+    giftCardPaise,
+    couponCode,
+    giftCardCode,
+    totalPaise,
+    customerIdToken,
+    strictPersistence = false,
+  } = params;
+
+  const ctx = getFirestoreContext();
+  if (!ctx) {
+    if (strictPersistence) {
+      throw new StoreHttpError(
+        503,
+        'ORDER_PERSISTENCE_UNAVAILABLE',
+        'Order storage is unavailable right now. Please try again in a moment.'
+      );
+    }
+    const now = Date.now();
+    const statusHistory: OrderStatusHistoryEntry[] = [
+      {
+        status: 'placed',
+        note: 'Cash on Delivery order placed · Payment due on delivery',
+        actor: customerUserId ? 'customer' : 'system',
+        at: now,
+      },
+    ];
+    return {
+      duplicate: false,
+      receipt: {
+        id: orderDocId,
+        orderNumber,
+        customerUserId,
+        status: 'placed',
+        paymentStatus: 'unpaid',
+        fulfillmentStatus: 'placed',
+        subtotalPaise,
+        discountPaise,
+        giftCardPaise,
+        couponCode,
+        giftCardCode,
+        totalPaise,
+        currency: 'INR',
+        createdAt: now,
+        updatedAt: now,
+        paymentCollectedAt: null,
+        idempotencyKey,
+        paymentMethod: 'cod',
+        razorpayOrderId: null,
+        razorpayPaymentId: null,
+        statusHistory,
+        items: lines.map((l) => ({
+          productId: l.productId,
+          variantId: l.variantId,
+          productTitle: l.productTitle,
+          variantLabel: l.variantLabel,
+          sku: l.sku,
+          unitPricePaise: l.unitPricePaise,
+          quantity: l.quantity,
+          lineTotalPaise: l.lineTotalPaise,
+        })),
+      },
+    };
+  }
+
+  // Fast idempotency lookup before mutating inventory
+  if (idempotencyKey) {
+    const existing = await fetchExistingFirestoreOrder(orderDocId, '', '');
+    if (existing) {
+      return { receipt: existing, duplicate: true };
+    }
+  }
+
+  const adminBearer = await getFirestoreAdminBearerToken();
+  const effectiveBearer = adminBearer || customerIdToken || null;
+  if (!adminBearer && strictPersistence && !customerIdToken && process.env.VERCEL === '1') {
+    // Attempt guest rule path only if Firestore security rules allow public order create
+  } else if (!adminBearer && strictPersistence && !customerIdToken) {
+    throw new StoreHttpError(
+      503,
+      'ORDER_PERSISTENCE_UNAVAILABLE',
+      'Server database credentials are unavailable to record your COD order.'
+    );
+  }
+
+  const now = Date.now();
+  const statusHistory: OrderStatusHistoryEntry[] = [
+    {
+      status: 'placed',
+      note: 'Cash on Delivery order placed · Payment due on delivery',
+      actor: customerUserId ? 'customer' : 'system',
+      at: now,
+    },
+  ];
+  const statusHistoryJson = JSON.stringify(statusHistory);
+  const firestoreItems = lines.map((l, idx) => ({
+    id: `item_${orderDocId}_${idx + 1}`,
+    order_id: orderDocId,
+    product_id: l.productId,
+    variant_id: l.variantId,
+    product_title: l.productTitle,
+    variant_label: l.variantLabel,
+    sku: l.sku,
+    unit_price_paise: l.unitPricePaise,
+    quantity: l.quantity,
+    line_total_paise: l.lineTotalPaise,
+  }));
+
+  const receipt: SerializedOrderReceipt = {
+    id: orderDocId,
+    orderNumber,
+    customerUserId,
+    status: 'placed',
+    paymentStatus: 'unpaid',
+    fulfillmentStatus: 'placed',
+    subtotalPaise,
+    discountPaise,
+    giftCardPaise,
+    couponCode,
+    giftCardCode,
+    totalPaise,
+    currency: 'INR',
+    createdAt: now,
+    updatedAt: now,
+    paymentCollectedAt: null,
+    idempotencyKey,
+    paymentMethod: 'cod',
+    razorpayOrderId: null,
+    razorpayPaymentId: null,
+    statusHistory,
+    items: lines.map((l) => ({
+      productId: l.productId,
+      variantId: l.variantId,
+      productTitle: l.productTitle,
+      variantLabel: l.variantLabel,
+      sku: l.sku,
+      unitPricePaise: l.unitPricePaise,
+      quantity: l.quantity,
+      lineTotalPaise: l.lineTotalPaise,
+    })),
+  };
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (effectiveBearer) headers.Authorization = `Bearer ${effectiveBearer}`;
+  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
+  const productIds = Array.from(new Set(lines.map((l) => l.productId)));
+  const canUseRichFields = Boolean(adminBearer || (customerIdToken && customerUserId));
+
+  const docFields = canUseRichFields
+    ? {
+        id: orderDocId,
+        order_number: orderNumber,
+        customer_user_id: customerUserId,
+        customer_name: customer.customerName,
+        customer_email: customer.customerEmail,
+        customer_phone: customer.customerPhone,
+        shipping_address: customer.shippingAddress,
+        status: 'placed',
+        payment_status: 'unpaid',
+        fulfillment_status: 'placed',
+        payment_method: 'cod',
+        razorpay_order_id: null,
+        razorpay_payment_id: null,
+        coupon_code: couponCode,
+        gift_card_code: giftCardCode,
+        discount_paise: discountPaise,
+        gift_card_paise: giftCardPaise,
+        status_history_json: statusHistoryJson,
+        return_request_json: null,
+        idempotency_key: idempotencyKey,
+        payment_collected_at: null,
+        payment_collected_by: null,
+        subtotal_paise: subtotalPaise,
+        total_paise: totalPaise,
+        currency: 'INR',
+        created_at: now,
+        updated_at: now,
+        product_ids: productIds,
+        items: firestoreItems,
+      }
+    : {
+        id: orderDocId,
+        order_number: orderNumber,
+        customer_user_id: null,
+        customer_name: customer.customerName,
+        customer_email: customer.customerEmail,
+        customer_phone: customer.customerPhone,
+        shipping_address: customer.shippingAddress,
+        status: 'placed',
+        payment_status: 'unpaid',
+        fulfillment_status: 'placed',
+        payment_method: 'cod',
+        status_history_json: statusHistoryJson,
+        idempotency_key: idempotencyKey,
+        coupon_code: couponCode,
+        gift_card_code: giftCardCode,
+        discount_paise: discountPaise,
+        gift_card_paise: giftCardPaise,
+        subtotal_paise: subtotalPaise,
+        total_paise: totalPaise,
+        currency: 'INR',
+        created_at: now,
+        updated_at: now,
+        product_ids: productIds,
+        items: firestoreItems,
+      };
+
+  const docName = `${ctx.dbRootResource}/environments/${ctx.namespace}/orders/${orderDocId}`;
+  const writes: Array<Record<string, unknown>> = [
+    {
+      currentDocument: { exists: false },
+      update: {
+        name: docName,
+        fields: toFsFields(docFields),
+      },
+    },
+  ];
+
+  if (customerUserId && canUseRichFields) {
+    const notifId = `notif_placed_${orderDocId}`;
+    writes.push({
+      currentDocument: { exists: false },
+      update: {
+        name: `${ctx.dbRootResource}/environments/${ctx.namespace}/users/${encodeURIComponent(customerUserId)}/notifications/${notifId}`,
+        fields: toFsFields({
+          id: notifId,
+          user_id: customerUserId,
+          type: 'order_placed',
+          title: `Order ${orderNumber} placed`,
+          message: `Your Cash on Delivery order ${orderNumber} is placed. ₹${(totalPaise / 100).toLocaleString('en-IN')} is due on delivery.`,
+          order_id: orderDocId,
+          order_number: orderNumber,
+          is_read: 0,
+          read_at: null,
+          created_at: now,
+        }),
+      },
+    });
+  }
+
+  // Re-verify live stock & atomically deduct stock + coupon/gift-card balances when admin service account is configured
+  if (adminBearer) {
+    for (const pid of productIds) {
+      const prodRes = await fetch(
+        `${ctx.docBaseUrl}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}${keyParam}`,
+        { headers }
+      );
+      if (prodRes.ok) {
+        const prodDoc = (await prodRes.json()) as {
+          updateTime?: string;
+          fields?: Record<string, FsFieldValue>;
+        };
+        const prodData = fromFsFields(prodDoc.fields);
+        const rawVariants = Array.isArray(prodData.variants) ? prodData.variants : [];
+        const nextVariants = rawVariants.map((v) => {
+          if (!v || typeof v !== 'object') return v;
+          const rec = { ...(v as Record<string, unknown>) };
+          const qtyOrdered = lines
+            .filter((l) => l.productId === pid && l.variantId === String(rec.id || ''))
+            .reduce((s, l) => s + l.quantity, 0);
+          if (qtyOrdered > 0) {
+            const currentQty = Number(rec.stock_qty || 0);
+            if (currentQty < qtyOrdered) {
+              throw new StoreHttpError(
+                409,
+                'INSUFFICIENT_STOCK',
+                currentQty <= 0
+                  ? `"${String(prodData.title || 'This piece')}" is currently out of stock.`
+                  : `Only ${currentQty} piece(s) left for "${String(prodData.title || 'this piece')}".`
+              );
+            }
+            rec.stock_qty = currentQty - qtyOrdered;
+          }
+          return rec;
+        });
+        const nextTotalStock = nextVariants.reduce(
+          (sum, v) =>
+            sum + (v && typeof v === 'object' ? Number((v as Record<string, unknown>).stock_qty || 0) : 0),
+          0
+        );
+        writes.push({
+          ...(prodDoc.updateTime ? { currentDocument: { updateTime: prodDoc.updateTime } } : {}),
+          update: {
+            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}`,
+            fields: toFsFields({
+              ...prodData,
+              variants: nextVariants,
+              stock_qty: nextTotalStock,
+              updated_at: now,
+            }),
+          },
+        });
+      }
+    }
+
+    if (couponCode) {
+      const cpn = await fetchCouponFromFirestoreByCode(couponCode);
+      if (cpn) {
+        writes.push({
+          update: {
+            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/coupons/${encodeURIComponent(cpn.id)}`,
+            fields: toFsFields({
+              ...cpn,
+              used_count: Number(cpn.used_count || 0) + 1,
+              updated_at: now,
+            }),
+          },
+        });
+      }
+    }
+
+    if (giftCardCode && giftCardPaise > 0) {
+      const gc = await fetchGiftCardFromFirestoreByCode(giftCardCode);
+      if (gc) {
+        writes.push({
+          update: {
+            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/gift_cards/${encodeURIComponent(gc.id)}`,
+            fields: toFsFields({
+              ...gc,
+              balance_paise: Math.max(0, Number(gc.balance_paise || 0) - giftCardPaise),
+              last_used_at: now,
+              updated_at: now,
+            }),
+          },
+        });
+      }
+    }
+  }
+
+  const commitRes = await fetch(`${ctx.docBaseUrl}:commit${keyParam}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ writes }),
+  });
+
+  if (commitRes.ok) {
+    return { receipt, duplicate: false };
+  }
+
+  const errText = await commitRes.text().catch(() => '');
+  if (
+    commitRes.status === 409 ||
+    commitRes.status === 412 ||
+    errText.includes('ALREADY_EXISTS') ||
+    errText.includes('FAILED_PRECONDITION')
+  ) {
+    if (idempotencyKey) {
+      const existing = await fetchExistingFirestoreOrder(orderDocId, '', '');
+      if (existing) {
+        return { receipt: existing, duplicate: true };
+      }
+    }
+    throw new StoreHttpError(
+      409,
+      'ORDER_CONFLICT',
+      'Inventory or order state changed while placing your order. Please review your bag and retry.'
+    );
+  }
+
+  throw new StoreHttpError(
+    commitRes.status >= 400 ? commitRes.status : 502,
+    'ORDER_RECORD_FAILED',
+    `Unable to save your order (${commitRes.status}): ${errText.slice(0, 180)}`
+  );
+}
+
+export async function handlePlaceCodOrderRequest(params: {
+  body: Record<string, unknown>;
+  store?: BoutiqueStore | null;
+  customerUserId?: string | null;
+  customerIdToken?: string | null;
+  requireDurablePersistence?: boolean;
+}): Promise<CheckoutHandlerResponse> {
+  const {
+    body,
+    store = null,
+    customerUserId = null,
+    customerIdToken = null,
+    requireDurablePersistence = true,
+  } = params;
+
+  const rawMethod =
+    typeof body.paymentMethod === 'string' ? body.paymentMethod.trim().toLowerCase() : 'cod';
+  if (rawMethod !== 'cod') {
+    return {
+      status: 400,
+      body: {
+        status: 400,
+        code: 'INVALID_PAYMENT_METHOD',
+        error: 'POST /api/orders supports Cash on Delivery ("cod"). Use /api/create-order for Razorpay payments.',
+      },
+    };
+  }
+
+  const rawCustomer =
+    body.customer && typeof body.customer === 'object'
+      ? (body.customer as Record<string, unknown>)
+      : body;
+  const customerName =
+    typeof rawCustomer.customerName === 'string' ? rawCustomer.customerName.trim() : '';
+  const customerEmail =
+    typeof rawCustomer.customerEmail === 'string' ? rawCustomer.customerEmail.trim().toLowerCase() : '';
+  const customerPhone =
+    typeof rawCustomer.customerPhone === 'string' ? rawCustomer.customerPhone.trim() : '';
+  const shippingAddress =
+    typeof rawCustomer.shippingAddress === 'string' ? rawCustomer.shippingAddress.trim() : '';
+
+  if (customerName.length < 2 || customerName.length > 100) {
+    return {
+      status: 400,
+      body: { status: 400, code: 'VALIDATION_ERROR', error: 'Please enter your full name.' },
+    };
+  }
+  if (!EMAIL_REGEX.test(customerEmail)) {
+    return {
+      status: 400,
+      body: { status: 400, code: 'VALIDATION_ERROR', error: 'Please enter a valid email address.' },
+    };
+  }
+  if (customerPhone.length < 7 || customerPhone.length > 24) {
+    return {
+      status: 400,
+      body: {
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        error: 'Please enter a valid contact phone number.',
+      },
+    };
+  }
+  if (shippingAddress.length < 8 || shippingAddress.length > 400) {
+    return {
+      status: 400,
+      body: {
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        error: 'Please enter a complete delivery address.',
+      },
+    };
+  }
+
+  const cartLines = parseCartLines(body.items);
+  if (cartLines.length === 0) {
+    return {
+      status: 400,
+      body: { status: 400, code: 'EMPTY_CART', error: 'Your shopping bag is empty.' },
+    };
+  }
+
+  const rawIdempotency =
+    typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim().slice(0, 128) : '';
+  const cleanIdempotencyKey =
+    rawIdempotency && /^[a-zA-Z0-9_.:-]{6,128}$/.test(rawIdempotency)
+      ? rawIdempotency
+      : null;
+
+  const deterministicOrderId = cleanIdempotencyKey
+    ? buildDeterministicCodOrderId(cleanIdempotencyKey)
+    : `ord_cod_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`;
+
+  // Fast idempotency check BEFORE catalog/stock validation so retries succeed cleanly even after stock decremented on first attempt
+  if (cleanIdempotencyKey) {
+    if (store) {
+      const existingStoreOrder = await store.getOrderById(deterministicOrderId).catch(() => null);
+      if (existingStoreOrder) {
+        const { order: o, items } = existingStoreOrder;
+        const receipt: SerializedOrderReceipt = {
+          id: o.id,
+          orderNumber: o.order_number,
+          customerUserId: o.customer_user_id,
+          status: o.status,
+          paymentStatus: o.payment_status || 'unpaid',
+          fulfillmentStatus: o.fulfillment_status || o.status || 'placed',
+          subtotalPaise: o.subtotal_paise,
+          discountPaise: o.discount_paise || 0,
+          giftCardPaise: o.gift_card_paise || 0,
+          couponCode: o.coupon_code || null,
+          giftCardCode: o.gift_card_code || null,
+          totalPaise: o.total_paise,
+          currency: o.currency,
+          createdAt: o.created_at,
+          updatedAt: o.updated_at ?? o.created_at,
+          paymentCollectedAt: o.payment_collected_at ?? null,
+          idempotencyKey: o.idempotency_key ?? cleanIdempotencyKey,
+          paymentMethod: (o.payment_method as 'cod' | 'razorpay') || 'cod',
+          razorpayOrderId: o.razorpay_order_id ?? null,
+          razorpayPaymentId: o.razorpay_payment_id ?? null,
+          statusHistory: parseStatusHistorySafe(o.status_history_json),
+          items: items.map((l) => ({
+            productId: l.product_id,
+            variantId: l.variant_id,
+            productTitle: l.product_title,
+            variantLabel: l.variant_label,
+            sku: l.sku,
+            unitPricePaise: l.unit_price_paise,
+            quantity: l.quantity,
+            lineTotalPaise: l.line_total_paise,
+          })),
+        };
+        return { status: 200, body: { order: receipt, duplicate: true } };
+      }
+    } else {
+      const existingFsOrder = await fetchExistingFirestoreOrder(deterministicOrderId, '', '');
+      if (existingFsOrder) {
+        return { status: 200, body: { order: existingFsOrder, duplicate: true } };
+      }
+    }
+  }
+
+  try {
+    const validated = await validateCartAgainstCatalog({ items: cartLines, store });
+    const rawCoupon = typeof body.couponCode === 'string' ? body.couponCode.trim() : null;
+    const rawGiftCard = typeof body.giftCardCode === 'string' ? body.giftCardCode.trim() : null;
+
+    const promo = await validatePromoAndGiftCardForBag({
+      subtotalPaise: validated.totalPaise,
+      couponCode: rawCoupon,
+      giftCardCode: rawGiftCard,
+      store,
+      ensurePayableMinimum: false,
+    });
+
+    const customer: OrderCustomerDetails = {
+      customerName,
+      customerEmail,
+      customerPhone,
+      shippingAddress,
+    };
+
+    const orderNumber = `SC-${new Date().getUTCFullYear()}-${crypto
+      .createHash('sha256')
+      .update(deterministicOrderId)
+      .digest('hex')
+      .slice(0, 6)
+      .toUpperCase()}`;
+
+    if (store) {
+      const { order, items } = await store.placeOrder({
+        id: deterministicOrderId,
+        orderNumber,
+        idempotencyKey: cleanIdempotencyKey,
+        customerUserId,
+        customerName: customer.customerName,
+        customerEmail: customer.customerEmail,
+        customerPhone: customer.customerPhone,
+        shippingAddress: customer.shippingAddress,
+        status: 'placed',
+        paymentStatus: 'unpaid',
+        fulfillmentStatus: 'placed',
+        paymentMethod: 'cod',
+        razorpayOrderId: null,
+        razorpayPaymentId: null,
+        couponCode: promo.couponCode,
+        giftCardCode: promo.giftCardCode,
+        discountPaise: promo.discountPaise,
+        giftCardPaise: promo.giftCardPaise,
+        items: validated.lines.map((l) => ({
+          productId: l.productId,
+          variantId: l.variantId,
+          quantity: l.quantity,
+          expectedPricePaise: l.unitPricePaise,
+        })),
+      });
+
+      const receipt: SerializedOrderReceipt = {
+        id: order.id,
+        orderNumber: order.order_number,
+        customerUserId: order.customer_user_id,
+        status: order.status,
+        paymentStatus: order.payment_status || 'unpaid',
+        fulfillmentStatus: order.fulfillment_status || order.status || 'placed',
+        subtotalPaise: order.subtotal_paise,
+        discountPaise: order.discount_paise || 0,
+        giftCardPaise: order.gift_card_paise || 0,
+        couponCode: order.coupon_code || null,
+        giftCardCode: order.gift_card_code || null,
+        totalPaise: order.total_paise,
+        currency: order.currency,
+        createdAt: order.created_at,
+        updatedAt: order.updated_at ?? order.created_at,
+        paymentCollectedAt: order.payment_collected_at ?? null,
+        idempotencyKey: order.idempotency_key ?? cleanIdempotencyKey,
+        paymentMethod: 'cod',
+        razorpayOrderId: null,
+        razorpayPaymentId: null,
+        statusHistory: parseStatusHistorySafe(order.status_history_json),
+        items: items.map((l) => ({
+          productId: l.product_id,
+          variantId: l.variant_id,
+          productTitle: l.product_title,
+          variantLabel: l.variant_label,
+          sku: l.sku,
+          unitPricePaise: l.unit_price_paise,
+          quantity: l.quantity,
+          lineTotalPaise: l.line_total_paise,
+        })),
+      };
+
+      return { status: 201, body: { order: receipt, duplicate: false } };
+    }
+
+    const persisted = await persistCodOrderToFirestoreOnce({
+      orderDocId: deterministicOrderId,
+      orderNumber,
+      idempotencyKey: cleanIdempotencyKey,
+      customerUserId,
+      customer,
+      lines: validated.lines,
+      subtotalPaise: validated.totalPaise,
+      discountPaise: promo.discountPaise,
+      giftCardPaise: promo.giftCardPaise,
+      couponCode: promo.couponCode,
+      giftCardCode: promo.giftCardCode,
+      totalPaise: promo.finalAmountPaise,
+      customerIdToken,
+      strictPersistence: requireDurablePersistence,
+    });
+
+    return {
+      status: persisted.duplicate ? 200 : 201,
+      body: { order: persisted.receipt, duplicate: persisted.duplicate },
+    };
+  } catch (err) {
+    if (err instanceof StoreHttpError) {
+      return {
+        status: err.httpStatus,
+        body: { status: err.httpStatus, code: err.code, error: err.message },
+      };
+    }
+    return {
+      status: 500,
+      body: {
+        status: 500,
+        code: 'COD_ORDER_FAILED',
+        error:
+          err instanceof Error && err.message
+            ? err.message
+            : 'Unable to place Cash on Delivery order right now.',
+      },
+    };
+  }
 }
 
 export function clearRazorpayCheckoutCachesForTest() {

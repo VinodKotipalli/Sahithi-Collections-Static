@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import {
   AlertTriangle,
+  Banknote,
   CheckCircle2,
   CreditCard,
   Loader2,
@@ -17,6 +18,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { useAuth } from '../context/AuthContext';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
+import { getValidClientIdToken } from '../services/firebaseClientApi';
 import {
   checkRazorpayOrderStatus,
   createRazorpayOrder,
@@ -89,6 +91,7 @@ export function BagDrawer({
   const [validation, setValidation] = useState<BagValidationResult | null>(null);
   const [validating, setValidating] = useState(false);
   const [checkoutOpen, setCheckoutOpen] = useState(false);
+  const [paymentMethod, setPaymentMethod] = useState<'razorpay' | 'cod'>('razorpay');
   const [submitting, setSubmitting] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [paymentErrorText, setPaymentErrorText] = useState<string | null>(null);
@@ -116,6 +119,8 @@ export function BagDrawer({
   const [promoFeedback, setPromoFeedback] = useState<{ kind: 'ok' | 'err'; text: string } | null>(
     null
   );
+
+  const codAttemptRef = useRef<{ signature: string; key: string } | null>(null);
 
   useFocusTrap(isOpen, drawerRef, onClose);
 
@@ -353,10 +358,27 @@ export function BagDrawer({
       return;
     }
 
-    if (netPayablePaise < 100) {
+    if (paymentMethod === 'razorpay' && netPayablePaise < 100) {
       setPaymentErrorText(
         'Net payable amount after promo discounts must be at least ₹1.00 (100 paise) for Razorpay Checkout.'
       );
+      return;
+    }
+
+    const customerDetails = {
+      customerName: customerName.trim(),
+      customerEmail: customerEmail.trim(),
+      customerPhone: customerPhone.trim(),
+      shippingAddress: shippingAddress.trim(),
+    };
+
+    if (
+      customerDetails.customerName.length < 2 ||
+      !customerDetails.customerEmail ||
+      customerDetails.customerPhone.length < 7 ||
+      customerDetails.shippingAddress.length < 8
+    ) {
+      setPaymentErrorText('Please complete your name, email, phone number, and delivery address.');
       return;
     }
 
@@ -376,12 +398,64 @@ export function BagDrawer({
         };
       });
 
-      const customerDetails = {
-        customerName: customerName.trim(),
-        customerEmail: customerEmail.trim(),
-        customerPhone: customerPhone.trim(),
-        shippingAddress: shippingAddress.trim(),
-      };
+      if (paymentMethod === 'cod') {
+        const payloadSignature = JSON.stringify({
+          items: payloadItems,
+          customerDetails,
+          appliedCouponCode,
+          appliedGiftCardCode,
+        });
+        if (!codAttemptRef.current || codAttemptRef.current.signature !== payloadSignature) {
+          const freshId =
+            typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+              ? crypto.randomUUID()
+              : `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+          codAttemptRef.current = {
+            signature: payloadSignature,
+            key: `cod_${freshId}`,
+          };
+        }
+
+        const idToken = await getValidClientIdToken().catch(() => null);
+        const codRes = await apiRequest<{ order?: PlacedOrderReceipt; duplicate?: boolean }>(
+          '/api/orders',
+          {
+            method: 'POST',
+            headers: idToken ? { Authorization: `Bearer ${idToken}` } : undefined,
+            body: JSON.stringify({
+              ...customerDetails,
+              customer: customerDetails,
+              paymentMethod: 'cod',
+              couponCode: appliedCouponCode || undefined,
+              giftCardCode: appliedGiftCardCode || undefined,
+              idempotencyKey: codAttemptRef.current.key,
+              items: payloadItems,
+            }),
+          }
+        );
+
+        checkoutInFlightRef.current = false;
+        setSubmitting(false);
+
+        if (!codRes.ok || !codRes.data?.order?.orderNumber) {
+          setPaymentErrorText(
+            !codRes.ok
+              ? codRes.error
+              : 'Could not confirm your Cash on Delivery order. Please try again.'
+          );
+          if (!codRes.ok && codRes.status === 409) {
+            void revalidateBag();
+          }
+          return;
+        }
+
+        codAttemptRef.current = null;
+        setReceipt(codRes.data.order);
+        setCheckoutOpen(false);
+        onClearBag();
+        onOrderCompleted();
+        return;
+      }
 
       const [scriptLoaded, orderRes] = await Promise.all([
         ensureRazorpayCheckoutScript(10_000),
@@ -582,14 +656,23 @@ export function BagDrawer({
                     </div>
                     <div>
                       <p className="text-xs font-medium tracking-wider uppercase text-[#B76E79]">
-                        Payment &amp; Order Confirmed
+                        {receipt.paymentMethod === 'cod'
+                          ? 'Order Placed · Cash on Delivery'
+                          : 'Payment & Order Confirmed'}
                       </p>
                       <h3 className="font-serif text-2xl font-semibold text-[#49243E]">
                         {receipt.orderNumber}
                       </h3>
                       <p className="mt-1 text-xs text-[#242124]/70 tabular-nums">
-                        Placed {formatTimestamp(receipt.createdAt)} · Paid via Razorpay
-                        {receipt.razorpayPaymentId ? ` · Ref ${receipt.razorpayPaymentId}` : ''}
+                        {receipt.paymentMethod === 'cod'
+                          ? `Placed ${formatTimestamp(receipt.createdAt)} · ${
+                              receipt.paymentStatus === 'paid'
+                                ? 'Payment collected'
+                                : 'Payment due on delivery'
+                            }`
+                          : `Placed ${formatTimestamp(receipt.createdAt)} · Paid via Razorpay${
+                              receipt.razorpayPaymentId ? ` · Ref ${receipt.razorpayPaymentId}` : ''
+                            }`}
                       </p>
                     </div>
                   </div>
@@ -639,7 +722,11 @@ export function BagDrawer({
                       </div>
                     )}
                     <div className="flex items-center justify-between border-t border-[#49243E]/10 pt-2 text-base font-semibold text-[#49243E]">
-                      <span>Order Total</span>
+                      <span>
+                        {receipt.paymentMethod === 'cod' && receipt.paymentStatus !== 'paid'
+                          ? 'Amount Due on Delivery'
+                          : 'Order Total'}
+                      </span>
                       <span className="tabular-nums">{formatPaiseINR(receipt.totalPaise)}</span>
                     </div>
                   </div>
@@ -1041,6 +1128,81 @@ export function BagDrawer({
                         )}
                       </div>
 
+                      {/* Payment Method Selection */}
+                      <fieldset className="space-y-2 rounded-xl border border-[#49243E]/12 bg-[#FFF9F5]/70 p-3">
+                        <legend className="px-1 text-xs font-semibold text-[#49243E]">
+                          Payment Method
+                        </legend>
+                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                          <label
+                            className={`flex min-h-[48px] cursor-pointer items-center gap-2.5 rounded-xl border px-3 py-2 text-xs transition-colors ${
+                              paymentMethod === 'razorpay'
+                                ? 'border-[#49243E] bg-white text-[#49243E]'
+                                : 'border-[#49243E]/15 bg-white/60 text-[#242124]/80 hover:border-[#49243E]/35'
+                            }`}
+                          >
+                            <input
+                              type="radio"
+                              name="checkout-payment-method"
+                              value="razorpay"
+                              checked={paymentMethod === 'razorpay'}
+                              onChange={() => {
+                                setPaymentMethod('razorpay');
+                                setPaymentErrorText(null);
+                              }}
+                              className="h-4 w-4 accent-[#49243E]"
+                            />
+                            <CreditCard className="h-4 w-4 shrink-0 text-[#B76E79]" aria-hidden="true" />
+                            <div className="min-w-0">
+                              <span className="block font-semibold text-[#49243E]">Pay Online</span>
+                              <span className="block text-[11px] text-[#242124]/65">
+                                UPI, Cards &amp; NetBanking
+                              </span>
+                            </div>
+                          </label>
+
+                          <label
+                            className={`flex min-h-[48px] cursor-pointer items-center gap-2.5 rounded-xl border px-3 py-2 text-xs transition-colors ${
+                              paymentMethod === 'cod'
+                                ? 'border-[#49243E] bg-white text-[#49243E]'
+                                : 'border-[#49243E]/15 bg-white/60 text-[#242124]/80 hover:border-[#49243E]/35'
+                            }`}
+                          >
+                            <input
+                              type="radio"
+                              name="checkout-payment-method"
+                              value="cod"
+                              checked={paymentMethod === 'cod'}
+                              onChange={() => {
+                                setPaymentMethod('cod');
+                                setPaymentErrorText(null);
+                              }}
+                              className="h-4 w-4 accent-[#49243E]"
+                            />
+                            <Banknote className="h-4 w-4 shrink-0 text-[#B76E79]" aria-hidden="true" />
+                            <div className="min-w-0">
+                              <span className="block font-semibold text-[#49243E]">
+                                Cash on Delivery
+                              </span>
+                              <span className="block text-[11px] text-[#242124]/65">
+                                Pay when delivered
+                              </span>
+                            </div>
+                          </label>
+                        </div>
+
+                        {paymentMethod === 'cod' && (
+                          <div className="rounded-lg border border-[#49243E]/12 bg-white px-3 py-2 text-xs text-[#49243E]">
+                            <p className="font-semibold tabular-nums">
+                              Pay {formatPaiseINR(netPayablePaise)} on delivery
+                            </p>
+                            <p className="mt-0.5 text-[11px] text-[#242124]/65">
+                              Complimentary delivery · ₹0 COD fee. Our team confirms dispatch promptly.
+                            </p>
+                          </div>
+                        )}
+                      </fieldset>
+
                       {paymentErrorText && (
                         <div
                           role="alert"
@@ -1060,13 +1222,19 @@ export function BagDrawer({
                       >
                         {submitting ? (
                           <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                        ) : paymentMethod === 'cod' ? (
+                          <Banknote className="h-4 w-4" aria-hidden="true" />
                         ) : (
                           <CreditCard className="h-4 w-4" aria-hidden="true" />
                         )}
                         <span>
                           {submitting
-                            ? 'Processing Payment…'
-                            : `Pay with Razorpay (${formatPaiseINR(netPayablePaise)})`}
+                            ? paymentMethod === 'cod'
+                              ? 'Placing Order…'
+                              : 'Processing Payment…'
+                            : paymentMethod === 'cod'
+                              ? 'Place Order'
+                              : `Pay with Razorpay (${formatPaiseINR(netPayablePaise)})`}
                         </span>
                       </button>
                     </form>

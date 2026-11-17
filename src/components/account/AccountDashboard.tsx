@@ -1152,7 +1152,7 @@ export function AccountDashboard({
                     No orders placed under this account yet
                   </h2>
                   <p className="mt-1.5 text-sm text-[#242124]/70">
-                    Orders placed while signed in appear here immediately after Razorpay payment confirmation.
+                    Orders placed while signed in appear here once confirmed online or placed with Cash on Delivery.
                   </p>
                   <button
                     type="button"
@@ -1165,8 +1165,11 @@ export function AccountDashboard({
               ) : (
                 <div className="space-y-4">
                   {orders.map((order) => {
+                    const isCod = order.paymentMethod === 'cod';
                     const fulfillment = order.fulfillmentStatus || order.status || 'placed';
-                    const payment = order.paymentStatus || (order.razorpayPaymentId ? 'paid' : 'pending');
+                    const payment =
+                      order.paymentStatus || (order.razorpayPaymentId ? 'paid' : isCod ? 'unpaid' : 'pending');
+                    const isUnpaidCod = isCod && payment !== 'paid';
                     const canRequestCancel = ['placed', 'pending', 'confirmed', 'packed'].includes(fulfillment);
                     const canRequestReturn = fulfillment === 'delivered';
                     const hasOpenRequest = order.returnRequest?.status === 'pending';
@@ -1178,20 +1181,34 @@ export function AccountDashboard({
                       >
                         <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#49243E]/10 pb-3.5">
                           <div>
-                            <p className="font-mono text-xs font-semibold text-[#B76E79]">
-                              {order.orderNumber}
-                            </p>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="font-mono text-xs font-semibold text-[#B76E79]">
+                                {order.orderNumber}
+                              </p>
+                              <span className="rounded-md border border-[#49243E]/18 bg-[#FFF9F5] px-2 py-0.5 text-[11px] font-medium text-[#49243E]">
+                                {isCod ? 'Cash on Delivery' : 'Online · Razorpay'}
+                              </span>
+                            </div>
                             <p className="mt-1 text-xs font-semibold uppercase tracking-wider text-[#49243E]">
-                              Payment: {payment} · Fulfillment: {fulfillment.replace(/_/g, ' ')}
+                              Payment:{' '}
+                              {payment === 'paid'
+                                ? 'Paid'
+                                : isCod
+                                  ? 'Payment due on delivery'
+                                  : payment}{' '}
+                              · Fulfillment: {fulfillment.replace(/_/g, ' ')}
                             </p>
                             <p className="mt-1 text-xs text-[#242124]/65 tabular-nums">
                               Placed {formatTimestamp(order.createdAt)}
                               {order.razorpayPaymentId ? ` · Razorpay ${order.razorpayPaymentId}` : ''}
+                              {order.paymentCollectedAt
+                                ? ` · Collected ${formatTimestamp(order.paymentCollectedAt)}`
+                                : ''}
                             </p>
                           </div>
                           <div className="text-right tabular-nums">
                             <span className="block text-[11px] uppercase tracking-wider text-[#242124]/60">
-                              Total Paid
+                              {isUnpaidCod ? 'Amount Due on Delivery' : 'Total Paid'}
                             </span>
                             <span className="font-serif text-2xl font-semibold text-[#49243E]">
                               {formatPaiseINR(order.totalPaise)}

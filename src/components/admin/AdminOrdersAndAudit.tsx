@@ -27,6 +27,10 @@ interface AdminOrdersPanelProps {
     status: string,
     note?: string
   ) => Promise<{ ok: boolean; error?: string }>;
+  onCollectOrderPayment?: (
+    orderId: string,
+    note?: string
+  ) => Promise<{ ok: boolean; error?: string }>;
   onResolveReturnRequest: (
     orderId: string,
     decision: 'approved' | 'rejected',
@@ -57,10 +61,12 @@ export function AdminOrdersPanel({
   totalPages,
   onPageChange,
   onUpdateOrderStatus,
+  onCollectOrderPayment,
   onResolveReturnRequest,
   onRecoverOrder,
 }: AdminOrdersPanelProps) {
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [collectingId, setCollectingId] = useState<string | null>(null);
   const [resolvingId, setResolvingId] = useState<string | null>(null);
   const [resolutionNotes, setResolutionNotes] = useState<Record<string, string>>({});
   const [statusNotes, setStatusNotes] = useState<Record<string, string>>({});
@@ -186,8 +192,21 @@ export function AdminOrdersPanel({
         >
           <div className="space-y-4">
             {orders.map((order) => {
+              const isCod = order.paymentMethod === 'cod';
               const payment = order.paymentStatus || (order.razorpayPaymentId ? 'paid' : 'unpaid');
-              const fulfillment = order.fulfillmentStatus || order.status || 'pending';
+              const fulfillment = order.fulfillmentStatus || order.status || 'placed';
+              const isUnpaidCod = isCod && payment !== 'paid';
+              const canCollectPayment =
+                isUnpaidCod &&
+                fulfillment !== 'cancelled' &&
+                fulfillment !== 'returned' &&
+                typeof onCollectOrderPayment === 'function';
+              const paymentDisplay =
+                payment === 'paid'
+                  ? 'Paid'
+                  : isCod
+                    ? 'Payment due on delivery'
+                    : payment;
 
               return (
                 <div
@@ -196,19 +215,27 @@ export function AdminOrdersPanel({
                 >
                   <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#49243E]/10 pb-3">
                     <div className="min-w-0">
-                      <p className="font-mono text-xs font-semibold text-[#B76E79]">
-                        {order.orderNumber}
-                        {order.customerUserId ? ' · Registered Customer' : ' · Guest Checkout'}
-                      </p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="font-mono text-xs font-semibold text-[#B76E79]">
+                          {order.orderNumber}
+                          {order.customerUserId ? ' · Registered Customer' : ' · Guest Checkout'}
+                        </p>
+                        <span className="rounded-md border border-[#49243E]/20 bg-white px-2 py-0.5 text-[11px] font-medium text-[#49243E]">
+                          {isCod ? 'Cash on Delivery' : 'Online · Razorpay'}
+                        </span>
+                      </div>
                       <h3 className="mt-0.5 font-serif text-xl font-semibold text-[#49243E]">
                         {order.customerName}
                       </h3>
-                      <p className="mt-0.5 text-xs font-semibold uppercase tracking-wider text-[#49243E]">
-                        Payment: {payment} · Fulfillment: {fulfillment.replace(/_/g, ' ')}
+                      <p className="mt-0.5 text-xs font-semibold uppercase tracking-wider text-[#49243E] tabular-nums">
+                        Payment: {paymentDisplay} · Fulfillment: {fulfillment.replace(/_/g, ' ')}
                       </p>
                       <p className="mt-1 text-xs tabular-nums text-[#242124]/65">
                         {order.customerEmail} · {order.customerPhone} · Placed{' '}
                         {formatTimestamp(order.createdAt)}
+                        {order.paymentCollectedAt
+                          ? ` · Collected ${formatTimestamp(order.paymentCollectedAt)}`
+                          : ''}
                       </p>
                       {order.razorpayOrderId && (
                         <p className="mt-1 font-mono text-[11px] text-[#242124]/65">
@@ -222,7 +249,7 @@ export function AdminOrdersPanel({
                     <div className="flex flex-col items-end gap-2">
                       <div className="text-right tabular-nums">
                         <span className="block text-[10px] font-semibold uppercase tracking-wider text-[#49243E]/60">
-                          Total
+                          {isUnpaidCod ? 'Amount Due on Delivery' : 'Total'}
                         </span>
                         <span className="font-serif text-xl font-semibold text-[#49243E]">
                           {formatPaiseINR(order.totalPaise)}
@@ -230,6 +257,52 @@ export function AdminOrdersPanel({
                       </div>
 
                       <div className="flex flex-wrap items-center justify-end gap-2">
+                        {canCollectPayment && (
+                          <button
+                            type="button"
+                            disabled={collectingId === order.id || updatingId === order.id}
+                            onClick={async () => {
+                              if (!onCollectOrderPayment) return;
+                              setCollectingId(order.id);
+                              setOrderErrors((prev) => {
+                                if (!prev[order.id]) return prev;
+                                const next = { ...prev };
+                                delete next[order.id];
+                                return next;
+                              });
+                              try {
+                                const result = await onCollectOrderPayment(
+                                  order.id,
+                                  statusNotes[order.id]?.trim() || undefined
+                                );
+                                if (!result.ok) {
+                                  setOrderErrors((prev) => ({
+                                    ...prev,
+                                    [order.id]:
+                                      result.error ||
+                                      'Could not mark COD payment as collected.',
+                                  }));
+                                } else {
+                                  setStatusNotes((prev) => {
+                                    const next = { ...prev };
+                                    delete next[order.id];
+                                    return next;
+                                  });
+                                }
+                              } finally {
+                                setCollectingId(null);
+                              }
+                            }}
+                            className="inline-flex min-h-[44px] items-center gap-1.5 rounded-xl border border-[#49243E] bg-white px-3.5 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#49243E] hover:text-[#FFF9F5] disabled:opacity-60"
+                          >
+                            {collectingId === order.id ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                            ) : (
+                              <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                            )}
+                            <span>Mark Payment Collected</span>
+                          </button>
+                        )}
                         {updatingId === order.id && (
                           <Loader2 className="h-4 w-4 animate-spin text-[#B76E79]" aria-hidden="true" />
                         )}
@@ -240,7 +313,7 @@ export function AdminOrdersPanel({
                             setStatusNotes((prev) => ({ ...prev, [order.id]: e.target.value }))
                           }
                           placeholder="Optional customer note"
-                          className="h-10 w-44 rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs text-[#242124] focus:border-[#49243E] focus:outline-none"
+                          className="h-11 w-44 rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs text-[#242124] focus:border-[#49243E] focus:outline-none"
                         />
                         <select
                           aria-label={`Fulfillment status for ${order.orderNumber}`}
@@ -279,7 +352,7 @@ export function AdminOrdersPanel({
                               setUpdatingId(null);
                             }
                           }}
-                          className="h-10 rounded-xl border border-[#49243E]/20 bg-white px-3 text-xs font-medium capitalize text-[#49243E] focus:border-[#49243E] focus:outline-none disabled:opacity-60"
+                          className="h-11 rounded-xl border border-[#49243E]/20 bg-white px-3 text-xs font-medium capitalize text-[#49243E] focus:border-[#49243E] focus:outline-none disabled:opacity-60"
                         >
                           {ORDER_STATUSES.map((s) => (
                             <option key={s} value={s}>

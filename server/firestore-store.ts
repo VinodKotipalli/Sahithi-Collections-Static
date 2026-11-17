@@ -118,6 +118,9 @@ interface FirestoreOrderDoc {
   gift_card_paise?: number;
   status_history_json?: string;
   return_request_json?: string | null;
+  idempotency_key?: string | null;
+  payment_collected_at?: number | null;
+  payment_collected_by?: string | null;
   subtotal_paise: number;
   total_paise: number;
   currency: string;
@@ -150,6 +153,10 @@ function normalizeFirestoreOrderRow(doc: FirestoreOrderDoc): OrderRow {
     gift_card_paise: Number(doc.gift_card_paise || 0),
     status_history_json: doc.status_history_json || '[]',
     return_request_json: doc.return_request_json ?? null,
+    idempotency_key: doc.idempotency_key ?? null,
+    payment_collected_at:
+      typeof doc.payment_collected_at === 'number' ? doc.payment_collected_at : null,
+    payment_collected_by: doc.payment_collected_by ?? null,
     subtotal_paise: Number(doc.subtotal_paise || 0),
     total_paise: Number(doc.total_paise || 0),
     currency: doc.currency || 'INR',
@@ -946,8 +953,21 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
 
     for (const oDoc of ordersSnap.docs) {
       const orderDoc = oDoc.data() as FirestoreOrderDoc;
-      if (orderDoc.status === 'pending') pendingOrders += 1;
-      if (orderDoc.status !== 'cancelled') {
+      const fulfillment = orderDoc.fulfillment_status || orderDoc.status || 'placed';
+      const paymentStatus =
+        orderDoc.payment_status ?? (orderDoc.razorpay_payment_id ? 'paid' : 'unpaid');
+      const paymentMethod =
+        orderDoc.payment_method ??
+        (orderDoc.razorpay_order_id || orderDoc.razorpay_payment_id ? 'razorpay' : 'cod');
+
+      if (!['delivered', 'cancelled', 'returned'].includes(fulfillment)) {
+        pendingOrders += 1;
+      }
+      const isCancelled = orderDoc.status === 'cancelled' || fulfillment === 'cancelled';
+      const isPaid =
+        paymentStatus === 'paid' ||
+        (paymentMethod !== 'cod' && ['paid', 'fulfilled'].includes(orderDoc.status));
+      if (!isCancelled && isPaid) {
         totalRevenuePaise += Number(orderDoc.total_paise || 0);
       }
       if (orderDoc.return_request_json) {
@@ -1702,6 +1722,19 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
           return { order: normalizeFirestoreOrderRow(doc), items: doc.items || [] };
         }
       }
+      const cleanIdempotencyKey =
+        typeof input.idempotencyKey === 'string' && input.idempotencyKey.trim()
+          ? input.idempotencyKey.trim().slice(0, 128)
+          : null;
+      if (cleanIdempotencyKey) {
+        const existingByKey = await tx.get(
+          this.ordersCol().where('idempotency_key', '==', cleanIdempotencyKey).limit(1)
+        );
+        if (!existingByKey.empty) {
+          const doc = existingByKey.docs[0].data() as FirestoreOrderDoc;
+          return { order: normalizeFirestoreOrderRow(doc), items: doc.items || [] };
+        }
+      }
 
       // Firestore requires all reads before writes inside a transaction
       const productSnaps = new Map<string, FirestoreProductDoc>();
@@ -1842,18 +1875,23 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
         });
       }
 
-      const status = input.status || 'pending';
+      const paymentMethod = input.paymentMethod || 'cod';
+      const status = input.status || (paymentMethod === 'cod' ? 'placed' : 'pending');
       const paymentStatus = input.paymentStatus || (input.paymentMethod === 'razorpay' ? 'paid' : 'unpaid');
       const fulfillmentStatus = input.fulfillmentStatus || (status === 'confirmed' ? 'confirmed' : 'placed');
-      const paymentMethod = input.paymentMethod || 'cod';
+      const paymentCollectedAt = paymentStatus === 'paid' ? now : null;
+      const paymentCollectedBy = null;
       const statusHistory: OrderStatusHistoryEntry[] =
         input.statusHistory && input.statusHistory.length > 0
           ? input.statusHistory
           : [
               {
                 status: fulfillmentStatus,
-                note: paymentMethod === 'razorpay' ? 'Payment verified via Razorpay' : 'Order placed',
-                actor: 'system',
+                note:
+                  paymentMethod === 'razorpay'
+                    ? 'Payment verified via Razorpay'
+                    : 'Cash on Delivery order placed · Payment due on delivery',
+                actor: input.customerUserId ? 'customer' : 'system',
                 at: now,
               },
             ];
@@ -1879,6 +1917,9 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
         gift_card_paise: giftCardPaise,
         status_history_json: statusHistoryJson,
         return_request_json: null,
+        idempotency_key: cleanIdempotencyKey,
+        payment_collected_at: paymentCollectedAt,
+        payment_collected_by: paymentCollectedBy,
         subtotal_paise: subtotalPaise,
         total_paise: totalPaise,
         currency: 'INR',
@@ -1900,7 +1941,7 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
           message:
             paymentMethod === 'razorpay'
               ? `Payment verified for order ${orderNumber} (₹${(totalPaise / 100).toLocaleString('en-IN')}).`
-              : `Your boutique order ${orderNumber} has been received.`,
+              : `Your Cash on Delivery order ${orderNumber} is placed. ₹${(totalPaise / 100).toLocaleString('en-IN')} is due on delivery.`,
           order_id: orderId,
           order_number: orderNumber,
           is_read: 0,
@@ -2138,6 +2179,72 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
         message:
           reqRecord.resolutionNote ||
           `Your ${reqRecord.type} request for order ${existing.order_number} was ${input.decision}.`,
+        orderId: existing.id,
+        orderNumber: existing.order_number,
+      });
+    }
+
+    const updatedDoc: FirestoreOrderDoc = { ...existing, ...patch };
+    return { order: normalizeFirestoreOrderRow(updatedDoc), items: updatedDoc.items || [] };
+  }
+
+  async collectOrderPayment(input: {
+    orderId: string;
+    actorUserId?: string | null;
+    note?: string;
+  }): Promise<OrderWithItems | null> {
+    const ref = this.ordersCol().doc(input.orderId);
+    const snap = await ref.get();
+    if (!snap.exists) return null;
+
+    const existing = snap.data() as FirestoreOrderDoc;
+    if (existing.status === 'cancelled' || existing.fulfillment_status === 'cancelled') {
+      throw new StoreHttpError(
+        409,
+        'ORDER_CANCELLED',
+        'Cannot record payment collection for a cancelled order.'
+      );
+    }
+
+    if (existing.payment_status === 'paid') {
+      return { order: normalizeFirestoreOrderRow(existing), items: existing.items || [] };
+    }
+
+    const now = Date.now();
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+
+    const noteText =
+      input.note?.trim() ||
+      `Cash on Delivery payment of ₹${(Number(existing.total_paise || 0) / 100).toLocaleString('en-IN')} collected`;
+    history.push({
+      status: 'payment_collected',
+      note: noteText,
+      actor: 'owner',
+      at: now,
+    });
+
+    const patch = {
+      payment_status: 'paid',
+      payment_collected_at: now,
+      payment_collected_by: input.actorUserId || 'owner',
+      status_history_json: JSON.stringify(history),
+      updated_at: now,
+    };
+    await ref.update(patch);
+
+    if (existing.customer_user_id) {
+      await this.createCustomerNotification({
+        id: `notif_paid_${existing.id}_${now}`,
+        userId: existing.customer_user_id,
+        type: 'order_status',
+        title: `Payment received for order ${existing.order_number}`,
+        message: `${noteText} for order ${existing.order_number}.`,
         orderId: existing.id,
         orderNumber: existing.order_number,
       });

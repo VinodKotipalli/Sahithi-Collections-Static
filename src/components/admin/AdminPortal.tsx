@@ -995,6 +995,27 @@ export function AdminPortal({
     return { ok: true };
   };
 
+  const handleCollectOrderPayment = async (
+    orderId: string,
+    note?: string
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const res = await apiRequest<{ id: string; paymentStatus: string; order: AdminOrder }>(
+      `/api/admin/orders/${encodeURIComponent(orderId)}/collect-payment`,
+      {
+        method: 'POST',
+        body: JSON.stringify(note ? { note } : {}),
+      }
+    );
+    if (!res.ok) {
+      showToast('err', res.error);
+      return { ok: false, error: res.error };
+    }
+    showToast('ok', 'Payment marked as collected.');
+    await Promise.all([loadOrders({ silent: true }), loadOverview({ silent: true })]);
+    setActivityRefreshTick((t) => t + 1);
+    return { ok: true };
+  };
+
   const handleResolveReturnRequest = async (
     orderId: string,
     decision: 'approved' | 'rejected',
@@ -2169,6 +2190,7 @@ export function AdminPortal({
               totalPages={ordersTotalPages}
               onPageChange={setOrdersPage}
               onUpdateOrderStatus={handleUpdateOrderStatus}
+              onCollectOrderPayment={handleCollectOrderPayment}
               onResolveReturnRequest={handleResolveReturnRequest}
               onRecoverOrder={handleRecoverOrder}
             />

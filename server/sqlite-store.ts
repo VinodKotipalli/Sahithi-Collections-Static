@@ -476,8 +476,19 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       .prepare(
         `SELECT
            COUNT(*) AS totalOrders,
-           SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pendingOrders,
-           COALESCE(SUM(CASE WHEN status != 'cancelled' THEN total_paise ELSE 0 END), 0) AS totalRevenuePaise
+           SUM(CASE WHEN COALESCE(fulfillment_status, status) NOT IN ('delivered', 'cancelled', 'returned') THEN 1 ELSE 0 END) AS pendingOrders,
+           COALESCE(SUM(
+             CASE
+               WHEN status != 'cancelled'
+                 AND COALESCE(fulfillment_status, status) != 'cancelled'
+                 AND (
+                   payment_status = 'paid'
+                   OR (payment_method != 'cod' AND status IN ('paid', 'fulfilled'))
+                 )
+               THEN total_paise
+               ELSE 0
+             END
+           ), 0) AS totalRevenuePaise
          FROM orders`
       )
       .get() as Record<string, number | null>;
@@ -1301,6 +1312,22 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           return { order: existingByRzp, items };
         }
       }
+      const cleanIdempotencyKey =
+        typeof input.idempotencyKey === 'string' && input.idempotencyKey.trim()
+          ? input.idempotencyKey.trim().slice(0, 128)
+          : null;
+      if (cleanIdempotencyKey) {
+        const existingByKey = this.db
+          .prepare(`SELECT * FROM orders WHERE idempotency_key = ? LIMIT 1`)
+          .get(cleanIdempotencyKey) as OrderRow | undefined;
+        if (existingByKey) {
+          const items = this.db
+            .prepare(`SELECT * FROM order_items WHERE order_id = ?`)
+            .all(existingByKey.id) as unknown as OrderItemRow[];
+          this.db.exec('COMMIT;');
+          return { order: existingByKey, items };
+        }
+      }
 
       const fetchProduct = this.db.prepare(`SELECT * FROM products WHERE id = ? LIMIT 1`);
       const fetchVariantById = this.db.prepare(
@@ -1417,18 +1444,24 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           .run(giftCardPaise, now, now, input.giftCardCode.trim());
       }
 
-      const status = input.status || 'pending';
-      const paymentStatus = input.paymentStatus || (input.paymentMethod === 'razorpay' ? 'paid' : 'unpaid');
-      const fulfillmentStatus = input.fulfillmentStatus || (status === 'confirmed' ? 'confirmed' : 'placed');
       const paymentMethod = input.paymentMethod || 'cod';
+      const status = input.status || (paymentMethod === 'cod' ? 'placed' : 'pending');
+      const paymentStatus = input.paymentStatus || (paymentMethod === 'razorpay' ? 'paid' : 'unpaid');
+      const fulfillmentStatus =
+        input.fulfillmentStatus || (status === 'confirmed' ? 'confirmed' : 'placed');
+      const paymentCollectedAt = paymentStatus === 'paid' ? now : null;
+      const paymentCollectedBy = null;
       const statusHistory: OrderStatusHistoryEntry[] =
         input.statusHistory && input.statusHistory.length > 0
           ? input.statusHistory
           : [
               {
                 status: fulfillmentStatus,
-                note: paymentMethod === 'razorpay' ? 'Payment verified via Razorpay' : 'Order placed',
-                actor: 'system',
+                note:
+                  paymentMethod === 'razorpay'
+                    ? 'Payment verified via Razorpay'
+                    : 'Cash on Delivery order placed · Payment due on delivery',
+                actor: input.customerUserId ? 'customer' : 'system',
                 at: now,
               },
             ];
@@ -1441,8 +1474,9 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
             customer_phone, shipping_address, status, payment_status, fulfillment_status,
             payment_method, razorpay_order_id, razorpay_payment_id, coupon_code, gift_card_code,
             discount_paise, gift_card_paise, status_history_json, return_request_json,
+            idempotency_key, payment_collected_at, payment_collected_by,
             subtotal_paise, total_paise, currency, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'INR', ?, ?)`
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'INR', ?, ?)`
         )
         .run(
           orderId,
@@ -1463,6 +1497,9 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           discountPaise,
           giftCardPaise,
           statusHistoryJson,
+          cleanIdempotencyKey,
+          paymentCollectedAt,
+          paymentCollectedBy,
           subtotalPaise,
           totalPaise,
           now,
@@ -1533,7 +1570,7 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
             `Order ${orderNumber} placed`,
             paymentMethod === 'razorpay'
               ? `Payment verified for order ${orderNumber} (₹${(totalPaise / 100).toLocaleString('en-IN')}).`
-              : `Your boutique order ${orderNumber} has been received.`,
+              : `Your Cash on Delivery order ${orderNumber} is placed. ₹${(totalPaise / 100).toLocaleString('en-IN')} is due on delivery.`,
             orderId,
             orderNumber,
             now
@@ -1563,6 +1600,9 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           gift_card_paise: giftCardPaise,
           status_history_json: statusHistoryJson,
           return_request_json: null,
+          idempotency_key: cleanIdempotencyKey,
+          payment_collected_at: paymentCollectedAt,
+          payment_collected_by: paymentCollectedBy,
           subtotal_paise: subtotalPaise,
           total_paise: totalPaise,
           currency: 'INR',
@@ -1817,6 +1857,80 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
         message:
           reqRecord.resolutionNote ||
           `Your ${reqRecord.type} request for order ${existing.order_number} was ${input.decision}.`,
+        orderId: existing.id,
+        orderNumber: existing.order_number,
+      });
+    }
+
+    return this.getOrderById(input.orderId);
+  }
+
+  async collectOrderPayment(input: {
+    orderId: string;
+    actorUserId?: string | null;
+    note?: string;
+  }): Promise<OrderWithItems | null> {
+    const existing = this.db
+      .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+      .get(input.orderId) as OrderRow | undefined;
+    if (!existing) return null;
+
+    if (existing.status === 'cancelled' || existing.fulfillment_status === 'cancelled') {
+      throw new StoreHttpError(
+        409,
+        'ORDER_CANCELLED',
+        'Cannot record payment collection for a cancelled order.'
+      );
+    }
+
+    if (existing.payment_status === 'paid') {
+      return this.getOrderById(input.orderId);
+    }
+
+    const now = Date.now();
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+
+    const noteText =
+      input.note?.trim() ||
+      `Cash on Delivery payment of ₹${(existing.total_paise / 100).toLocaleString('en-IN')} collected`;
+    history.push({
+      status: 'payment_collected',
+      note: noteText,
+      actor: 'owner',
+      at: now,
+    });
+
+    this.db
+      .prepare(
+        `UPDATE orders
+         SET payment_status = 'paid',
+             payment_collected_at = ?,
+             payment_collected_by = ?,
+             status_history_json = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        now,
+        input.actorUserId || 'owner',
+        JSON.stringify(history),
+        now,
+        input.orderId
+      );
+
+    if (existing.customer_user_id) {
+      await this.createCustomerNotification({
+        id: `notif_paid_${existing.id}_${now}`,
+        userId: existing.customer_user_id,
+        type: 'order_status',
+        title: `Payment received for order ${existing.order_number}`,
+        message: `${noteText} for order ${existing.order_number}.`,
         orderId: existing.id,
         orderNumber: existing.order_number,
       });

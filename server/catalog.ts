@@ -5,6 +5,7 @@ import multer from 'multer';
 import {
   handleCreateOrderRequest,
   handleOrderStatusRequest,
+  handlePlaceCodOrderRequest,
   handleRazorpayWebhookRequest,
   handleRecoverRazorpayOrder,
   handleVerifyPaymentRequest,
@@ -342,9 +343,12 @@ function serializeCategory(cat: CategoryRow) {
 function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
   const statusHistory = parseJsonSafe<unknown[]>(o.status_history_json || '', []);
   const returnRequest = parseJsonSafe<unknown | null>(o.return_request_json || '', null);
-  const paymentStatus = o.payment_status || 'pending';
+  const paymentMethod: 'razorpay' | 'cod' =
+    (o.payment_method as 'razorpay' | 'cod') || (o.razorpay_order_id ? 'razorpay' : 'cod');
+  const paymentStatus = o.payment_status || (o.razorpay_payment_id ? 'paid' : 'unpaid');
   const fulfillmentStatus =
-    o.fulfillment_status || (o.status === 'paid' ? 'confirmed' : o.status);
+    o.fulfillment_status ||
+    (o.status === 'paid' ? 'confirmed' : o.status === 'pending' ? 'placed' : o.status);
 
   return {
     id: o.id,
@@ -357,9 +361,11 @@ function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
     status: o.status,
     paymentStatus,
     fulfillmentStatus,
-    paymentMethod: (o.payment_method as 'razorpay' | 'cod') || (o.razorpay_order_id ? 'razorpay' : 'cod'),
+    paymentMethod,
     razorpayOrderId: o.razorpay_order_id ?? null,
     razorpayPaymentId: o.razorpay_payment_id ?? null,
+    paymentCollectedAt: o.payment_collected_at ?? null,
+    idempotencyKey: o.idempotency_key ?? null,
     couponCode: o.coupon_code ?? null,
     giftCardCode: o.gift_card_code ?? null,
     discountPaise: o.discount_paise || 0,
@@ -1364,123 +1370,28 @@ export function registerCatalogAndAdminRoutes(params: {
 
   app.post('/api/orders', async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
     try {
-      const customerName =
-        typeof req.body?.customerName === 'string' ? req.body.customerName.trim() : '';
-      const customerEmail =
-        typeof req.body?.customerEmail === 'string'
-          ? req.body.customerEmail.trim().toLowerCase()
-          : '';
-      const customerPhone =
-        typeof req.body?.customerPhone === 'string' ? req.body.customerPhone.trim() : '';
-      const shippingAddress =
-        typeof req.body?.shippingAddress === 'string' ? req.body.shippingAddress.trim() : '';
-      const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
-
-      if (customerName.length < 2 || customerName.length > 100) {
-        return sendJsonError(req, res, 400, 'VALIDATION_ERROR', 'Please enter your full name.');
-      }
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail)) {
-        return sendJsonError(
-          req,
-          res,
-          400,
-          'VALIDATION_ERROR',
-          'Please enter a valid email address.'
-        );
-      }
-      if (customerPhone.length < 7 || customerPhone.length > 24) {
-        return sendJsonError(
-          req,
-          res,
-          400,
-          'VALIDATION_ERROR',
-          'Please enter a valid contact phone number.'
-        );
-      }
-      if (shippingAddress.length < 8 || shippingAddress.length > 400) {
-        return sendJsonError(
-          req,
-          res,
-          400,
-          'VALIDATION_ERROR',
-          'Please enter a complete delivery address.'
-        );
-      }
-      if (rawItems.length === 0 || rawItems.length > 30) {
-        return sendJsonError(req, res, 400, 'VALIDATION_ERROR', 'Your shopping bag is empty.');
-      }
-
-      const parsedItems: Array<{
-        productId: string;
-        variantId: string;
-        quantity: number;
-        expectedPricePaise: number | null;
-      }> = [];
-
-      for (const raw of rawItems) {
-        if (!raw || typeof raw !== 'object') {
-          return sendJsonError(req, res, 400, 'VALIDATION_ERROR', 'Invalid cart item.');
+      const authHeader = req.get('authorization');
+      if (authHeader && /^Bearer\s+/i.test(authHeader)) {
+        const verified = await verifyBearerFirebaseTokenFromHeader(authHeader);
+        if (!verified.ok && !req.authUser?.id) {
+          return sendJsonError(req, res, verified.status, verified.code, verified.error);
         }
-        const obj = raw as Record<string, unknown>;
-        const productId = typeof obj.productId === 'string' ? obj.productId : '';
-        const variantId = typeof obj.variantId === 'string' ? obj.variantId : '';
-        const quantity = typeof obj.quantity === 'number' ? obj.quantity : 0;
-        const expectedPricePaise =
-          typeof obj.expectedPricePaise === 'number' && Number.isFinite(obj.expectedPricePaise)
-            ? Math.round(obj.expectedPricePaise)
-            : null;
-
-        if (!productId || !Number.isInteger(quantity) || quantity < 1 || quantity > 50) {
-          return sendJsonError(req, res, 400, 'VALIDATION_ERROR', 'Invalid item quantity in bag.');
-        }
-
-        parsedItems.push({ productId, variantId, quantity, expectedPricePaise });
       }
-
-      try {
-        const { order, items } = await store.placeOrder({
-          customerUserId: req.authUser?.id || null,
-          customerName,
-          customerEmail,
-          customerPhone,
-          shippingAddress,
-          items: parsedItems,
-        });
-
-        return res.status(201).json({
-          order: {
-            id: order.id,
-            orderNumber: order.order_number,
-            status: order.status,
-            subtotalPaise: order.subtotal_paise,
-            totalPaise: order.total_paise,
-            currency: order.currency,
-            createdAt: order.created_at,
-            items: items.map((l) => ({
-              productId: l.product_id,
-              variantId: l.variant_id,
-              productTitle: l.product_title,
-              variantLabel: l.variant_label,
-              sku: l.sku,
-              unitPricePaise: l.unit_price_paise,
-              quantity: l.quantity,
-              lineTotalPaise: l.line_total_paise,
-            })),
-          },
-        });
-      } catch (innerErr) {
-        if (innerErr instanceof StoreHttpError) {
-          return sendJsonError(
-            req,
-            res,
-            innerErr.httpStatus,
-            innerErr.code,
-            innerErr.message
-          );
-        }
-        throw innerErr;
-      }
+      const authCtx = await resolveCheckoutAuthContext(req);
+      const result = await handlePlaceCodOrderRequest({
+        body: (req.body && typeof req.body === 'object' ? req.body : {}) as Record<
+          string,
+          unknown
+        >,
+        store,
+        customerUserId: authCtx.customerUserId,
+        customerIdToken: authCtx.customerIdToken,
+      });
+      return res.status(result.status).json(result.body);
     } catch (err) {
+      if (err instanceof StoreHttpError) {
+        return sendJsonError(req, res, err.httpStatus, err.code, err.message);
+      }
       return next(err);
     }
   });
@@ -2907,6 +2818,7 @@ export function registerCatalogAndAdminRoutes(params: {
         const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
         const allowed = new Set([
           'pending',
+          'placed',
           'confirmed',
           'packed',
           'shipped',
@@ -2940,6 +2852,35 @@ export function registerCatalogAndAdminRoutes(params: {
           order: serializeOrderWithItems(updated),
         });
       } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/admin/orders/:id/collect-payment',
+    requireOwner,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const id = String(req.params.id || '');
+        const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
+        const updated = await store.collectOrderPayment({
+          orderId: id,
+          actorUserId: req.authUser?.id || null,
+          note: note || undefined,
+        });
+        if (!updated) {
+          return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
+        }
+        return res.json({
+          id,
+          paymentStatus: updated.order.payment_status,
+          order: serializeOrderWithItems(updated),
+        });
+      } catch (err) {
+        if (err instanceof StoreHttpError) {
+          return sendJsonError(req, res, err.httpStatus, err.code, err.message);
+        }
         return next(err);
       }
     }

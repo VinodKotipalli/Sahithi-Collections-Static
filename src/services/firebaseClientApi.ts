@@ -886,6 +886,9 @@ function serializeClientOrderDoc(o: Record<string, unknown>) {
     paymentStatus,
     fulfillmentStatus,
     paymentMethod: String(o.payment_method || (rzOrderId || rzPaymentId ? 'razorpay' : 'cod')),
+    paymentCollectedAt:
+      typeof o.payment_collected_at === 'number' ? Number(o.payment_collected_at) : null,
+    idempotencyKey: typeof o.idempotency_key === 'string' ? o.idempotency_key : null,
     razorpayOrderId: rzOrderId,
     razorpayPaymentId: rzPaymentId,
     couponCode: typeof o.coupon_code === 'string' && o.coupon_code ? o.coupon_code : null,
@@ -3985,12 +3988,20 @@ export async function handleClientlessApiRequest<T>(
     }
 
     if (cleanPath === '/api/orders' && upperMethod === 'POST') {
-      const customerName = typeof body.customerName === 'string' ? body.customerName.trim() : '';
+      const rawCustomer =
+        body.customer && typeof body.customer === 'object'
+          ? (body.customer as Record<string, unknown>)
+          : body;
+      const customerName =
+        typeof rawCustomer.customerName === 'string' ? rawCustomer.customerName.trim() : '';
       const customerEmail =
-        typeof body.customerEmail === 'string' ? body.customerEmail.trim().toLowerCase() : '';
-      const customerPhone = typeof body.customerPhone === 'string' ? body.customerPhone.trim() : '';
+        typeof rawCustomer.customerEmail === 'string'
+          ? rawCustomer.customerEmail.trim().toLowerCase()
+          : '';
+      const customerPhone =
+        typeof rawCustomer.customerPhone === 'string' ? rawCustomer.customerPhone.trim() : '';
       const shippingAddress =
-        typeof body.shippingAddress === 'string' ? body.shippingAddress.trim() : '';
+        typeof rawCustomer.shippingAddress === 'string' ? rawCustomer.shippingAddress.trim() : '';
       const rawItems = Array.isArray(body.items) ? body.items : [];
 
       if (
@@ -4008,16 +4019,53 @@ export async function handleClientlessApiRequest<T>(
         };
       }
 
-      const docs = await getMergedProductDocs();
+      const activeSession = await getValidClientSession().catch(() => null);
+      const rawIdempotency =
+        typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim().slice(0, 128) : '';
+      const cleanIdempotencyKey =
+        rawIdempotency && /^[a-zA-Z0-9_.:-]{6,128}$/.test(rawIdempotency)
+          ? rawIdempotency
+          : null;
+
+      let deterministicHash = 0;
+      if (cleanIdempotencyKey) {
+        for (let i = 0; i < cleanIdempotencyKey.length; i += 1) {
+          deterministicHash = ((deterministicHash << 5) - deterministicHash + cleanIdempotencyKey.charCodeAt(i)) >>> 0;
+        }
+      }
+      const now = Date.now();
+      const orderId = cleanIdempotencyKey
+        ? `ord_cod_${cleanIdempotencyKey.replace(/[^a-zA-Z0-9]/g, '').slice(0, 14)}_${deterministicHash.toString(36)}`
+        : `ord_cod_${now.toString(36)}_${randomHex(4)}`;
+
+      if (cleanIdempotencyKey) {
+        const existingOrderDoc = await firestoreGetDoc<Record<string, unknown>>(
+          'orders',
+          orderId,
+          activeSession?.idToken
+        ).catch(() => null);
+        if (existingOrderDoc) {
+          return {
+            ok: true,
+            data: {
+              order: serializeClientOrderDoc(existingOrderDoc),
+              duplicate: true,
+            } as unknown as T,
+          };
+        }
+      }
+
+      const orderNumber = cleanIdempotencyKey
+        ? `SC-COD-${deterministicHash.toString(36).toUpperCase().padStart(6, '0').slice(-6)}`
+        : `SC-${now.toString(36).toUpperCase().slice(-5)}${randomHex(2).toUpperCase()}`;
+
+      const docs = await getMergedProductDocs(activeSession?.idToken);
       const productMap = new Map(
         docs
           .filter((d) => d.status === 'active' || d.status === 'published')
           .map((d) => [d.id, d])
       );
 
-      const now = Date.now();
-      const orderId = `ord_${now.toString(36)}_${randomHex(4)}`;
-      const orderNumber = `SC-${now.toString(36).toUpperCase().slice(-5)}${randomHex(2).toUpperCase()}`;
       let subtotalPaise = 0;
       const productIds = new Set<string>();
       const orderItems: Array<{
@@ -4069,12 +4117,15 @@ export async function handleClientlessApiRequest<T>(
           };
         }
 
-        if (availableStock < quantity) {
+        if (availableStock < quantity || availableStock <= 0) {
           return {
             ok: false,
             status: 409,
             code: 'INSUFFICIENT_STOCK',
-            error: `Only ${availableStock} piece(s) left for "${doc.title}".`,
+            error:
+              availableStock <= 0
+                ? `"${doc.title}" is currently out of stock.`
+                : `Only ${availableStock} piece(s) left for "${doc.title}".`,
           };
         }
 
@@ -4095,38 +4146,130 @@ export async function handleClientlessApiRequest<T>(
         });
       }
 
-      const activeSession = await getValidClientSession().catch(() => null);
+      let discountPaise = 0;
+      let appliedCouponCode: string | null = null;
+      const rawCouponCode =
+        typeof body.couponCode === 'string' ? body.couponCode.trim().toUpperCase() : '';
+      if (rawCouponCode) {
+        const cpnDoc = await firestoreGetDoc<Record<string, unknown>>(
+          'coupons',
+          `cpn_${rawCouponCode.toLowerCase()}`,
+          activeSession?.idToken
+        );
+        if (!cpnDoc) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'INVALID_COUPON',
+            error: `Coupon "${rawCouponCode}" was not found.`,
+          };
+        }
+        const c = serializeClientCouponDoc(cpnDoc);
+        if (!c.active || (c.startsAt && now < c.startsAt) || (c.expiresAt && now > c.expiresAt)) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'INVALID_COUPON',
+            error: `Coupon "${rawCouponCode}" is inactive or expired.`,
+          };
+        }
+        if (c.usageLimit !== null && c.usedCount >= c.usageLimit) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'COUPON_EXHAUSTED',
+            error: `Coupon "${rawCouponCode}" has reached its redemption limit.`,
+          };
+        }
+        if (subtotalPaise < c.minSpendPaise) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'COUPON_MIN_SPEND',
+            error: `Coupon "${rawCouponCode}" requires a minimum order of ₹${(c.minSpendPaise / 100).toLocaleString('en-IN')}.`,
+          };
+        }
+        discountPaise =
+          c.discountType === 'percent'
+            ? Math.round((subtotalPaise * c.discountValue) / 100)
+            : c.discountValue;
+        if (c.maxDiscountPaise !== null && c.maxDiscountPaise > 0) {
+          discountPaise = Math.min(discountPaise, c.maxDiscountPaise);
+        }
+        discountPaise = Math.max(0, Math.min(subtotalPaise, discountPaise));
+        appliedCouponCode = c.code;
+      }
+
+      let giftCardPaise = 0;
+      let appliedGiftCardCode: string | null = null;
+      const rawGiftCardCode =
+        typeof body.giftCardCode === 'string' ? body.giftCardCode.trim().toUpperCase() : '';
+      if (rawGiftCardCode) {
+        const gcDoc = await firestoreGetDoc<Record<string, unknown>>(
+          'gift_cards',
+          `gc_${rawGiftCardCode.toLowerCase()}`,
+          activeSession?.idToken
+        );
+        if (!gcDoc) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'INVALID_GIFT_CARD',
+            error: `Gift card "${rawGiftCardCode}" was not found.`,
+          };
+        }
+        const gc = serializeClientGiftCardDoc(gcDoc);
+        if (!gc.active || (gc.expiresAt && now > gc.expiresAt) || gc.balancePaise <= 0) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'INVALID_GIFT_CARD',
+            error: `Gift card "${rawGiftCardCode}" cannot be redeemed.`,
+          };
+        }
+        giftCardPaise = Math.min(gc.balancePaise, Math.max(0, subtotalPaise - discountPaise));
+        appliedGiftCardCode = gc.code;
+      }
+
+      const finalTotalPaise = Math.max(0, subtotalPaise - discountPaise - giftCardPaise);
       const initialHistory: OrderStatusHistoryEntry[] = [
-        { status: 'pending', note: 'Order placed', actor: 'customer', at: now },
-      ];
-      await firestoreSetDoc(
-        'orders',
-        orderId,
         {
-          id: orderId,
-          order_number: orderNumber,
-          customer_user_id: activeSession ? activeSession.uid : null,
-          customer_name: customerName,
-          customer_email: customerEmail,
-          customer_phone: customerPhone,
-          shipping_address: shippingAddress,
-          status: 'pending',
-          payment_status: 'unpaid',
-          fulfillment_status: 'pending',
-          payment_method: 'cod',
-          discount_paise: 0,
-          gift_card_paise: 0,
-          status_history: initialHistory,
-          subtotal_paise: subtotalPaise,
-          total_paise: subtotalPaise,
-          currency: 'INR',
-          created_at: now,
-          updated_at: now,
-          product_ids: Array.from(productIds),
-          items: orderItems,
+          status: 'placed',
+          note: 'Cash on Delivery order placed · Payment due on delivery',
+          actor: activeSession ? 'customer' : 'system',
+          at: now,
         },
-        activeSession?.idToken
-      );
+      ];
+
+      const orderDocPayload: Record<string, unknown> = {
+        id: orderId,
+        order_number: orderNumber,
+        customer_user_id: activeSession ? activeSession.uid : null,
+        customer_name: customerName,
+        customer_email: customerEmail,
+        customer_phone: customerPhone,
+        shipping_address: shippingAddress,
+        status: 'placed',
+        payment_status: 'unpaid',
+        fulfillment_status: 'placed',
+        payment_method: 'cod',
+        discount_paise: discountPaise,
+        gift_card_paise: giftCardPaise,
+        coupon_code: appliedCouponCode,
+        gift_card_code: appliedGiftCardCode,
+        idempotency_key: cleanIdempotencyKey,
+        status_history: initialHistory,
+        status_history_json: JSON.stringify(initialHistory),
+        subtotal_paise: subtotalPaise,
+        total_paise: finalTotalPaise,
+        currency: 'INR',
+        created_at: now,
+        updated_at: now,
+        product_ids: Array.from(productIds),
+        items: orderItems,
+      };
+
+      await firestoreSetDoc('orders', orderId, orderDocPayload, activeSession?.idToken);
 
       if (activeSession?.uid) {
         await firestoreSetDoc(
@@ -4137,7 +4280,7 @@ export async function handleClientlessApiRequest<T>(
             user_id: activeSession.uid,
             type: 'order_placed',
             title: `Order ${orderNumber} placed`,
-            message: `We have received your order ${orderNumber} for ₹${(subtotalPaise / 100).toLocaleString('en-IN')}.`,
+            message: `Cash on Delivery order ${orderNumber} placed. ₹${(finalTotalPaise / 100).toLocaleString('en-IN')} is due on delivery.`,
             order_id: orderId,
             order_number: orderNumber,
             is_read: 0,
@@ -4152,37 +4295,8 @@ export async function handleClientlessApiRequest<T>(
       return {
         ok: true,
         data: {
-          order: {
-            id: orderId,
-            orderNumber,
-            customerUserId: activeSession ? activeSession.uid : null,
-            customerName,
-            customerEmail,
-            customerPhone,
-            shippingAddress,
-            status: 'pending',
-            paymentStatus: 'unpaid',
-            fulfillmentStatus: 'pending',
-            paymentMethod: 'cod',
-            subtotalPaise,
-            discountPaise: 0,
-            giftCardPaise: 0,
-            totalPaise: subtotalPaise,
-            currency: 'INR',
-            statusHistory: initialHistory,
-            createdAt: now,
-            updatedAt: now,
-            items: orderItems.map((it) => ({
-              productId: it.product_id,
-              variantId: it.variant_id,
-              productTitle: it.product_title,
-              variantLabel: it.variant_label,
-              sku: it.sku,
-              unitPricePaise: it.unit_price_paise,
-              quantity: it.quantity,
-              lineTotalPaise: it.line_total_paise,
-            })),
-          },
+          order: serializeClientOrderDoc(orderDocPayload),
+          duplicate: false,
         } as unknown as T,
       };
     }
@@ -4358,8 +4472,9 @@ export async function handleClientlessApiRequest<T>(
 
         const paidOrders = serializedOrders.filter(
           (o) =>
-            o.paymentStatus === 'paid' ||
-            ['paid', 'fulfilled', 'confirmed', 'packed', 'shipped', 'delivered'].includes(o.status)
+            !['cancelled', 'refunded'].includes(o.status) &&
+            (o.paymentStatus === 'paid' ||
+              (o.paymentMethod !== 'cod' && ['paid', 'fulfilled'].includes(o.status)))
         );
         const totalRevenuePaise = paidOrders.reduce(
           (sum, o) => sum + Number(o.totalPaise || 0),
@@ -5799,6 +5914,7 @@ export async function handleClientlessApiRequest<T>(
         }
         const allowedStatuses = new Set([
           'pending',
+          'placed',
           'confirmed',
           'packed',
           'shipped',
@@ -5868,6 +5984,91 @@ export async function handleClientlessApiRequest<T>(
         return {
           ok: true,
           data: { id: orderId, status: nextStatus, order: serialized, item: serialized } as unknown as T,
+        };
+      }
+
+      if (cleanPath.match(/^\/api\/admin\/orders\/[^/]+\/collect-payment$/) && upperMethod === 'POST') {
+        const orderId = decodeURIComponent(cleanPath.split('/')[4] || '');
+        const existing = await firestoreGetDoc<Record<string, unknown>>('orders', orderId, idToken);
+        if (!existing) {
+          return {
+            ok: false,
+            status: 404,
+            code: 'ORDER_NOT_FOUND',
+            error: 'Order not found.',
+          };
+        }
+        const currentFulfillment = String(existing.fulfillment_status || existing.status || 'placed');
+        if (currentFulfillment === 'cancelled' || existing.status === 'cancelled') {
+          return {
+            ok: false,
+            status: 409,
+            code: 'ORDER_CANCELLED',
+            error: 'Payment cannot be collected for a cancelled order.',
+          };
+        }
+        if (existing.payment_status === 'paid') {
+          const serialized = serializeClientOrderDoc(existing);
+          return {
+            ok: true,
+            data: { id: orderId, paymentStatus: 'paid', order: serialized } as unknown as T,
+          };
+        }
+        const now = Date.now();
+        const note =
+          typeof body.note === 'string' && body.note.trim()
+            ? body.note.trim().slice(0, 300)
+            : 'Cash payment collected on delivery';
+        const prevHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
+          existing.status_history ?? existing.status_history_json,
+          []
+        );
+        const nextHistory: OrderStatusHistoryEntry[] = [
+          ...prevHistory,
+          {
+            status: 'payment_collected',
+            note,
+            actor: 'owner',
+            at: now,
+          },
+        ];
+        const updated = {
+          ...existing,
+          payment_status: 'paid',
+          payment_collected_at: now,
+          payment_collected_by: session.uid,
+          status_history: nextHistory,
+          status_history_json: JSON.stringify(nextHistory),
+          updated_at: now,
+        };
+        await firestoreSetDoc('orders', orderId, updated, idToken);
+        const customerUid =
+          typeof existing.customer_user_id === 'string' ? existing.customer_user_id : null;
+        if (customerUid) {
+          const notifId = `notif_paid_${orderId}_${now}`;
+          await firestoreSetDoc(
+            `users/${encodeURIComponent(customerUid)}/notifications`,
+            notifId,
+            {
+              id: notifId,
+              user_id: customerUid,
+              type: 'order_status',
+              title: `Payment collected for ${String(existing.order_number || orderId)}`,
+              message: `We have recorded Cash on Delivery payment for order ${String(existing.order_number || orderId)}.`,
+              order_id: orderId,
+              order_number: String(existing.order_number || ''),
+              is_read: 0,
+              read: false,
+              read_at: null,
+              created_at: now,
+            },
+            idToken
+          ).catch(() => undefined);
+        }
+        const serialized = serializeClientOrderDoc(updated);
+        return {
+          ok: true,
+          data: { id: orderId, paymentStatus: 'paid', order: serialized } as unknown as T,
         };
       }
 

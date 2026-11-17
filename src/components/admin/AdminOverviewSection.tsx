@@ -97,7 +97,7 @@ export function AdminOverviewSection({
     {
       label: 'Total Revenue',
       value: formatPaiseINR(metrics.totalRevenuePaise),
-      detail: 'Non-cancelled storefront orders',
+      detail: 'Collected payments (online & settled COD)',
       icon: IndianRupee,
       onClick: () => onNavigateTab('orders'),
     },
@@ -247,8 +247,17 @@ export function AdminOverviewSection({
           ) : (
             <ul className="divide-y divide-[#49243E]/10">
               {recentOrders.map((order) => {
+                const isCod = order.paymentMethod === 'cod';
                 const pay = order.paymentStatus || (order.razorpayPaymentId ? 'paid' : 'unpaid');
-                const ful = (order.fulfillmentStatus || order.status || 'pending').replace(/_/g, ' ');
+                const payLabel =
+                  pay === 'paid'
+                    ? isCod
+                      ? 'COD paid'
+                      : 'Paid online'
+                    : isCod
+                      ? 'COD · payment due'
+                      : `Payment ${pay}`;
+                const ful = (order.fulfillmentStatus || order.status || 'placed').replace(/_/g, ' ');
                 return (
                   <li key={order.id} className="flex items-center justify-between gap-3 py-3 text-xs">
                     <div className="min-w-0">
@@ -258,8 +267,8 @@ export function AdminOverviewSection({
                           · {order.orderNumber}
                         </span>
                       </p>
-                      <p className="mt-0.5 truncate capitalize tabular-nums text-[#242124]/60">
-                        Payment {pay} · Fulfillment {ful} · {formatTimestamp(order.createdAt)}
+                      <p className="mt-0.5 truncate tabular-nums text-[#242124]/60">
+                        {payLabel} · Fulfillment {ful} · {formatTimestamp(order.createdAt)}
                       </p>
                     </div>
                     <span className="shrink-0 font-semibold tabular-nums text-[#49243E]">
