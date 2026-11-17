@@ -53,38 +53,77 @@ declare global {
 }
 
 const RAZORPAY_CHECKOUT_SCRIPT_SRC = 'https://checkout.razorpay.com/v1/checkout.js';
+const DEFAULT_SCRIPT_TIMEOUT_MS = 10_000;
 
-export function ensureRazorpayCheckoutScript(): Promise<boolean> {
+export function ensureRazorpayCheckoutScript(
+  timeoutMs = DEFAULT_SCRIPT_TIMEOUT_MS
+): Promise<boolean> {
   if (typeof window === 'undefined') return Promise.resolve(false);
   if (typeof window.Razorpay === 'function') return Promise.resolve(true);
 
   return new Promise((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      resolve(ok);
+    };
+
     const existing = document.querySelector<HTMLScriptElement>(
       `script[src="${RAZORPAY_CHECKOUT_SCRIPT_SRC}"]`
     );
-    if (existing) {
-      if (typeof window.Razorpay === 'function') {
-        resolve(true);
-        return;
-      }
-      existing.addEventListener('load', () => resolve(typeof window.Razorpay === 'function'), {
-        once: true,
-      });
-      existing.addEventListener('error', () => resolve(false), { once: true });
-      return;
-    }
 
-    const script = document.createElement('script');
-    script.src = RAZORPAY_CHECKOUT_SCRIPT_SRC;
-    script.async = true;
-    script.onload = () => resolve(typeof window.Razorpay === 'function');
-    script.onerror = () => resolve(false);
-    document.body.appendChild(script);
+    const targetScript = existing || document.createElement('script');
+    const onLoad = () => finish(typeof window.Razorpay === 'function');
+    const onError = () => {
+      if (!existing && targetScript.parentNode) {
+        targetScript.parentNode.removeChild(targetScript);
+      }
+      finish(false);
+    };
+
+    targetScript.addEventListener('load', onLoad, { once: true });
+    targetScript.addEventListener('error', onError, { once: true });
+
+    timer = setTimeout(() => {
+      targetScript.removeEventListener('load', onLoad);
+      targetScript.removeEventListener('error', onError);
+      finish(typeof window.Razorpay === 'function');
+    }, Math.max(1000, timeoutMs));
+
+    if (!existing) {
+      targetScript.src = RAZORPAY_CHECKOUT_SCRIPT_SRC;
+      targetScript.async = true;
+      document.body.appendChild(targetScript);
+    } else if (typeof window.Razorpay === 'function') {
+      targetScript.removeEventListener('load', onLoad);
+      targetScript.removeEventListener('error', onError);
+      finish(true);
+    }
   });
 }
 
+export interface CreateRazorpayOrderItem {
+  productId: string;
+  variantId: string;
+  quantity: number;
+  expectedPricePaise?: number | null;
+}
+
 export interface CreateRazorpayOrderInput {
-  amount: number;
+  items: CreateRazorpayOrderItem[];
+  customer?: {
+    customerName: string;
+    customerEmail: string;
+    customerPhone: string;
+    shippingAddress: string;
+  };
   currency?: string;
   receipt?: string;
 }
@@ -93,7 +132,9 @@ export interface CreateRazorpayOrderResponse {
   order_id: string;
   amount: number;
   currency: string;
+  key_id: string;
   receipt?: string;
+  checkout_token?: string;
 }
 
 export async function createRazorpayOrder(
@@ -102,11 +143,11 @@ export async function createRazorpayOrder(
   | { ok: true; data: CreateRazorpayOrderResponse }
   | { ok: false; status: number; error: string }
 > {
-  if (!Number.isInteger(input.amount) || input.amount < 100) {
+  if (!Array.isArray(input.items) || input.items.length === 0) {
     return {
       ok: false,
       status: 400,
-      error: 'Order amount must be at least ₹1.00 (100 paise).',
+      error: 'Your shopping bag is empty.',
     };
   }
 
@@ -119,9 +160,10 @@ export async function createRazorpayOrder(
         Accept: 'application/json',
       },
       body: JSON.stringify({
-        amount: input.amount,
+        items: input.items,
+        customer: input.customer,
         currency: input.currency || 'INR',
-        receipt: input.receipt || `rcpt_${Date.now()}`,
+        receipt: input.receipt || `sc_rcpt_${Date.now()}`,
       }),
     });
 
@@ -143,7 +185,11 @@ export async function createRazorpayOrder(
         : typeof body.id === 'string'
           ? body.id
           : '';
-    if (!orderId) {
+    const keyId = typeof body.key_id === 'string' ? body.key_id.trim() : '';
+    const amount = typeof body.amount === 'number' ? Math.round(body.amount) : NaN;
+    const currency = typeof body.currency === 'string' ? body.currency.trim() : '';
+
+    if (!orderId || !keyId || !Number.isInteger(amount) || amount < 100 || !currency) {
       return {
         ok: false,
         status: 500,
@@ -155,9 +201,12 @@ export async function createRazorpayOrder(
       ok: true,
       data: {
         order_id: orderId,
-        amount: typeof body.amount === 'number' ? body.amount : input.amount,
-        currency: typeof body.currency === 'string' ? body.currency : input.currency || 'INR',
+        amount,
+        currency,
+        key_id: keyId,
         receipt: typeof body.receipt === 'string' ? body.receipt : input.receipt,
+        checkout_token:
+          typeof body.checkout_token === 'string' ? body.checkout_token : undefined,
       },
     };
   } catch (err) {
@@ -176,6 +225,7 @@ export interface VerifyRazorpayPaymentInput {
   razorpay_order_id: string;
   razorpay_payment_id: string;
   razorpay_signature: string;
+  checkout_token?: string;
   orderData?: {
     customerName: string;
     customerEmail: string;

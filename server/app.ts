@@ -47,6 +47,7 @@ import {
 } from './firebase-rest.ts';
 import { SqliteBoutiqueStore } from './sqlite-store.ts';
 import { StoreHttpError, type AdminBindingRow, type BoutiqueStore } from './store.ts';
+import type { RazorpayClientFactory } from './razorpay-checkout.ts';
 
 const SESSION_COOKIE_NAME = 'sc_session';
 const FIREBASE_SESSION_COOKIE_NAME = 'sc_fb_session';
@@ -68,6 +69,7 @@ export interface CreateAuthAppOptions {
   disableRateLimit?: boolean;
   appBaseUrl?: string;
   seedCatalog?: boolean;
+  razorpayClientFactory?: RazorpayClientFactory;
 }
 
 interface AuthedRequest extends Request {
@@ -2687,6 +2689,7 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     createSessionForUser,
     verifyPassword,
     serializePublicUser,
+    razorpayClientFactory: options.razorpayClientFactory,
   });
 
   const postOnlyMutationPaths = [

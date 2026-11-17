@@ -48,6 +48,7 @@ export function BagDrawer({
   onOrderCompleted,
 }: BagDrawerProps) {
   const drawerRef = useRef<HTMLDivElement>(null);
+  const checkoutInFlightRef = useRef(false);
   const prefersReducedMotion = usePrefersReducedMotion();
   const { user, apiRequest } = useAuth();
 
@@ -61,6 +62,7 @@ export function BagDrawer({
   const [checkoutOpen, setCheckoutOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
+  const [paymentErrorText, setPaymentErrorText] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<PlacedOrderReceipt | null>(null);
 
   const [customerName, setCustomerName] = useState('');
@@ -134,20 +136,21 @@ export function BagDrawer({
 
   const handlePlaceOrder = async (e: FormEvent) => {
     e.preventDefault();
-    if (submitting) return;
+    if (checkoutInFlightRef.current || submitting) return;
     setErrorText(null);
+    setPaymentErrorText(null);
+
+    if (items.length === 0) {
+      setPaymentErrorText('Your shopping bag is empty.');
+      return;
+    }
 
     if (displaySubtotalPaise < 100) {
-      setErrorText('Minimum order amount is ₹1.00 (100 paise).');
+      setPaymentErrorText('Minimum order amount is ₹1.00 (100 paise).');
       return;
     }
 
-    const razorpayKeyId = (import.meta.env.VITE_RAZORPAY_KEY_ID || '').trim();
-    if (!razorpayKeyId) {
-      setErrorText('Razorpay key is not configured (VITE_RAZORPAY_KEY_ID).');
-      return;
-    }
-
+    checkoutInFlightRef.current = true;
     setSubmitting(true);
 
     try {
@@ -163,68 +166,89 @@ export function BagDrawer({
         };
       });
 
-      const scriptLoaded = await ensureRazorpayCheckoutScript();
-      if (!scriptLoaded || typeof window.Razorpay !== 'function') {
-        setErrorText('Failed to load Razorpay Checkout SDK. Please check your connection and try again.');
-        setSubmitting(false);
-        return;
-      }
+      const customerDetails = {
+        customerName: customerName.trim(),
+        customerEmail: customerEmail.trim(),
+        customerPhone: customerPhone.trim(),
+        shippingAddress: shippingAddress.trim(),
+      };
 
-      const orderRes = await createRazorpayOrder({
-        amount: displaySubtotalPaise,
-        currency: 'INR',
-        receipt: `sc_rcpt_${Date.now()}`,
-      });
+      const [scriptLoaded, orderRes] = await Promise.all([
+        ensureRazorpayCheckoutScript(10_000),
+        createRazorpayOrder({
+          items: payloadItems,
+          customer: customerDetails,
+          currency: 'INR',
+          receipt: `sc_rcpt_${Date.now()}`,
+        }),
+      ]);
 
       if (!orderRes.ok) {
-        setErrorText(orderRes.error);
+        setPaymentErrorText(orderRes.error);
+        checkoutInFlightRef.current = false;
+        setSubmitting(false);
+        if (orderRes.status === 409) {
+          void revalidateBag();
+        }
+        return;
+      }
+
+      if (!scriptLoaded || typeof window.Razorpay !== 'function') {
+        setPaymentErrorText(
+          'Razorpay Checkout could not load in time. Please check your connection and try again.'
+        );
+        checkoutInFlightRef.current = false;
         setSubmitting(false);
         return;
       }
 
-      const { order_id, amount, currency } = orderRes.data;
+      const { order_id, amount, currency, key_id, checkout_token } = orderRes.data;
 
+      let settled = false;
       const rzp = new window.Razorpay({
-        key: razorpayKeyId,
+        key: key_id,
         amount,
         currency,
         name: 'Sahithi Collections',
         description: 'Boutique Order Checkout',
         order_id,
         prefill: {
-          name: customerName.trim(),
-          email: customerEmail.trim(),
-          contact: customerPhone.trim(),
+          name: customerDetails.customerName,
+          email: customerDetails.customerEmail,
+          contact: customerDetails.customerPhone,
         },
         theme: {
           color: '#49243E',
         },
         modal: {
           ondismiss: () => {
+            if (settled) return;
+            settled = true;
+            checkoutInFlightRef.current = false;
             setSubmitting(false);
-            setErrorText('Payment was cancelled. Your bag items are still saved.');
+            setPaymentErrorText('Payment was cancelled. Your bag items are still saved.');
           },
         },
         handler: async (paymentResponse) => {
+          settled = true;
           setSubmitting(true);
-          setErrorText(null);
+          setPaymentErrorText(null);
           const verifyRes = await verifyRazorpayPayment({
             razorpay_order_id: paymentResponse.razorpay_order_id,
             razorpay_payment_id: paymentResponse.razorpay_payment_id,
             razorpay_signature: paymentResponse.razorpay_signature,
+            checkout_token,
             orderData: {
-              customerName: customerName.trim(),
-              customerEmail: customerEmail.trim(),
-              customerPhone: customerPhone.trim(),
-              shippingAddress: shippingAddress.trim(),
+              ...customerDetails,
               items: payloadItems,
             },
           });
 
+          checkoutInFlightRef.current = false;
           setSubmitting(false);
 
           if (!verifyRes.ok) {
-            setErrorText(verifyRes.error);
+            setPaymentErrorText(verifyRes.error);
             void revalidateBag();
             return;
           }
@@ -269,18 +293,22 @@ export function BagDrawer({
       });
 
       rzp.on('payment.failed', (failure) => {
+        if (settled) return;
+        settled = true;
+        checkoutInFlightRef.current = false;
         setSubmitting(false);
         const failureMsg =
           failure?.error?.description ||
           failure?.error?.reason ||
           'Payment failed. Please try again with another payment method.';
-        setErrorText(failureMsg);
+        setPaymentErrorText(failureMsg);
       });
 
       rzp.open();
     } catch (err) {
+      checkoutInFlightRef.current = false;
       setSubmitting(false);
-      setErrorText(
+      setPaymentErrorText(
         err instanceof Error ? err.message : 'Something went wrong while starting payment.'
       );
     }
@@ -606,6 +634,18 @@ export function BagDrawer({
                           className="mt-1 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 p-3 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
                         />
                       </div>
+                      {paymentErrorText && (
+                        <div
+                          role="alert"
+                          className="flex items-start gap-2 rounded-xl border border-[#B76E79]/55 bg-[#F3D5DF]/45 p-3 text-xs text-[#49243E]"
+                        >
+                          <AlertTriangle
+                            className="mt-0.5 h-4 w-4 shrink-0 text-[#B76E79]"
+                            aria-hidden="true"
+                          />
+                          <span>{paymentErrorText}</span>
+                        </div>
+                      )}
                       <button
                         type="submit"
                         disabled={submitting || validating}
@@ -616,7 +656,11 @@ export function BagDrawer({
                         ) : (
                           <CreditCard className="h-4 w-4" aria-hidden="true" />
                         )}
-                        <span>Pay with Razorpay ({formatPaiseINR(displaySubtotalPaise)})</span>
+                        <span>
+                          {submitting
+                            ? 'Processing Payment…'
+                            : `Pay with Razorpay (${formatPaiseINR(displaySubtotalPaise)})`}
+                        </span>
                       </button>
                     </form>
                   )}
