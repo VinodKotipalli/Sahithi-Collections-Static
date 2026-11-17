@@ -4,7 +4,12 @@ import express from 'express';
 import multer from 'multer';
 import {
   handleCreateOrderRequest,
+  handleOrderStatusRequest,
+  handleRazorpayWebhookRequest,
+  handleRecoverRazorpayOrder,
   handleVerifyPaymentRequest,
+  validatePromoAndGiftCardForBag,
+  verifyBearerFirebaseTokenFromHeader,
   type RazorpayClientFactory,
 } from './razorpay-checkout.ts';
 import {
@@ -20,6 +25,11 @@ import {
   type CategoryRow,
   type ContactMessageRow,
   type ContactMessageStatus,
+  type CouponRow,
+  type CustomerAddressRow,
+  type CustomerNotificationRow,
+  type GiftCardRow,
+  type LoyaltyConfigData,
   type OrderWithItems,
   type ProductStatus,
   type ProductVariantRow,
@@ -60,6 +70,7 @@ export interface AuthedCatalogRequest extends Request {
   requestId?: string;
   authSession?: SessionRow;
   authUser?: UserRow;
+  rawBody?: string;
 }
 
 export interface ProductColorDTO {
@@ -329,18 +340,39 @@ function serializeCategory(cat: CategoryRow) {
 }
 
 function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
+  const statusHistory = parseJsonSafe<unknown[]>(o.status_history_json || '', []);
+  const returnRequest = parseJsonSafe<unknown | null>(o.return_request_json || '', null);
+  const paymentStatus = o.payment_status || 'pending';
+  const fulfillmentStatus =
+    o.fulfillment_status || (o.status === 'paid' ? 'confirmed' : o.status);
+
   return {
     id: o.id,
     orderNumber: o.order_number,
+    customerUserId: o.customer_user_id ?? null,
     customerName: o.customer_name,
     customerEmail: o.customer_email,
     customerPhone: o.customer_phone,
     shippingAddress: o.shipping_address,
     status: o.status,
+    paymentStatus,
+    fulfillmentStatus,
+    paymentMethod: (o.payment_method as 'razorpay' | 'cod') || (o.razorpay_order_id ? 'razorpay' : 'cod'),
+    razorpayOrderId: o.razorpay_order_id ?? null,
+    razorpayPaymentId: o.razorpay_payment_id ?? null,
+    couponCode: o.coupon_code ?? null,
+    giftCardCode: o.gift_card_code ?? null,
+    discountPaise: o.discount_paise || 0,
+    giftCardPaise: o.gift_card_paise || 0,
     subtotalPaise: o.subtotal_paise,
     totalPaise: o.total_paise,
+    subtotal: Number((o.subtotal_paise / 100).toFixed(2)),
+    total: Number((o.total_paise / 100).toFixed(2)),
     currency: o.currency,
+    statusHistory: Array.isArray(statusHistory) ? statusHistory : [],
+    returnRequest: returnRequest && typeof returnRequest === 'object' ? returnRequest : null,
     createdAt: o.created_at,
+    updatedAt: o.updated_at ?? o.created_at,
     items: items.map((it) => ({
       id: it.id,
       productId: it.product_id,
@@ -352,6 +384,74 @@ function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
       quantity: it.quantity,
       lineTotalPaise: it.line_total_paise,
     })),
+  };
+}
+
+function serializeCouponRow(c: CouponRow) {
+  return {
+    id: c.id,
+    code: c.code,
+    title: c.title,
+    description: c.description,
+    discountType: c.discount_type,
+    discountValue: c.discount_value,
+    maxDiscountPaise: c.max_discount_paise,
+    minSpendPaise: c.min_spend_paise,
+    usageLimit: c.usage_limit,
+    usedCount: c.used_count,
+    active: Boolean(c.active),
+    startsAt: c.starts_at,
+    expiresAt: c.expires_at,
+    createdAt: c.created_at,
+    updatedAt: c.updated_at,
+  };
+}
+
+function serializeGiftCardRow(g: GiftCardRow) {
+  return {
+    id: g.id,
+    code: g.code,
+    recipientEmail: g.recipient_email,
+    note: g.note,
+    initialBalancePaise: g.initial_balance_paise,
+    balancePaise: g.balance_paise,
+    active: Boolean(g.active),
+    expiresAt: g.expires_at,
+    lastUsedAt: g.last_used_at,
+    createdAt: g.created_at,
+    updatedAt: g.updated_at,
+  };
+}
+
+function serializeCustomerAddress(a: CustomerAddressRow) {
+  return {
+    id: a.id,
+    fullName: a.full_name,
+    phone: a.phone,
+    line1: a.line1,
+    line2: a.line2,
+    city: a.city,
+    state: a.state,
+    pincode: a.pincode,
+    landmark: a.landmark,
+    label: a.label,
+    isDefault: Boolean(a.is_default),
+    createdAt: a.created_at,
+    updatedAt: a.updated_at,
+  };
+}
+
+function serializeCustomerNotification(n: CustomerNotificationRow) {
+  return {
+    id: n.id,
+    type: n.type,
+    title: n.title,
+    message: n.message,
+    orderId: n.order_id,
+    orderNumber: n.order_number,
+    read: Boolean(n.is_read),
+    readAt: n.read_at,
+    createdAt: n.created_at,
   };
 }
 
@@ -921,6 +1021,41 @@ export function registerCatalogAndAdminRoutes(params: {
     }
   };
 
+  const requireCustomerAuth = async (
+    req: AuthedCatalogRequest,
+    res: Response,
+    next: NextFunction
+  ) => {
+    try {
+      if (req.authSession && req.authUser) {
+        return next();
+      }
+      const authHeader = req.get('authorization');
+      if (authHeader) {
+        const verified = await verifyBearerFirebaseTokenFromHeader(authHeader);
+        if (verified.ok && verified.uid) {
+          const matchedUser = await store.getUserById(verified.uid).catch(() => null);
+          const now = Date.now();
+          req.authUser = matchedUser || {
+            id: verified.uid,
+            full_name: 'Member',
+            email: verified.email || null,
+            email_verified: 1,
+            password_hash: 'firebase-managed',
+            phone_e164: null,
+            phone_verified: 0,
+            created_at: now,
+            updated_at: now,
+          };
+          return next();
+        }
+      }
+      return sendJsonError(req, res, 401, 'AUTH_REQUIRED', 'Authentication required.');
+    } catch (err) {
+      return next(err);
+    }
+  };
+
   app.use('/api/admin', (_req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow');
@@ -1351,20 +1486,41 @@ export function registerCatalogAndAdminRoutes(params: {
   });
 
   // -------------------------------------------------------------------------
-  // Razorpay Standard Web Checkout Endpoints (/api/create-order, /api/verify-payment)
+  // Razorpay Standard Web Checkout, Webhook, Order Status & Promo Validation
   // -------------------------------------------------------------------------
+
+  async function resolveCheckoutAuthContext(req: AuthedCatalogRequest): Promise<{
+    customerUserId: string | null;
+    customerIdToken: string | null;
+  }> {
+    const authHeader = req.get('authorization');
+    let customerIdToken: string | null = null;
+    let bearerUid: string | null = null;
+    if (authHeader && /^Bearer\s+(.+)$/i.test(authHeader)) {
+      const m = /^Bearer\s+(.+)$/i.exec(authHeader);
+      customerIdToken = m?.[1]?.trim() || null;
+      const verified = await verifyBearerFirebaseTokenFromHeader(authHeader);
+      bearerUid = verified.ok ? verified.uid : null;
+    }
+    return {
+      customerUserId: req.authUser?.id || bearerUid || null,
+      customerIdToken,
+    };
+  }
 
   app.post(
     '/api/create-order',
     async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
       try {
+        const authCtx = await resolveCheckoutAuthContext(req);
         const result = await handleCreateOrderRequest({
           body: (req.body && typeof req.body === 'object' ? req.body : {}) as Record<
             string,
             unknown
           >,
           store,
-          customerUserId: req.authUser?.id || null,
+          customerUserId: authCtx.customerUserId,
+          customerIdToken: authCtx.customerIdToken,
           razorpayClientFactory,
         });
         return res.status(result.status).json(result.body);
@@ -1378,16 +1534,519 @@ export function registerCatalogAndAdminRoutes(params: {
     '/api/verify-payment',
     async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
       try {
+        const authCtx = await resolveCheckoutAuthContext(req);
         const result = await handleVerifyPaymentRequest({
           body: (req.body && typeof req.body === 'object' ? req.body : {}) as Record<
             string,
             unknown
           >,
           store,
-          customerUserId: req.authUser?.id || null,
+          customerUserId: authCtx.customerUserId,
+          customerIdToken: authCtx.customerIdToken,
           razorpayClientFactory,
         });
         return res.status(result.status).json(result.body);
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/razorpay-webhook',
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const rawBody =
+          typeof req.rawBody === 'string' && req.rawBody
+            ? req.rawBody
+            : JSON.stringify(req.body || {});
+        const result = await handleRazorpayWebhookRequest({
+          rawBody,
+          signatureHeader: req.get('x-razorpay-signature'),
+          store,
+          razorpayClientFactory,
+        });
+        return res.status(result.status).json(result.body);
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  const handleOrderStatusHttp = async (
+    req: AuthedCatalogRequest,
+    res: Response,
+    next: NextFunction
+  ) => {
+    try {
+      const authCtx = await resolveCheckoutAuthContext(req);
+      const qOid =
+        typeof req.query.razorpay_order_id === 'string'
+          ? req.query.razorpay_order_id
+          : typeof req.query.order_id === 'string'
+            ? req.query.order_id
+            : '';
+      const qPid =
+        typeof req.query.razorpay_payment_id === 'string'
+          ? req.query.razorpay_payment_id
+          : typeof req.query.payment_id === 'string'
+            ? req.query.payment_id
+            : '';
+      const bodyObj = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<
+        string,
+        unknown
+      >;
+      const razorpayOrderId =
+        typeof bodyObj.razorpay_order_id === 'string'
+          ? bodyObj.razorpay_order_id
+          : typeof bodyObj.order_id === 'string'
+            ? bodyObj.order_id
+            : qOid;
+      const razorpayPaymentId =
+        typeof bodyObj.razorpay_payment_id === 'string'
+          ? bodyObj.razorpay_payment_id
+          : typeof bodyObj.payment_id === 'string'
+            ? bodyObj.payment_id
+            : qPid;
+
+      const result = await handleOrderStatusRequest({
+        razorpayOrderId,
+        razorpayPaymentId,
+        store,
+        customerUserId: authCtx.customerUserId,
+        customerIdToken: authCtx.customerIdToken,
+        razorpayClientFactory,
+      });
+      return res.status(result.status).json(result.body);
+    } catch (err) {
+      return next(err);
+    }
+  };
+
+  app.get('/api/order-status', handleOrderStatusHttp);
+  app.post('/api/order-status', handleOrderStatusHttp);
+
+  app.post(
+    '/api/coupons/validate',
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const subtotalPaise = Math.max(
+          0,
+          Math.round(Number(req.body?.subtotalPaise ?? 0) || 0)
+        );
+        const couponCode =
+          typeof req.body?.couponCode === 'string'
+            ? req.body.couponCode
+            : typeof req.body?.code === 'string'
+              ? req.body.code
+              : '';
+        const giftCardCode =
+          typeof req.body?.giftCardCode === 'string' ? req.body.giftCardCode : '';
+        if (!couponCode.trim() && !giftCardCode.trim()) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Enter a coupon or gift card code to apply.'
+          );
+        }
+        const result = await validatePromoAndGiftCardForBag({
+          subtotalPaise,
+          couponCode: couponCode.trim() || null,
+          giftCardCode: giftCardCode.trim() || null,
+          store,
+          ensurePayableMinimum: false,
+        });
+        return res.json({
+          valid: true,
+          ...result,
+        });
+      } catch (err) {
+        if (err instanceof StoreHttpError) {
+          return sendJsonError(req, res, err.httpStatus, err.code, err.message);
+        }
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/gift-cards/check',
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const rawCode = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase() : '';
+        if (!rawCode || rawCode.length < 4) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Enter a valid Sahithi Gift Card code.'
+          );
+        }
+        const gc = await store.getGiftCardByCode(rawCode);
+        if (!gc) {
+          return sendJsonError(
+            req,
+            res,
+            404,
+            'GIFT_CARD_NOT_FOUND',
+            `Gift card "${rawCode}" was not found.`
+          );
+        }
+        if (!gc.active) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'GIFT_CARD_INACTIVE',
+            `Gift card "${rawCode}" is inactive.`
+          );
+        }
+        if (gc.expires_at && Date.now() > gc.expires_at) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'GIFT_CARD_EXPIRED',
+            `Gift card "${rawCode}" expired on ${new Date(gc.expires_at).toLocaleDateString('en-IN')}.`
+          );
+        }
+        return res.json({ giftCard: serializeGiftCardRow(gc) });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Customer "Your Account" Endpoints (/api/account/*)
+  // -------------------------------------------------------------------------
+
+  app.get(
+    '/api/account/orders',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const orders = await store.listCustomerOrders(req.authUser!.id);
+        return res.json({
+          items: orders.map((o) => serializeOrderWithItems(o)),
+        });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/account/orders/:id/request',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const orderId = String(req.params.id || '');
+        const reqType = req.body?.type === 'cancel' ? 'cancel' : req.body?.type === 'return' ? 'return' : null;
+        const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+        if (!reqType) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Request type must be "cancel" or "return".'
+          );
+        }
+        if (reason.length < 5 || reason.length > 500) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Please provide a reason between 5 and 500 characters.'
+          );
+        }
+        const existing = await store.getOrderById(orderId);
+        if (!existing) {
+          return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
+        }
+        if (existing.order.customer_user_id !== req.authUser!.id) {
+          return sendJsonError(
+            req,
+            res,
+            403,
+            'FORBIDDEN',
+            'You can only submit requests for your own orders.'
+          );
+        }
+        const updated = await store.submitOrderReturnRequest({
+          orderId,
+          userId: req.authUser!.id,
+          type: reqType,
+          reason,
+        });
+        if (!updated) {
+          return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
+        }
+        return res.json({ order: serializeOrderWithItems(updated) });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.get(
+    '/api/account/addresses',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const addresses = await store.listCustomerAddresses(req.authUser!.id);
+        return res.json({ items: addresses.map((a) => serializeCustomerAddress(a)) });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  const handleSaveAddress = async (
+    req: AuthedCatalogRequest,
+    res: Response,
+    next: NextFunction,
+    fixedId?: string
+  ) => {
+    try {
+      const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim() : '';
+      const phone = typeof req.body?.phone === 'string' ? req.body.phone.trim() : '';
+      const line1 = typeof req.body?.line1 === 'string' ? req.body.line1.trim() : '';
+      const line2 = typeof req.body?.line2 === 'string' ? req.body.line2.trim() : '';
+      const city = typeof req.body?.city === 'string' ? req.body.city.trim() : '';
+      const state = typeof req.body?.state === 'string' ? req.body.state.trim() : '';
+      const pincode = typeof req.body?.pincode === 'string' ? req.body.pincode.trim() : '';
+      const landmark = typeof req.body?.landmark === 'string' ? req.body.landmark.trim() : '';
+      const label =
+        req.body?.label === 'Work' || req.body?.label === 'Other' ? req.body.label : 'Home';
+      const isDefault = Boolean(req.body?.isDefault);
+
+      if (fullName.length < 2 || phone.length < 7 || line1.length < 5 || city.length < 2 || state.length < 2 || pincode.length < 4) {
+        return sendJsonError(
+          req,
+          res,
+          400,
+          'VALIDATION_ERROR',
+          'Please complete recipient name, phone, street address, city, state, and PIN code.'
+        );
+      }
+
+      const saved = await store.upsertCustomerAddress(req.authUser!.id, {
+        id: fixedId || (typeof req.body?.id === 'string' ? req.body.id.trim() : undefined),
+        fullName,
+        phone,
+        line1,
+        line2,
+        city,
+        state,
+        pincode,
+        landmark,
+        label,
+        isDefault,
+      });
+      return res.json({ address: serializeCustomerAddress(saved) });
+    } catch (err) {
+      return next(err);
+    }
+  };
+
+  app.post('/api/account/addresses', requireCustomerAuth, (req, res, next) =>
+    handleSaveAddress(req, res, next)
+  );
+  app.patch('/api/account/addresses/:id', requireCustomerAuth, (req, res, next) =>
+    handleSaveAddress(req, res, next, String(req.params.id || ''))
+  );
+
+  app.delete(
+    '/api/account/addresses/:id',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const deleted = await store.deleteCustomerAddress(
+          req.authUser!.id,
+          String(req.params.id || '')
+        );
+        if (!deleted) {
+          return sendJsonError(req, res, 404, 'ADDRESS_NOT_FOUND', 'Saved address not found.');
+        }
+        return res.json({ deletedId: String(req.params.id || ''), ok: true });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.get(
+    '/api/account/wishlist',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const productIds = await store.getCustomerWishlist(req.authUser!.id);
+        return res.json({ productIds });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.put(
+    '/api/account/wishlist',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const rawIds = Array.isArray(req.body?.productIds) ? req.body.productIds : [];
+        const cleanIds = rawIds.filter(
+          (id: unknown): id is string => typeof id === 'string' && id.trim().length > 0
+        );
+        const productIds = await store.setCustomerWishlist(req.authUser!.id, cleanIds);
+        return res.json({ productIds });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.get(
+    '/api/account/notifications',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const rows = await store.listCustomerNotifications(req.authUser!.id);
+        const items = rows.map((n) => serializeCustomerNotification(n));
+        return res.json({
+          items,
+          unreadCount: items.filter((n) => !n.read).length,
+        });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.patch(
+    '/api/account/notifications/:id/read',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const ok = await store.markCustomerNotificationRead(
+          req.authUser!.id,
+          String(req.params.id || '')
+        );
+        if (!ok) {
+          return sendJsonError(
+            req,
+            res,
+            404,
+            'NOTIFICATION_NOT_FOUND',
+            'Notification not found.'
+          );
+        }
+        return res.json({ ok: true, id: String(req.params.id || '') });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/account/notifications/read-all',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        await store.markAllCustomerNotificationsRead(req.authUser!.id);
+        return res.json({ ok: true });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.get(
+    '/api/account/coupons',
+    requireCustomerAuth,
+    async (_req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const now = Date.now();
+        const rows = await store.listCoupons(true);
+        const available = rows.filter(
+          (c) =>
+            (!c.starts_at || now >= c.starts_at) &&
+            (!c.expires_at || now <= c.expires_at) &&
+            (c.usage_limit === null || c.used_count < c.usage_limit)
+        );
+        return res.json({ items: available.map((c) => serializeCouponRow(c)) });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.get(
+    '/api/account/rewards',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const [config, orders] = await Promise.all([
+          store.getLoyaltyConfig(),
+          store.listCustomerOrders(req.authUser!.id),
+        ]);
+        const qualifyingOrders = orders.filter(
+          (entry) =>
+            (entry.order.payment_status || '').toLowerCase() === 'paid' &&
+            !['cancelled', 'returned'].includes((entry.order.fulfillment_status || entry.order.status).toLowerCase())
+        );
+        const lifetimeSpendPaise = qualifyingOrders.reduce(
+          (sum, entry) => sum + Number(entry.order.total_paise || 0),
+          0
+        );
+        const deliveredOrdersCount = orders.filter(
+          (entry) =>
+            (entry.order.fulfillment_status || entry.order.status).toLowerCase() === 'delivered'
+        ).length;
+        const pointsBalance = config.rewardsEnabled
+          ? Math.floor((lifetimeSpendPaise / 10_000) * Math.max(0, config.pointsPerHundredInr))
+          : 0;
+        const threshold = Math.max(100, config.plusQualificationSpendPaise || 1_000_000);
+        const isPlusMember = config.plusEnabled && lifetimeSpendPaise >= threshold;
+
+        return res.json({
+          config,
+          pointsBalance,
+          lifetimeEarnedPoints: pointsBalance,
+          lifetimeSpendPaise,
+          deliveredOrdersCount,
+          isPlusMember,
+          plusStatusLabel: !config.plusEnabled
+            ? 'Program paused'
+            : isPlusMember
+              ? `${config.plusTierName} Active`
+              : `${config.plusTierName} Eligible at ₹${(threshold / 100).toLocaleString('en-IN')}`,
+          plusProgressPaise: Math.min(threshold, lifetimeSpendPaise),
+        });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.get(
+    '/api/account/payment-methods',
+    requireCustomerAuth,
+    async (_req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        // Honest Saved Cards & Wallet availability: standard Razorpay Checkout handles UPI, cards, and wallets securely per payment without storing PANs locally.
+        return res.json({
+          enabled: false,
+          provider: 'razorpay',
+          reason:
+            'Sahithi Collections uses PCI-compliant Razorpay Standard Checkout. Saved card tokens require Razorpay Customer Vault configuration; all UPI, Cards, Wallets, and NetBanking options remain available at checkout.',
+          methods: [],
+        });
       } catch (err) {
         return next(err);
       }
@@ -2245,7 +2904,17 @@ export function registerCatalogAndAdminRoutes(params: {
       try {
         const id = String(req.params.id || '');
         const nextStatus = typeof req.body?.status === 'string' ? req.body.status.trim() : '';
-        const allowed = new Set(['pending', 'confirmed', 'shipped', 'delivered', 'cancelled']);
+        const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
+        const allowed = new Set([
+          'pending',
+          'confirmed',
+          'packed',
+          'shipped',
+          'delivered',
+          'cancelled',
+          'return_requested',
+          'returned',
+        ]);
         if (!allowed.has(nextStatus)) {
           return sendJsonError(
             req,
@@ -2256,12 +2925,461 @@ export function registerCatalogAndAdminRoutes(params: {
           );
         }
 
-        const updated = await store.updateOrderStatus(id, nextStatus);
+        const updated = await store.updateOrderStatusWithHistory(id, nextStatus, {
+          actor: 'owner',
+          note: note || undefined,
+          notifyCustomer: true,
+        });
         if (!updated) {
           return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
         }
 
-        return res.json({ id, status: nextStatus });
+        return res.json({
+          id,
+          status: updated.order.status,
+          order: serializeOrderWithItems(updated),
+        });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/admin/orders/:id/resolve-request',
+    requireOwner,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const id = String(req.params.id || '');
+        const decision =
+          req.body?.decision === 'approved' || req.body?.decision === 'rejected'
+            ? req.body.decision
+            : null;
+        if (!decision) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Decision must be "approved" or "rejected".'
+          );
+        }
+        const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
+        const resolved = await store.resolveOrderReturnRequest({
+          orderId: id,
+          decision,
+          note: note || undefined,
+        });
+        if (!resolved) {
+          return sendJsonError(
+            req,
+            res,
+            404,
+            'ORDER_OR_REQUEST_NOT_FOUND',
+            'Order or pending return/cancel request not found.'
+          );
+        }
+        return res.json({ order: serializeOrderWithItems(resolved) });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/admin/orders/recover',
+    requireOwner,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const razorpayOrderId =
+          typeof req.body?.razorpayOrderId === 'string'
+            ? req.body.razorpayOrderId.trim()
+            : typeof req.body?.razorpay_order_id === 'string'
+              ? req.body.razorpay_order_id.trim()
+              : '';
+        const razorpayPaymentId =
+          typeof req.body?.razorpayPaymentId === 'string'
+            ? req.body.razorpayPaymentId.trim()
+            : typeof req.body?.razorpay_payment_id === 'string'
+              ? req.body.razorpay_payment_id.trim()
+              : '';
+        const customerFallback =
+          req.body?.customer && typeof req.body.customer === 'object'
+            ? {
+                customerName: String((req.body.customer as Record<string, unknown>).customerName || ''),
+                customerEmail: String((req.body.customer as Record<string, unknown>).customerEmail || ''),
+                customerPhone: String((req.body.customer as Record<string, unknown>).customerPhone || ''),
+                shippingAddress: String((req.body.customer as Record<string, unknown>).shippingAddress || ''),
+              }
+            : null;
+
+        const result = await handleRecoverRazorpayOrder({
+          razorpayOrderId,
+          razorpayPaymentId,
+          customerFallback:
+            customerFallback && customerFallback.customerEmail ? customerFallback : null,
+          store,
+          razorpayClientFactory,
+        });
+        return res.status(result.status).json(result.body);
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  // Admin Coupons, Gift Cards, Loyalty & Activity
+  app.get(
+    '/api/admin/coupons',
+    requireOwner,
+    async (_req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const items = await store.listCoupons(false);
+        return res.json({ items: items.map((c) => serializeCouponRow(c)) });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  const handleUpsertCoupon = async (
+    req: AuthedCatalogRequest,
+    res: Response,
+    next: NextFunction,
+    fixedId?: string
+  ) => {
+    try {
+      const code = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase() : '';
+      const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+      const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
+      const discountType = req.body?.discountType === 'flat_paise' ? 'flat_paise' : 'percent';
+      const discountValue = Math.round(Number(req.body?.discountValue ?? 0));
+      const maxDiscountPaise =
+        req.body?.maxDiscountPaise !== undefined && req.body?.maxDiscountPaise !== null && req.body?.maxDiscountPaise !== ''
+          ? Math.max(0, Math.round(Number(req.body.maxDiscountPaise)))
+          : null;
+      const minSpendPaise = Math.max(0, Math.round(Number(req.body?.minSpendPaise ?? 0) || 0));
+      const usageLimit =
+        req.body?.usageLimit !== undefined && req.body?.usageLimit !== null && req.body?.usageLimit !== ''
+          ? Math.max(1, Math.round(Number(req.body.usageLimit)))
+          : null;
+      const active = req.body?.active !== undefined ? Boolean(req.body.active) : true;
+      const startsAt = req.body?.startsAt ? Number(req.body.startsAt) : null;
+      const expiresAt = req.body?.expiresAt ? Number(req.body.expiresAt) : null;
+
+      if (!/^[A-Z0-9_-]{3,32}$/.test(code) || !title || !Number.isFinite(discountValue) || discountValue <= 0) {
+        return sendJsonError(
+          req,
+          res,
+          400,
+          'VALIDATION_ERROR',
+          'Provide a valid alphanumeric coupon code (3–32 chars), title, and discount value.'
+        );
+      }
+      if (discountType === 'percent' && discountValue > 90) {
+        return sendJsonError(
+          req,
+          res,
+          400,
+          'VALIDATION_ERROR',
+          'Percentage discount cannot exceed 90%.'
+        );
+      }
+      const saved = await store.upsertCoupon({
+        id: fixedId,
+        code,
+        title,
+        description,
+        discountType,
+        discountValue,
+        maxDiscountPaise,
+        minSpendPaise,
+        usageLimit,
+        active,
+        startsAt,
+        expiresAt,
+      });
+      return res.json({ coupon: serializeCouponRow(saved) });
+    } catch (err) {
+      return next(err);
+    }
+  };
+
+  app.post('/api/admin/coupons', requireOwner, (req, res, next) =>
+    handleUpsertCoupon(req, res, next)
+  );
+  app.put('/api/admin/coupons/:id', requireOwner, (req, res, next) =>
+    handleUpsertCoupon(req, res, next, String(req.params.id || ''))
+  );
+  app.delete(
+    '/api/admin/coupons/:id',
+    requireOwner,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const deleted = await store.deleteCoupon(String(req.params.id || ''));
+        if (!deleted) {
+          return sendJsonError(req, res, 404, 'COUPON_NOT_FOUND', 'Coupon not found.');
+        }
+        return res.json({ deletedId: String(req.params.id || ''), ok: true });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.get(
+    '/api/admin/gift-cards',
+    requireOwner,
+    async (_req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const items = await store.listGiftCards();
+        return res.json({ items: items.map((g) => serializeGiftCardRow(g)) });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  const handleUpsertGiftCard = async (
+    req: AuthedCatalogRequest,
+    res: Response,
+    next: NextFunction,
+    fixedId?: string
+  ) => {
+    try {
+      const code = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase() : '';
+      const recipientEmail =
+        typeof req.body?.recipientEmail === 'string' ? req.body.recipientEmail.trim().toLowerCase() : '';
+      const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
+      const initialBalancePaise = Math.round(Number(req.body?.initialBalancePaise ?? 0));
+      const balancePaise =
+        req.body?.balancePaise !== undefined
+          ? Math.round(Number(req.body.balancePaise))
+          : initialBalancePaise;
+      const active = req.body?.active !== undefined ? Boolean(req.body.active) : true;
+      const expiresAt = req.body?.expiresAt ? Number(req.body.expiresAt) : null;
+
+      if (!/^[A-Z0-9_-]{4,36}$/.test(code) || !Number.isFinite(initialBalancePaise) || initialBalancePaise < 100 || !Number.isFinite(balancePaise) || balancePaise < 0) {
+        return sendJsonError(
+          req,
+          res,
+          400,
+          'VALIDATION_ERROR',
+          'Provide a valid gift card code (4–36 chars) and positive INR balance.'
+        );
+      }
+      const saved = await store.upsertGiftCard({
+        id: fixedId,
+        code,
+        recipientEmail,
+        note,
+        initialBalancePaise,
+        balancePaise,
+        active,
+        expiresAt,
+      });
+      return res.json({ giftCard: serializeGiftCardRow(saved) });
+    } catch (err) {
+      return next(err);
+    }
+  };
+
+  app.post('/api/admin/gift-cards', requireOwner, (req, res, next) =>
+    handleUpsertGiftCard(req, res, next)
+  );
+  app.put('/api/admin/gift-cards/:id', requireOwner, (req, res, next) =>
+    handleUpsertGiftCard(req, res, next, String(req.params.id || ''))
+  );
+  app.delete(
+    '/api/admin/gift-cards/:id',
+    requireOwner,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const deleted = await store.deleteGiftCard(String(req.params.id || ''));
+        if (!deleted) {
+          return sendJsonError(req, res, 404, 'GIFT_CARD_NOT_FOUND', 'Gift card not found.');
+        }
+        return res.json({ deletedId: String(req.params.id || ''), ok: true });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.get(
+    '/api/admin/loyalty',
+    requireOwner,
+    async (_req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const config = await store.getLoyaltyConfig();
+        return res.json({ config });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.put(
+    '/api/admin/loyalty',
+    requireOwner,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const current = await store.getLoyaltyConfig();
+        const body = (req.body?.config && typeof req.body.config === 'object' ? req.body.config : req.body || {}) as Partial<LoyaltyConfigData>;
+        const nextConfig: LoyaltyConfigData = {
+          rewardsEnabled: body.rewardsEnabled !== undefined ? Boolean(body.rewardsEnabled) : current.rewardsEnabled,
+          pointsPerHundredInr:
+            typeof body.pointsPerHundredInr === 'number' && Number.isFinite(body.pointsPerHundredInr)
+              ? Math.max(0, Math.min(100, Math.round(body.pointsPerHundredInr)))
+              : current.pointsPerHundredInr,
+          rupeeValuePerPointPaise:
+            typeof body.rupeeValuePerPointPaise === 'number' && Number.isFinite(body.rupeeValuePerPointPaise)
+              ? Math.max(0, Math.min(5000, Math.round(body.rupeeValuePerPointPaise)))
+              : current.rupeeValuePerPointPaise,
+          plusEnabled: body.plusEnabled !== undefined ? Boolean(body.plusEnabled) : current.plusEnabled,
+          plusTierName:
+            typeof body.plusTierName === 'string' && body.plusTierName.trim()
+              ? body.plusTierName.trim().slice(0, 60)
+              : current.plusTierName,
+          plusQualificationSpendPaise:
+            typeof body.plusQualificationSpendPaise === 'number' && Number.isFinite(body.plusQualificationSpendPaise)
+              ? Math.max(100, Math.round(body.plusQualificationSpendPaise))
+              : current.plusQualificationSpendPaise,
+          plusBenefits: Array.isArray(body.plusBenefits)
+            ? body.plusBenefits
+                .filter((b): b is string => typeof b === 'string' && b.trim().length > 0)
+                .map((b) => b.trim().slice(0, 140))
+            : current.plusBenefits,
+          giftCardsEnabled: body.giftCardsEnabled !== undefined ? Boolean(body.giftCardsEnabled) : current.giftCardsEnabled,
+        };
+        const saved = await store.saveLoyaltyConfig(nextConfig);
+        return res.json({ config: saved });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.get(
+    '/api/admin/activity',
+    requireOwner,
+    async (_req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const [users, ordersPage, messagesPage, coupons, giftCards] = await Promise.all([
+          store.listUsersSummary(),
+          store.listAdminOrders(1, 30),
+          store.listAdminMessages({ page: 1, pageSize: 30 }),
+          store.listCoupons(false),
+          store.listGiftCards(),
+        ]);
+
+        const events: Array<{
+          id: string;
+          type: 'registration' | 'order' | 'enquiry' | 'return_request' | 'coupon_redemption' | 'gift_card';
+          title: string;
+          detail: string;
+          actorLabel: string;
+          refId?: string;
+          status?: string;
+          createdAt: number;
+        }> = [];
+
+        for (const u of users) {
+          events.push({
+            id: `reg_${u.id}`,
+            type: 'registration',
+            title: 'Customer Registered',
+            detail: `${u.fullName || 'Member'} (${u.email})`,
+            actorLabel: u.email,
+            refId: u.id,
+            status: u.emailVerified ? 'verified' : 'pending',
+            createdAt: u.createdAt,
+          });
+        }
+
+        const returnRequests: Array<{
+          orderId: string;
+          orderNumber: string;
+          customerName: string;
+          customerEmail: string;
+          totalPaise: number;
+          request: unknown;
+        }> = [];
+
+        for (const entry of ordersPage.items) {
+          const serialized = serializeOrderWithItems(entry);
+          events.push({
+            id: `ord_${serialized.id}`,
+            type: 'order',
+            title: `Order ${serialized.orderNumber}`,
+            detail: `${serialized.paymentStatus} · ${serialized.fulfillmentStatus} · ₹${(serialized.totalPaise / 100).toLocaleString('en-IN')}`,
+            actorLabel: serialized.customerEmail,
+            refId: serialized.id,
+            status: serialized.fulfillmentStatus,
+            createdAt: serialized.createdAt,
+          });
+          if (serialized.returnRequest) {
+            const rr = serialized.returnRequest as {
+              id?: string;
+              type?: string;
+              reason?: string;
+              status?: string;
+              requestedAt?: number;
+            };
+            returnRequests.push({
+              orderId: serialized.id,
+              orderNumber: serialized.orderNumber,
+              customerName: serialized.customerName,
+              customerEmail: serialized.customerEmail,
+              totalPaise: serialized.totalPaise,
+              request: rr,
+            });
+            events.push({
+              id: `ret_${rr.id || serialized.id}`,
+              type: 'return_request',
+              title: `${rr.type === 'cancel' ? 'Cancellation' : 'Return'} Request (${serialized.orderNumber})`,
+              detail: rr.reason || '',
+              actorLabel: serialized.customerEmail,
+              refId: serialized.id,
+              status: rr.status || 'pending',
+              createdAt: rr.requestedAt || serialized.updatedAt,
+            });
+          }
+          if (serialized.couponCode) {
+            events.push({
+              id: `cpn_${serialized.id}`,
+              type: 'coupon_redemption',
+              title: `Coupon ${serialized.couponCode} Redeemed`,
+              detail: `Saved ₹${((serialized.discountPaise || 0) / 100).toLocaleString('en-IN')} on ${serialized.orderNumber}`,
+              actorLabel: serialized.customerEmail,
+              refId: serialized.id,
+              createdAt: serialized.createdAt,
+            });
+          }
+        }
+
+        for (const msg of messagesPage.items) {
+          events.push({
+            id: `msg_${msg.id}`,
+            type: 'enquiry',
+            title: `Enquiry: ${msg.subject}`,
+            detail: msg.message.slice(0, 140),
+            actorLabel: msg.sender_email || msg.sender_name,
+            refId: msg.id,
+            status: msg.status,
+            createdAt: msg.created_at,
+          });
+        }
+
+        events.sort((a, b) => b.createdAt - a.createdAt);
+
+        return res.json({
+          users,
+          returnRequests,
+          events: events.slice(0, 60),
+          coupons: coupons.map((c) => serializeCouponRow(c)),
+          giftCards: giftCards.map((g) => serializeGiftCardRow(g)),
+        });
       } catch (err) {
         return next(err);
       }

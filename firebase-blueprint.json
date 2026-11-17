@@ -91,12 +91,75 @@
         "created_at": { "type": "number" }
       },
       "required": ["id", "sender_email", "status", "created_at"]
+    },
+    "CustomerAddress": {
+      "title": "CustomerAddress",
+      "description": "Saved customer delivery address.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "full_name": { "type": "string" },
+        "phone": { "type": "string" },
+        "line1": { "type": "string" },
+        "city": { "type": "string" },
+        "state": { "type": "string" },
+        "pincode": { "type": "string" },
+        "is_default": { "type": "boolean" }
+      },
+      "required": ["id", "full_name", "phone", "line1", "city", "state", "pincode"]
+    },
+    "CustomerNotification": {
+      "title": "CustomerNotification",
+      "description": "Order & account notification for signed-in customers.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string" },
+        "title": { "type": "string" },
+        "message": { "type": "string" },
+        "read": { "type": "boolean" },
+        "created_at": { "type": "number" }
+      },
+      "required": ["id", "type", "title", "message", "read", "created_at"]
+    },
+    "Coupon": {
+      "title": "Coupon",
+      "description": "Storefront promotional coupon validated server-side.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "code": { "type": "string" },
+        "discount_type": { "type": "string", "enum": ["percent", "flat_paise"] },
+        "discount_value": { "type": "number" },
+        "active": { "type": "boolean" }
+      },
+      "required": ["id", "code", "discount_type", "discount_value", "active"]
+    },
+    "GiftCard": {
+      "title": "GiftCard",
+      "description": "Boutique gift card with server-verified balance.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "code": { "type": "string" },
+        "balance_paise": { "type": "number" },
+        "active": { "type": "boolean" }
+      },
+      "required": ["id", "code", "balance_paise", "active"]
     }
   },
   "firestore": {
     "/environments/{envKey}/users/{userId}": {
       "schema": { "$ref": "#/entities/EnvironmentUser" },
       "description": "Environment-isolated server-managed user accounts."
+    },
+    "/environments/{envKey}/users/{userId}/addresses/{addressId}": {
+      "schema": { "$ref": "#/entities/CustomerAddress" },
+      "description": "Private customer saved delivery addresses."
+    },
+    "/environments/{envKey}/users/{userId}/notifications/{notifId}": {
+      "schema": { "$ref": "#/entities/CustomerNotification" },
+      "description": "Private customer order and account notifications."
     },
     "/environments/{envKey}/admin_bindings/{bindingId}": {
       "schema": { "$ref": "#/entities/AdminBinding" },
@@ -109,6 +172,14 @@
     "/environments/{envKey}/orders/{orderId}": {
       "schema": { "$ref": "#/entities/Order" },
       "description": "Customer orders validated and persisted by backend APIs."
+    },
+    "/environments/{envKey}/coupons/{couponId}": {
+      "schema": { "$ref": "#/entities/Coupon" },
+      "description": "Storefront promo coupons."
+    },
+    "/environments/{envKey}/gift_cards/{cardId}": {
+      "schema": { "$ref": "#/entities/GiftCard" },
+      "description": "Storefront gift cards."
     },
     "/environments/{envKey}/categories/{categoryId}": {
       "schema": { "$ref": "#/entities/Category" },

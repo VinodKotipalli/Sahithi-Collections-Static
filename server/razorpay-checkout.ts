@@ -3,7 +3,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Razorpay from 'razorpay';
 import { PRODUCTS } from '../src/config/products.ts';
-import { StoreHttpError, type BoutiqueStore, type PlaceOrderInput } from './store.ts';
+import { verifyFirebaseIdToken } from './firebase-rest.ts';
+import {
+  StoreHttpError,
+  type BoutiqueStore,
+  type CouponRow,
+  type GiftCardRow,
+  type OrderStatusHistoryEntry,
+  type PendingCheckoutRow,
+  type PlaceOrderInput,
+} from './store.ts';
 
 const MIN_PRICE_PAISE = 100;
 const CHECKOUT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
@@ -47,6 +56,7 @@ export interface RazorpayOrderEntity {
   currency?: string;
   receipt?: string;
   status?: string;
+  notes?: Record<string, string>;
 }
 
 export interface RazorpayPaymentEntity {
@@ -56,6 +66,9 @@ export interface RazorpayPaymentEntity {
   currency?: string;
   status?: string;
   captured?: boolean;
+  email?: string;
+  contact?: string;
+  notes?: Record<string, string>;
 }
 
 export interface RazorpayClientLike {
@@ -67,6 +80,7 @@ export interface RazorpayClientLike {
       notes?: Record<string, string>;
     }) => Promise<RazorpayOrderEntity>;
     fetch: (orderId: string) => Promise<RazorpayOrderEntity>;
+    fetchPayments?: (orderId: string) => Promise<{ items?: RazorpayPaymentEntity[] }>;
   };
   payments: {
     fetch: (paymentId: string) => Promise<RazorpayPaymentEntity>;
@@ -82,6 +96,10 @@ export type RazorpayClientFactory = (
   keyId: string,
   keySecret: string
 ) => RazorpayClientLike;
+
+export type IdTokenVerifierFn = (
+  token: string
+) => Promise<{ uid: string; email?: string } | null>;
 
 export interface CartLineInput {
   productId: string;
@@ -111,14 +129,22 @@ export interface OrderCustomerDetails {
 export interface SerializedOrderReceipt {
   id: string;
   orderNumber: string;
+  customerUserId?: string | null;
   status: string;
+  paymentStatus: string;
+  fulfillmentStatus: string;
   subtotalPaise: number;
+  discountPaise: number;
+  giftCardPaise: number;
+  couponCode: string | null;
+  giftCardCode: string | null;
   totalPaise: number;
   currency: string;
   createdAt: number;
   paymentMethod: 'razorpay';
   razorpayOrderId: string;
   razorpayPaymentId: string;
+  statusHistory: OrderStatusHistoryEntry[];
   items: Array<{
     productId: string;
     variantId: string | null;
@@ -134,12 +160,17 @@ export interface SerializedOrderReceipt {
 interface PendingCheckoutRecord {
   razorpayOrderId: string;
   amountPaise: number;
+  subtotalPaise: number;
+  discountPaise: number;
+  giftCardPaise: number;
+  couponCode: string | null;
+  giftCardCode: string | null;
   currency: string;
   receipt: string;
   items: ValidatedOrderLine[];
   customer: OrderCustomerDetails | null;
   customerUserId: string | null;
-  status: 'pending' | 'confirmed';
+  status: 'pending' | 'confirmed' | 'payment_received_pending_confirm';
   createdAt: number;
   expiresAt: number;
   confirmedOrder?: SerializedOrderReceipt;
@@ -150,7 +181,13 @@ interface SignedCheckoutTokenPayload {
   v: 1;
   oid: string;
   amt: number;
+  sub?: number;
+  disc?: number;
+  gc?: number;
+  cpn?: string | null;
+  gcc?: string | null;
   cur: string;
+  uid?: string | null;
   items: Array<{
     productId: string;
     variantId: string;
@@ -372,6 +409,73 @@ async function getFirestoreAdminBearerToken(): Promise<string | null> {
   return null;
 }
 
+export async function verifyBearerFirebaseTokenFromHeader(
+  authHeader: string | string[] | undefined,
+  verifierOverride?: IdTokenVerifierFn
+): Promise<
+  | { ok: true; uid: string | null; rawToken: string | null; email?: string | null }
+  | { ok: false; status: 401; code: string; error: string }
+> {
+  const headerStr = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+  if (!headerStr || !headerStr.trim()) {
+    return { ok: true, uid: null, rawToken: null };
+  }
+
+  const trimmed = headerStr.trim();
+  if (!/^Bearer\s+/i.test(trimmed)) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'AUTH_INVALID',
+      error: 'Invalid Authorization header format.',
+    };
+  }
+  const token = trimmed.replace(/^Bearer\s+/i, '').trim();
+  if (!token) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'AUTH_INVALID',
+      error: 'Missing Bearer token.',
+    };
+  }
+
+  if (verifierOverride) {
+    const verified = await verifierOverride(token).catch(() => null);
+    if (!verified || !verified.uid) {
+      return {
+        ok: false,
+        status: 401,
+        code: 'AUTH_INVALID',
+        error: 'Your session token has expired or is invalid. Please sign in again.',
+      };
+    }
+    return { ok: true, uid: verified.uid, rawToken: token, email: verified.email || null };
+  }
+
+  const cfg = loadFirebaseConfig();
+  if (!cfg) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'AUTH_INVALID',
+      error: 'Firebase configuration is unavailable to verify your sign-in token.',
+    };
+  }
+
+  const claims = await verifyFirebaseIdToken(token, cfg.projectId).catch(() => null);
+  if (!claims || !claims.uid) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'AUTH_INVALID',
+      error: 'Your sign-in session has expired or is invalid. Please sign in again.',
+    };
+  }
+
+  return { ok: true, uid: claims.uid, rawToken: token, email: claims.email || null };
+}
+
 type FsFieldValue =
   | { nullValue: null }
   | { booleanValue: boolean }
@@ -538,11 +642,23 @@ function getFirestoreContext(): {
   };
 }
 
+function shouldRequireDurablePersistence(params: {
+  store?: BoutiqueStore | null;
+  requireDurablePersistence?: boolean;
+}): boolean {
+  if (params.requireDurablePersistence !== undefined) {
+    return params.requireDurablePersistence;
+  }
+  if (params.store) return true;
+  if (process.env.VERCEL === '1') return true;
+  if (parseServiceAccountCredentials() !== null) return true;
+  return false;
+}
+
 export async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, CatalogProductInfo>> {
   const ctx = getFirestoreContext();
   const byId = new Map<string, CatalogProductInfo>();
 
-  // Seed catalog fallback (matches src/services/firebaseClientApi.ts)
   const seeds = buildSeedCatalogProducts();
   for (const seed of seeds) {
     byId.set(seed.id, seed);
@@ -670,6 +786,203 @@ export async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, 
   }
 
   return byId;
+}
+
+async function fetchCouponFromFirestoreByCode(code: string): Promise<CouponRow | null> {
+  const ctx = getFirestoreContext();
+  if (!ctx) return null;
+  const bearerToken = await getFirestoreAdminBearerToken();
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
+  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
+  const queryUrl = `${ctx.docBaseUrl}/environments/${ctx.namespace}:runQuery${keyParam}`;
+  try {
+    const res = await fetch(queryUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'coupons' }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: 'code' },
+              op: 'EQUAL',
+              value: { stringValue: code.trim().toUpperCase() },
+            },
+          },
+          limit: 1,
+        },
+      }),
+    });
+    if (!res.ok) return null;
+    const rows = (await res.json()) as Array<{
+      document?: { name?: string; fields?: Record<string, FsFieldValue> };
+    }>;
+    if (!rows[0]?.document?.fields) return null;
+    const d = fromFsFields(rows[0].document.fields);
+    return {
+      id: String(d.id || rows[0].document.name?.split('/').pop() || ''),
+      code: String(d.code || code).toUpperCase(),
+      title: String(d.title || ''),
+      description: String(d.description || ''),
+      discount_type: d.discount_type === 'flat_paise' ? 'flat_paise' : 'percent',
+      discount_value: Number(d.discount_value || 0),
+      max_discount_paise:
+        typeof d.max_discount_paise === 'number' ? d.max_discount_paise : null,
+      min_spend_paise: Number(d.min_spend_paise || 0),
+      usage_limit: typeof d.usage_limit === 'number' ? d.usage_limit : null,
+      used_count: Number(d.used_count || 0),
+      active: d.active ? 1 : 0,
+      starts_at: typeof d.starts_at === 'number' ? d.starts_at : null,
+      expires_at: typeof d.expires_at === 'number' ? d.expires_at : null,
+      created_at: Number(d.created_at || 0),
+      updated_at: Number(d.updated_at || 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchGiftCardFromFirestoreByCode(code: string): Promise<GiftCardRow | null> {
+  const ctx = getFirestoreContext();
+  if (!ctx) return null;
+  const bearerToken = await getFirestoreAdminBearerToken();
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
+  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
+  const queryUrl = `${ctx.docBaseUrl}/environments/${ctx.namespace}:runQuery${keyParam}`;
+  try {
+    const res = await fetch(queryUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'gift_cards' }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: 'code' },
+              op: 'EQUAL',
+              value: { stringValue: code.trim().toUpperCase() },
+            },
+          },
+          limit: 1,
+        },
+      }),
+    });
+    if (!res.ok) return null;
+    const rows = (await res.json()) as Array<{
+      document?: { name?: string; fields?: Record<string, FsFieldValue> };
+    }>;
+    if (!rows[0]?.document?.fields) return null;
+    const d = fromFsFields(rows[0].document.fields);
+    return {
+      id: String(d.id || rows[0].document.name?.split('/').pop() || ''),
+      code: String(d.code || code).toUpperCase(),
+      recipient_email: String(d.recipient_email || ''),
+      note: String(d.note || ''),
+      initial_balance_paise: Number(d.initial_balance_paise || 0),
+      balance_paise: Number(d.balance_paise || 0),
+      active: d.active ? 1 : 0,
+      expires_at: typeof d.expires_at === 'number' ? d.expires_at : null,
+      last_used_at: typeof d.last_used_at === 'number' ? d.last_used_at : null,
+      created_at: Number(d.created_at || 0),
+      updated_at: Number(d.updated_at || 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function validatePromoAndGiftCardForBag(params: {
+  subtotalPaise: number;
+  couponCode?: string | null;
+  giftCardCode?: string | null;
+  store?: BoutiqueStore | null;
+  ensurePayableMinimum?: boolean;
+}): Promise<{
+  couponCode: string | null;
+  discountPaise: number;
+  giftCardCode: string | null;
+  giftCardPaise: number;
+  finalAmountPaise: number;
+}> {
+  const { subtotalPaise, store } = params;
+  const now = Date.now();
+  let couponCode: string | null = null;
+  let discountPaise = 0;
+
+  if (params.couponCode && params.couponCode.trim()) {
+    const cleanCode = params.couponCode.trim().toUpperCase();
+    const coupon = store
+      ? await store.getCouponByCode(cleanCode)
+      : await fetchCouponFromFirestoreByCode(cleanCode);
+    if (!coupon || !coupon.active) {
+      throw new StoreHttpError(400, 'INVALID_COUPON', `Coupon "${cleanCode}" is invalid or inactive.`);
+    }
+    if (coupon.starts_at && now < coupon.starts_at) {
+      throw new StoreHttpError(400, 'INVALID_COUPON', `Coupon "${cleanCode}" is not active yet.`);
+    }
+    if (coupon.expires_at && now > coupon.expires_at) {
+      throw new StoreHttpError(400, 'COUPON_EXPIRED', `Coupon "${cleanCode}" has expired.`);
+    }
+    if (coupon.usage_limit !== null && coupon.used_count >= coupon.usage_limit) {
+      throw new StoreHttpError(400, 'COUPON_EXHAUSTED', `Coupon "${cleanCode}" has reached its redemption limit.`);
+    }
+    if (subtotalPaise < coupon.min_spend_paise) {
+      throw new StoreHttpError(
+        400,
+        'COUPON_MIN_SPEND',
+        `Coupon "${cleanCode}" requires a minimum bag value of ₹${(coupon.min_spend_paise / 100).toLocaleString('en-IN')}.`
+      );
+    }
+
+    if (coupon.discount_type === 'percent') {
+      discountPaise = Math.round((subtotalPaise * coupon.discount_value) / 100);
+      if (coupon.max_discount_paise && coupon.max_discount_paise > 0) {
+        discountPaise = Math.min(discountPaise, coupon.max_discount_paise);
+      }
+    } else {
+      discountPaise = coupon.discount_value;
+    }
+    const maxAllowedDiscount = params.ensurePayableMinimum
+      ? Math.max(0, subtotalPaise - MIN_PRICE_PAISE)
+      : subtotalPaise;
+    discountPaise = Math.max(0, Math.min(maxAllowedDiscount, Math.round(discountPaise)));
+    couponCode = coupon.code;
+  }
+
+  let giftCardCode: string | null = null;
+  let giftCardPaise = 0;
+  if (params.giftCardCode && params.giftCardCode.trim()) {
+    const cleanGc = params.giftCardCode.trim().toUpperCase();
+    const gc = store
+      ? await store.getGiftCardByCode(cleanGc)
+      : await fetchGiftCardFromFirestoreByCode(cleanGc);
+    if (!gc || !gc.active) {
+      throw new StoreHttpError(400, 'INVALID_GIFT_CARD', `Gift card "${cleanGc}" was not found or is inactive.`);
+    }
+    if (gc.expires_at && now > gc.expires_at) {
+      throw new StoreHttpError(400, 'GIFT_CARD_EXPIRED', `Gift card "${cleanGc}" has expired.`);
+    }
+    if (gc.balance_paise <= 0) {
+      throw new StoreHttpError(400, 'GIFT_CARD_EMPTY', `Gift card "${cleanGc}" has zero remaining balance.`);
+    }
+    const afterCoupon = Math.max(0, subtotalPaise - discountPaise);
+    const maxRedeemable = params.ensurePayableMinimum
+      ? Math.max(0, afterCoupon - MIN_PRICE_PAISE)
+      : afterCoupon;
+    giftCardPaise = Math.min(gc.balance_paise, maxRedeemable);
+    giftCardCode = gc.code;
+  }
+
+  const finalAmountPaise = Math.max(0, subtotalPaise - discountPaise - giftCardPaise);
+  return {
+    couponCode,
+    discountPaise,
+    giftCardCode,
+    giftCardPaise,
+    finalAmountPaise,
+  };
 }
 
 async function validateCartAgainstCatalog(params: {
@@ -868,25 +1181,129 @@ function verifySignedCheckoutToken(
   }
 }
 
-async function savePendingCheckoutToFirestore(record: PendingCheckoutRecord): Promise<void> {
+function toPendingCheckoutRow(record: PendingCheckoutRecord): PendingCheckoutRow {
+  return {
+    id: record.razorpayOrderId,
+    customer_user_id: record.customerUserId,
+    amount_paise: record.amountPaise,
+    subtotal_paise: record.subtotalPaise,
+    discount_paise: record.discountPaise,
+    gift_card_paise: record.giftCardPaise,
+    coupon_code: record.couponCode,
+    gift_card_code: record.giftCardCode,
+    currency: record.currency,
+    receipt: record.receipt,
+    items_json: JSON.stringify(record.items),
+    customer_json: record.customer ? JSON.stringify(record.customer) : null,
+    status: record.status,
+    razorpay_payment_id: record.razorpayPaymentId || null,
+    confirmed_order_id: record.confirmedOrder?.id || null,
+    confirmed_order_json: record.confirmedOrder ? JSON.stringify(record.confirmedOrder) : null,
+    created_at: record.createdAt,
+    updated_at: Date.now(),
+    expires_at: record.expiresAt,
+  };
+}
+
+function fromPendingCheckoutRow(row: PendingCheckoutRow): PendingCheckoutRecord {
+  let items: ValidatedOrderLine[] = [];
+  let customer: OrderCustomerDetails | null = null;
+  let confirmedOrder: SerializedOrderReceipt | undefined;
+  try {
+    const parsed = JSON.parse(row.items_json || '[]') as unknown;
+    if (Array.isArray(parsed)) items = parsed as ValidatedOrderLine[];
+  } catch {
+    items = [];
+  }
+  if (row.customer_json) {
+    try {
+      customer = JSON.parse(row.customer_json) as OrderCustomerDetails;
+    } catch {
+      customer = null;
+    }
+  }
+  if (row.confirmed_order_json) {
+    try {
+      confirmedOrder = JSON.parse(row.confirmed_order_json) as SerializedOrderReceipt;
+    } catch {
+      confirmedOrder = undefined;
+    }
+  }
+  return {
+    razorpayOrderId: row.id,
+    amountPaise: row.amount_paise,
+    subtotalPaise: row.subtotal_paise,
+    discountPaise: row.discount_paise,
+    giftCardPaise: row.gift_card_paise,
+    couponCode: row.coupon_code,
+    giftCardCode: row.gift_card_code,
+    currency: row.currency,
+    receipt: row.receipt,
+    items,
+    customer,
+    customerUserId: row.customer_user_id,
+    status:
+      row.status === 'confirmed' || row.status === 'payment_received_pending_confirm'
+        ? row.status
+        : 'pending',
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    razorpayPaymentId: row.razorpay_payment_id || undefined,
+    confirmedOrder,
+  };
+}
+
+async function savePendingCheckoutToFirestore(
+  record: PendingCheckoutRecord,
+  options?: { strict?: boolean; customerIdToken?: string | null }
+): Promise<boolean> {
   const ctx = getFirestoreContext();
-  if (!ctx) return;
-  const bearerToken = await getFirestoreAdminBearerToken();
-  if (!bearerToken) return;
+  if (!ctx) {
+    if (options?.strict) {
+      throw new StoreHttpError(
+        503,
+        'CHECKOUT_PERSISTENCE_FAILED',
+        'Checkout configuration is missing Firebase project details.'
+      );
+    }
+    return false;
+  }
+
+  const adminBearer = await getFirestoreAdminBearerToken();
+  const effectiveBearer = adminBearer || options?.customerIdToken || null;
+  if (!effectiveBearer) {
+    if (options?.strict && process.env.VERCEL === '1') {
+      // If unauthenticated guest without service account on Vercel, check if firestore.rules permits pending_checkout create
+      // Attempt without bearer (firestore.rules allows valid guest pending_checkout write), but check res.ok!
+    } else if (options?.strict) {
+      throw new StoreHttpError(
+        503,
+        'CHECKOUT_PERSISTENCE_FAILED',
+        'Server database credentials are unavailable to save checkout state.'
+      );
+    }
+  }
 
   const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
   const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/pending_checkouts/${encodeURIComponent(record.razorpayOrderId)}${keyParam}`;
-  await fetch(url, {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (effectiveBearer) {
+    headers.Authorization = `Bearer ${effectiveBearer}`;
+  }
+
+  const res = await fetch(url, {
     method: 'PATCH',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${bearerToken}`,
-    },
+    headers,
     body: JSON.stringify({
       fields: toFsFields({
         id: record.razorpayOrderId,
         razorpay_order_id: record.razorpayOrderId,
         amount_paise: record.amountPaise,
+        subtotal_paise: record.subtotalPaise,
+        discount_paise: record.discountPaise,
+        gift_card_paise: record.giftCardPaise,
+        coupon_code: record.couponCode,
+        gift_card_code: record.giftCardCode,
         currency: record.currency,
         receipt: record.receipt,
         items: record.items,
@@ -894,12 +1311,26 @@ async function savePendingCheckoutToFirestore(record: PendingCheckoutRecord): Pr
         customer_user_id: record.customerUserId,
         status: record.status,
         created_at: record.createdAt,
+        updated_at: Date.now(),
         expires_at: record.expiresAt,
         ...(record.razorpayPaymentId ? { razorpay_payment_id: record.razorpayPaymentId } : {}),
         ...(record.confirmedOrder ? { confirmed_order: record.confirmedOrder } : {}),
       }),
     }),
-  }).catch(() => undefined);
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    if (options?.strict) {
+      throw new StoreHttpError(
+        503,
+        'CHECKOUT_PERSISTENCE_FAILED',
+        `Unable to save durable checkout record (${res.status}): ${errText.slice(0, 140)}`
+      );
+    }
+    return false;
+  }
+  return true;
 }
 
 async function loadPendingCheckoutFromFirestore(
@@ -924,6 +1355,11 @@ async function loadPendingCheckoutFromFirestore(
     return {
       razorpayOrderId: data.razorpay_order_id,
       amountPaise: Math.round(Number(data.amount_paise || 0)),
+      subtotalPaise: Math.round(Number(data.subtotal_paise || data.amount_paise || 0)),
+      discountPaise: Math.round(Number(data.discount_paise || 0)),
+      giftCardPaise: Math.round(Number(data.gift_card_paise || 0)),
+      couponCode: typeof data.coupon_code === 'string' ? data.coupon_code : null,
+      giftCardCode: typeof data.gift_card_code === 'string' ? data.gift_card_code : null,
       currency: String(data.currency || 'INR'),
       receipt: String(data.receipt || ''),
       items: Array.isArray(data.items) ? (data.items as ValidatedOrderLine[]) : [],
@@ -933,7 +1369,12 @@ async function loadPendingCheckoutFromFirestore(
           : null,
       customerUserId:
         typeof data.customer_user_id === 'string' ? data.customer_user_id : null,
-      status: data.status === 'confirmed' ? 'confirmed' : 'pending',
+      status:
+        data.status === 'confirmed'
+          ? 'confirmed'
+          : data.status === 'payment_received_pending_confirm'
+            ? 'payment_received_pending_confirm'
+            : 'pending',
       createdAt: Number(data.created_at || Date.now()),
       expiresAt: Number(data.expires_at || Date.now() + CHECKOUT_TOKEN_TTL_MS),
       razorpayPaymentId:
@@ -952,6 +1393,19 @@ function buildDeterministicOrderId(razorpayOrderId: string): string {
   const sanitized = razorpayOrderId.replace(/[^a-zA-Z0-9_-]/g, '_');
   const candidate = `ord_rzp_${sanitized}`;
   return candidate.slice(0, 120);
+}
+
+function parseStatusHistorySafe(raw: unknown): OrderStatusHistoryEntry[] {
+  if (Array.isArray(raw)) return raw as OrderStatusHistoryEntry[];
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) return parsed as OrderStatusHistoryEntry[];
+    } catch {
+      return [];
+    }
+  }
+  return [];
 }
 
 async function fetchExistingFirestoreOrder(
@@ -976,17 +1430,27 @@ async function fetchExistingFirestoreOrder(
     const data = fromFsFields(doc.fields);
     if (typeof data.id !== 'string') return null;
     const rawItems = Array.isArray(data.items) ? data.items : [];
+    const createdAt = Number(data.created_at || Date.now());
     return {
       id: data.id,
       orderNumber: String(data.order_number || orderDocId),
-      status: 'confirmed',
+      customerUserId:
+        typeof data.customer_user_id === 'string' ? data.customer_user_id : null,
+      status: String(data.status || 'confirmed'),
+      paymentStatus: String(data.payment_status || 'paid'),
+      fulfillmentStatus: String(data.fulfillment_status || data.status || 'confirmed'),
       subtotalPaise: Number(data.subtotal_paise || 0),
+      discountPaise: Number(data.discount_paise || 0),
+      giftCardPaise: Number(data.gift_card_paise || 0),
+      couponCode: typeof data.coupon_code === 'string' ? data.coupon_code : null,
+      giftCardCode: typeof data.gift_card_code === 'string' ? data.gift_card_code : null,
       totalPaise: Number(data.total_paise || 0),
       currency: String(data.currency || 'INR'),
-      createdAt: Number(data.created_at || Date.now()),
+      createdAt,
       paymentMethod: 'razorpay',
       razorpayOrderId: String(data.razorpay_order_id || razorpayOrderId),
       razorpayPaymentId: String(data.razorpay_payment_id || razorpayPaymentId),
+      statusHistory: parseStatusHistorySafe(data.status_history_json),
       items: rawItems
         .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
         .map((it) => ({
@@ -1011,9 +1475,30 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
   customerUserId: string | null;
   customer: OrderCustomerDetails;
   lines: ValidatedOrderLine[];
+  subtotalPaise: number;
+  discountPaise: number;
+  giftCardPaise: number;
+  couponCode: string | null;
+  giftCardCode: string | null;
   totalPaise: number;
+  customerIdToken?: string | null;
+  strictPersistence?: boolean;
 }): Promise<SerializedOrderReceipt> {
-  const { razorpayOrderId, razorpayPaymentId, customerUserId, customer, lines, totalPaise } = params;
+  const {
+    razorpayOrderId,
+    razorpayPaymentId,
+    customerUserId,
+    customer,
+    lines,
+    subtotalPaise,
+    discountPaise,
+    giftCardPaise,
+    couponCode,
+    giftCardCode,
+    totalPaise,
+    customerIdToken,
+    strictPersistence = false,
+  } = params;
   const ctx = getFirestoreContext();
   const orderDocId = buildDeterministicOrderId(razorpayOrderId);
   const now = Date.now();
@@ -1024,6 +1509,15 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
     .slice(0, 6)
     .toUpperCase();
   const orderNumber = `SC-${suffix}`;
+  const statusHistory: OrderStatusHistoryEntry[] = [
+    {
+      status: 'confirmed',
+      note: 'Payment verified via Razorpay',
+      actor: 'system',
+      at: now,
+    },
+  ];
+  const statusHistoryJson = JSON.stringify(statusHistory);
 
   const firestoreItems = lines.map((l, idx) => ({
     id: `item_${orderDocId}_${idx + 1}`,
@@ -1041,14 +1535,22 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
   const receipt: SerializedOrderReceipt = {
     id: orderDocId,
     orderNumber,
+    customerUserId,
     status: 'confirmed',
-    subtotalPaise: totalPaise,
+    paymentStatus: 'paid',
+    fulfillmentStatus: 'confirmed',
+    subtotalPaise,
+    discountPaise,
+    giftCardPaise,
+    couponCode,
+    giftCardCode,
     totalPaise,
     currency: 'INR',
     createdAt: now,
     paymentMethod: 'razorpay',
     razorpayOrderId,
     razorpayPaymentId,
+    statusHistory,
     items: lines.map((l) => ({
       productId: l.productId,
       variantId: l.variantId,
@@ -1061,20 +1563,32 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
     })),
   };
 
-  if (!ctx) return receipt;
+  if (!ctx) {
+    if (strictPersistence) {
+      throw new StoreHttpError(
+        503,
+        'ORDER_CONFIRMATION_PENDING',
+        'Payment received. Order persistence configuration is unavailable.'
+      );
+    }
+    return receipt;
+  }
 
-  const bearerToken = await getFirestoreAdminBearerToken();
+  const adminBearer = await getFirestoreAdminBearerToken();
+  const effectiveBearer = adminBearer || customerIdToken || null;
+  if (!adminBearer && strictPersistence && process.env.VERCEL === '1' && !customerIdToken) {
+    // Allow unauthenticated guest rule path only if Firestore accepts it
+  }
+
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
+  if (effectiveBearer) headers.Authorization = `Bearer ${effectiveBearer}`;
   const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
 
   const productIds = Array.from(new Set(lines.map((l) => l.productId)));
 
-  // With Firebase service-account admin credentials, we can write confirmed status and Razorpay metadata.
-  // Without admin credentials, firestore.rules (`isValidPublicOrder`) allows unauthenticated `create`
-  // with exact 14 fields and `status: 'pending'` — so use `currentDocument: { exists: false }` commit
-  // to enforce exactly-once creation in Firestore cleanly.
-  const docFields = bearerToken
+  // Use admin fields if we have service account bearer token OR authenticated matching customer UID
+  const canUseRichFields = Boolean(adminBearer || (customerIdToken && customerUserId));
+  const docFields = canUseRichFields
     ? {
         id: orderDocId,
         order_number: orderNumber,
@@ -1084,15 +1598,24 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
         customer_phone: customer.customerPhone,
         shipping_address: customer.shippingAddress,
         status: 'confirmed',
-        subtotal_paise: totalPaise,
-        total_paise: totalPaise,
-        currency: 'INR',
-        created_at: now,
-        product_ids: productIds,
-        items: firestoreItems,
+        payment_status: 'paid',
+        fulfillment_status: 'confirmed',
         payment_method: 'razorpay',
         razorpay_order_id: razorpayOrderId,
         razorpay_payment_id: razorpayPaymentId,
+        coupon_code: couponCode,
+        gift_card_code: giftCardCode,
+        discount_paise: discountPaise,
+        gift_card_paise: giftCardPaise,
+        status_history_json: statusHistoryJson,
+        return_request_json: null,
+        subtotal_paise: subtotalPaise,
+        total_paise: totalPaise,
+        currency: 'INR',
+        created_at: now,
+        updated_at: now,
+        product_ids: productIds,
+        items: firestoreItems,
       }
     : {
         id: orderDocId,
@@ -1103,7 +1626,7 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
         customer_phone: customer.customerPhone,
         shipping_address: customer.shippingAddress,
         status: 'pending',
-        subtotal_paise: totalPaise,
+        subtotal_paise: subtotalPaise,
         total_paise: totalPaise,
         currency: 'INR',
         created_at: now,
@@ -1112,27 +1635,133 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
       };
 
   const docName = `${ctx.dbRootResource}/environments/${ctx.namespace}/orders/${orderDocId}`;
+  const writes: Array<Record<string, unknown>> = [
+    {
+      currentDocument: { exists: false },
+      update: {
+        name: docName,
+        fields: toFsFields(docFields),
+      },
+    },
+  ];
+
+  // If authenticated matching customer or admin, also write 1 placed notification atomically!
+  if (customerUserId && canUseRichFields) {
+    const notifId = `notif_placed_${orderDocId}`;
+    writes.push({
+      currentDocument: { exists: false },
+      update: {
+        name: `${ctx.dbRootResource}/environments/${ctx.namespace}/users/${encodeURIComponent(customerUserId)}/notifications/${notifId}`,
+        fields: toFsFields({
+          id: notifId,
+          user_id: customerUserId,
+          type: 'order_placed',
+          title: `Order ${orderNumber} placed`,
+          message: `Payment verified for order ${orderNumber} (₹${(totalPaise / 100).toLocaleString('en-IN')}).`,
+          order_id: orderDocId,
+          order_number: orderNumber,
+          is_read: 0,
+          read_at: null,
+          created_at: now,
+        }),
+      },
+    });
+  }
+
+  // Note: Stock deduction, coupon usage increment, and gift card deduction require admin service account
+  // because Firestore security rules restrict customer writes on products/coupons/gift_cards.
+  if (adminBearer) {
+    for (const pid of productIds) {
+      try {
+        const prodRes = await fetch(
+          `${ctx.docBaseUrl}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}${keyParam}`,
+          { headers }
+        );
+        if (prodRes.ok) {
+          const prodDoc = (await prodRes.json()) as {
+            updateTime?: string;
+            fields?: Record<string, FsFieldValue>;
+          };
+          const prodData = fromFsFields(prodDoc.fields);
+          const rawVariants = Array.isArray(prodData.variants) ? prodData.variants : [];
+          const nextVariants = rawVariants.map((v) => {
+            if (!v || typeof v !== 'object') return v;
+            const rec = { ...(v as Record<string, unknown>) };
+            const qtyOrdered = lines
+              .filter((l) => l.productId === pid && l.variantId === String(rec.id || ''))
+              .reduce((s, l) => s + l.quantity, 0);
+            if (qtyOrdered > 0) {
+              rec.stock_qty = Math.max(0, Number(rec.stock_qty || 0) - qtyOrdered);
+            }
+            return rec;
+          });
+          const nextTotalStock = nextVariants.reduce(
+            (sum, v) =>
+              sum + (v && typeof v === 'object' ? Number((v as Record<string, unknown>).stock_qty || 0) : 0),
+            0
+          );
+          writes.push({
+            ...(prodDoc.updateTime ? { currentDocument: { updateTime: prodDoc.updateTime } } : {}),
+            update: {
+              name: `${ctx.dbRootResource}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}`,
+              fields: toFsFields({
+                ...prodData,
+                variants: nextVariants,
+                stock_qty: nextTotalStock,
+                updated_at: now,
+              }),
+            },
+          });
+        }
+      } catch {
+        // Skip best-effort stock read failure if product is seed-only
+      }
+    }
+
+    if (couponCode) {
+      const cpn = await fetchCouponFromFirestoreByCode(couponCode);
+      if (cpn) {
+        writes.push({
+          update: {
+            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/coupons/${encodeURIComponent(cpn.id)}`,
+            fields: toFsFields({
+              ...cpn,
+              used_count: Number(cpn.used_count || 0) + 1,
+              updated_at: now,
+            }),
+          },
+        });
+      }
+    }
+
+    if (giftCardCode && giftCardPaise > 0) {
+      const gc = await fetchGiftCardFromFirestoreByCode(giftCardCode);
+      if (gc) {
+        writes.push({
+          update: {
+            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/gift_cards/${encodeURIComponent(gc.id)}`,
+            fields: toFsFields({
+              ...gc,
+              balance_paise: Math.max(0, Number(gc.balance_paise || 0) - giftCardPaise),
+              last_used_at: now,
+              updated_at: now,
+            }),
+          },
+        });
+      }
+    }
+  }
+
   const commitRes = await fetch(`${ctx.docBaseUrl}:commit${keyParam}`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({
-      writes: [
-        {
-          currentDocument: { exists: false },
-          update: {
-            name: docName,
-            fields: toFsFields(docFields),
-          },
-        },
-      ],
-    }),
+    body: JSON.stringify({ writes }),
   });
 
   if (commitRes.ok) {
     return receipt;
   }
 
-  // If the order document already exists (duplicate verify call or concurrent race), return idempotently
   if (commitRes.status === 409 || commitRes.status === 412 || commitRes.status === 400) {
     const errText = await commitRes.text().catch(() => '');
     if (
@@ -1337,13 +1966,67 @@ function extractRazorpayApiError(
   return { statusCode, description, isAuthFailure };
 }
 
+async function persistPendingCheckoutRecord(params: {
+  record: PendingCheckoutRecord;
+  store?: BoutiqueStore | null;
+  strictPersistence: boolean;
+  customerIdToken?: string | null;
+}): Promise<void> {
+  const { record, store, strictPersistence, customerIdToken } = params;
+  pendingCheckoutsMemory.set(record.razorpayOrderId, record);
+
+  if (store) {
+    try {
+      await store.savePendingCheckout(toPendingCheckoutRow(record));
+    } catch (err) {
+      throw new StoreHttpError(
+        503,
+        'CHECKOUT_PERSISTENCE_FAILED',
+        err instanceof Error
+          ? err.message
+          : 'Unable to save checkout state before opening payment.'
+      );
+    }
+    return;
+  }
+
+  await savePendingCheckoutToFirestore(record, {
+    strict: strictPersistence,
+    customerIdToken,
+  });
+}
+
+async function loadPendingCheckoutRecord(
+  razorpayOrderId: string,
+  store?: BoutiqueStore | null
+): Promise<PendingCheckoutRecord | null> {
+  const mem = pendingCheckoutsMemory.get(razorpayOrderId);
+  if (mem) return mem;
+
+  if (store) {
+    const row = await store.getPendingCheckout(razorpayOrderId).catch(() => null);
+    if (row) return fromPendingCheckoutRow(row);
+  }
+
+  return loadPendingCheckoutFromFirestore(razorpayOrderId);
+}
+
 export async function handleCreateOrderRequest(params: {
   body: Record<string, unknown>;
   store?: BoutiqueStore | null;
   customerUserId?: string | null;
+  customerIdToken?: string | null;
   razorpayClientFactory?: RazorpayClientFactory;
+  requireDurablePersistence?: boolean;
 }): Promise<CheckoutHandlerResponse> {
-  const { body, store = null, customerUserId = null, razorpayClientFactory } = params;
+  const {
+    body,
+    store = null,
+    customerUserId = null,
+    customerIdToken = null,
+    razorpayClientFactory,
+    requireDurablePersistence,
+  } = params;
 
   const creds = resolveRazorpayCredentials();
   if (!creds.ok) {
@@ -1375,7 +2058,7 @@ export async function handleCreateOrderRequest(params: {
   }
 
   let validatedLines: ValidatedOrderLine[] = [];
-  let amountPaise = NaN;
+  let subtotalPaise = NaN;
 
   const hasItemsField = Array.isArray(body.items);
   if (hasItemsField) {
@@ -1383,7 +2066,7 @@ export async function handleCreateOrderRequest(params: {
     try {
       const checked = await validateCartAgainstCatalog({ items: parsedLines, store });
       validatedLines = checked.lines;
-      amountPaise = checked.totalPaise;
+      subtotalPaise = checked.totalPaise;
     } catch (err) {
       if (err instanceof StoreHttpError) {
         return {
@@ -1399,7 +2082,7 @@ export async function handleCreateOrderRequest(params: {
     }
   } else {
     const rawAmount = body.amount;
-    amountPaise =
+    subtotalPaise =
       typeof rawAmount === 'number' && Number.isFinite(rawAmount)
         ? Math.round(rawAmount)
         : typeof rawAmount === 'string' && rawAmount.trim() !== ''
@@ -1407,7 +2090,7 @@ export async function handleCreateOrderRequest(params: {
           : NaN;
   }
 
-  if (!Number.isInteger(amountPaise) || amountPaise < MIN_PRICE_PAISE) {
+  if (!Number.isInteger(subtotalPaise) || subtotalPaise < MIN_PRICE_PAISE) {
     return {
       status: 400,
       body: {
@@ -1418,36 +2101,97 @@ export async function handleCreateOrderRequest(params: {
     };
   }
 
+  const requestedCouponCode =
+    typeof body.couponCode === 'string'
+      ? body.couponCode
+      : typeof body.coupon_code === 'string'
+        ? body.coupon_code
+        : null;
+  const requestedGiftCardCode =
+    typeof body.giftCardCode === 'string'
+      ? body.giftCardCode
+      : typeof body.gift_card_code === 'string'
+        ? body.gift_card_code
+        : null;
+
+  let discountPaise = 0;
+  let giftCardPaise = 0;
+  let couponCode: string | null = null;
+  let giftCardCode: string | null = null;
+  let amountPaise = subtotalPaise;
+
+  if (requestedCouponCode || requestedGiftCardCode) {
+    try {
+      const promoResult = await validatePromoAndGiftCardForBag({
+        subtotalPaise,
+        couponCode: requestedCouponCode,
+        giftCardCode: requestedGiftCardCode,
+        store,
+        ensurePayableMinimum: true,
+      });
+      couponCode = promoResult.couponCode;
+      discountPaise = promoResult.discountPaise;
+      giftCardCode = promoResult.giftCardCode;
+      giftCardPaise = promoResult.giftCardPaise;
+      amountPaise = promoResult.finalAmountPaise;
+    } catch (err) {
+      if (err instanceof StoreHttpError) {
+        return {
+          status: err.httpStatus,
+          body: {
+            status: err.httpStatus,
+            code: err.code,
+            error: err.message,
+          },
+        };
+      }
+      throw err;
+    }
+  }
+
   const receipt =
     typeof body.receipt === 'string' && body.receipt.trim()
       ? body.receipt.trim().slice(0, 40)
       : `sc_rcpt_${Date.now()}`;
 
   const customer = parseCustomerDetails(body.customer || body.orderData);
+  const strictPersistence = shouldRequireDurablePersistence({
+    store,
+    requireDurablePersistence,
+  });
 
   try {
     const razorpay = (razorpayClientFactory || defaultRazorpayFactory)(keyId, keySecret);
+    const notes: Record<string, string> = {};
+    if (validatedLines.length > 0) {
+      notes.items_count = String(validatedLines.length);
+      notes.product_ids = validatedLines
+        .map((l) => l.productId)
+        .join(',')
+        .slice(0, 200);
+    }
+    if (customerUserId) {
+      notes.customer_user_id = customerUserId.slice(0, 120);
+    }
+    if (couponCode) notes.coupon_code = couponCode.slice(0, 40);
+    if (giftCardCode) notes.gift_card_code = giftCardCode.slice(0, 40);
+
     const order = await razorpay.orders.create({
       amount: amountPaise,
       currency: 'INR',
       receipt,
-      ...(validatedLines.length > 0
-        ? {
-            notes: {
-              items_count: String(validatedLines.length),
-              product_ids: validatedLines
-                .map((l) => l.productId)
-                .join(',')
-                .slice(0, 200),
-            },
-          }
-        : {}),
+      ...(Object.keys(notes).length > 0 ? { notes } : {}),
     });
 
     const now = Date.now();
     const pendingRecord: PendingCheckoutRecord = {
       razorpayOrderId: order.id,
       amountPaise: Number(order.amount || amountPaise),
+      subtotalPaise,
+      discountPaise,
+      giftCardPaise,
+      couponCode,
+      giftCardCode,
       currency: String(order.currency || 'INR').toUpperCase(),
       receipt: String(order.receipt || receipt),
       items: validatedLines,
@@ -1459,15 +2203,50 @@ export async function handleCreateOrderRequest(params: {
     };
 
     pruneMemoryCaches(now);
-    pendingCheckoutsMemory.set(order.id, pendingRecord);
-    await savePendingCheckoutToFirestore(pendingRecord);
+    try {
+      await persistPendingCheckoutRecord({
+        record: pendingRecord,
+        store,
+        strictPersistence,
+        customerIdToken,
+      });
+    } catch (persistErr) {
+      pendingCheckoutsMemory.delete(order.id);
+      if (persistErr instanceof StoreHttpError) {
+        return {
+          status: persistErr.httpStatus,
+          body: {
+            status: persistErr.httpStatus,
+            code: persistErr.code,
+            error: persistErr.message,
+          },
+        };
+      }
+      return {
+        status: 503,
+        body: {
+          status: 503,
+          code: 'CHECKOUT_PERSISTENCE_FAILED',
+          error:
+            persistErr instanceof Error
+              ? persistErr.message
+              : 'Unable to save checkout state before opening payment.',
+        },
+      };
+    }
 
     const checkoutToken = createSignedCheckoutToken(
       {
         v: 1,
         oid: order.id,
         amt: pendingRecord.amountPaise,
+        sub: subtotalPaise,
+        disc: discountPaise,
+        gc: giftCardPaise,
+        cpn: couponCode,
+        gcc: giftCardCode,
         cur: pendingRecord.currency,
+        uid: customerUserId,
         items: validatedLines.map((l) => ({
           productId: l.productId,
           variantId: l.variantId,
@@ -1486,6 +2265,11 @@ export async function handleCreateOrderRequest(params: {
         order_id: order.id,
         id: order.id,
         amount: pendingRecord.amountPaise,
+        subtotal_paise: subtotalPaise,
+        discount_paise: discountPaise,
+        gift_card_paise: giftCardPaise,
+        coupon_code: couponCode,
+        gift_card_code: giftCardCode,
         currency: pendingRecord.currency,
         receipt: pendingRecord.receipt,
         key_id: keyId,
@@ -1493,6 +2277,17 @@ export async function handleCreateOrderRequest(params: {
       },
     };
   } catch (err: unknown) {
+    if (err instanceof StoreHttpError) {
+      return {
+        status: err.httpStatus,
+        body: {
+          status: err.httpStatus,
+          code: err.code,
+          error: err.message,
+        },
+      };
+    }
+
     const { description, isAuthFailure } = extractRazorpayApiError(
       err,
       'Failed to create Razorpay order.'
@@ -1523,130 +2318,49 @@ export async function handleCreateOrderRequest(params: {
   }
 }
 
-export async function handleVerifyPaymentRequest(params: {
-  body: Record<string, unknown>;
-  store?: BoutiqueStore | null;
-  customerUserId?: string | null;
+async function finalizePaidRazorpayOrder(params: {
+  razorpayOrderId: string;
+  razorpayPaymentId: string;
+  keyId: string;
+  keySecret: string;
+  keyMode: 'test' | 'live';
+  store: BoutiqueStore | null;
+  customerUserId: string | null;
+  customerIdToken?: string | null;
+  customerOverride?: OrderCustomerDetails | null;
+  itemsOverride?: ValidatedOrderLine[] | null;
+  expectedAmountOverride?: number | null;
+  verifiedToken?: SignedCheckoutTokenPayload | null;
   razorpayClientFactory?: RazorpayClientFactory;
+  fetchedPaymentPreloaded?: RazorpayPaymentEntity | null;
+  source: 'verify' | 'webhook' | 'status' | 'recover';
+  strictPersistence?: boolean;
 }): Promise<CheckoutHandlerResponse> {
-  const { body, store = null, customerUserId = null, razorpayClientFactory } = params;
+  const {
+    razorpayOrderId,
+    razorpayPaymentId,
+    keyId,
+    keySecret,
+    keyMode,
+    store,
+    customerIdToken = null,
+    verifiedToken = null,
+    razorpayClientFactory,
+    source,
+    strictPersistence = false,
+  } = params;
 
-  const razorpayOrderId =
-    typeof body.razorpay_order_id === 'string'
-      ? body.razorpay_order_id.trim()
-      : typeof body.order_id === 'string'
-        ? body.order_id.trim()
-        : '';
-  const razorpayPaymentId =
-    typeof body.razorpay_payment_id === 'string'
-      ? body.razorpay_payment_id.trim()
-      : typeof body.payment_id === 'string'
-        ? body.payment_id.trim()
-        : '';
-  const razorpaySignature =
-    typeof body.razorpay_signature === 'string'
-      ? body.razorpay_signature.trim()
-      : typeof body.signature === 'string'
-        ? body.signature.trim()
-        : '';
-  const checkoutToken =
-    typeof body.checkout_token === 'string' ? body.checkout_token.trim() : '';
-  const expectedOrderIdParam =
-    typeof body.expected_order_id === 'string' ? body.expected_order_id.trim() : '';
-
-  if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
-    return {
-      status: 400,
-      body: {
-        status: 400,
-        success: false,
-        verified: false,
-        code: 'MISSING_FIELDS',
-        error:
-          'Missing required payment verification fields (razorpay_order_id, razorpay_payment_id, razorpay_signature).',
-      },
-    };
-  }
-
-  const creds = resolveRazorpayCredentials();
-  if (!creds.ok) {
-    return {
-      status: 401,
-      body: {
-        status: 401,
-        success: false,
-        verified: false,
-        code: creds.code,
-        error: creds.error,
-      },
-    };
-  }
-  const { keyId, keySecret } = creds;
-
-  if (expectedOrderIdParam && expectedOrderIdParam !== razorpayOrderId) {
-    return {
-      status: 400,
-      body: {
-        status: 400,
-        success: false,
-        verified: false,
-        code: 'ORDER_MISMATCH',
-        error: 'Payment order ID does not match the stored checkout order.',
-      },
-    };
-  }
-
-  let verifiedToken: SignedCheckoutTokenPayload | null = null;
-  if (checkoutToken) {
-    verifiedToken = verifySignedCheckoutToken(checkoutToken, keySecret);
-    if (!verifiedToken || verifiedToken.oid !== razorpayOrderId) {
-      return {
-        status: 400,
-        body: {
-          status: 400,
-          success: false,
-          verified: false,
-          code: 'ORDER_MISMATCH',
-          error: 'Checkout session does not match the Razorpay order ID.',
-        },
-      };
-    }
-  }
-
-  // Verify HMAC-SHA256(order_id + "|" + payment_id, KEY_SECRET)
-  const expectedSignature = crypto
-    .createHmac('sha256', keySecret)
-    .update(`${razorpayOrderId}|${razorpayPaymentId}`)
-    .digest('hex');
-
-  const expectedBuf = Buffer.from(expectedSignature, 'utf8');
-  const actualBuf = Buffer.from(razorpaySignature, 'utf8');
-  const isValidSignature =
-    expectedBuf.length === actualBuf.length && crypto.timingSafeEqual(expectedBuf, actualBuf);
-
-  if (!isValidSignature) {
-    return {
-      status: 400,
-      body: {
-        status: 400,
-        success: false,
-        verified: false,
-        code: 'INVALID_SIGNATURE',
-        error: 'Invalid payment signature. Payment could not be verified.',
-      },
-    };
-  }
-
-  // Deduplicate concurrent verify requests for the same order
   const existingInFlight = inFlightVerifications.get(razorpayOrderId);
   if (existingInFlight) {
     return existingInFlight;
   }
 
-  const runVerification = async (): Promise<CheckoutHandlerResponse> => {
-    // Check in-memory and Firestore idempotency state first
+  const runFinalization = async (): Promise<CheckoutHandlerResponse> => {
+    const orderDocId = buildDeterministicOrderId(razorpayOrderId);
+
+    // 1. Check in-memory / store / Firestore idempotency state first
     const memCompleted = completedCheckoutsMemory.get(razorpayOrderId);
-    if (memCompleted) {
+    if (memCompleted?.order) {
       return {
         status: 200,
         body: {
@@ -1656,9 +2370,61 @@ export async function handleVerifyPaymentRequest(params: {
       };
     }
 
-    let pendingRecord =
-      pendingCheckoutsMemory.get(razorpayOrderId) ||
-      (await loadPendingCheckoutFromFirestore(razorpayOrderId));
+    if (store) {
+      const existingOrder = await store.getOrderById(orderDocId).catch(() => null);
+      if (existingOrder) {
+        const serialized: SerializedOrderReceipt = {
+          id: existingOrder.order.id,
+          orderNumber: existingOrder.order.order_number,
+          customerUserId: existingOrder.order.customer_user_id,
+          status: existingOrder.order.status,
+          paymentStatus: existingOrder.order.payment_status || 'paid',
+          fulfillmentStatus:
+            existingOrder.order.fulfillment_status || existingOrder.order.status,
+          subtotalPaise: existingOrder.order.subtotal_paise,
+          discountPaise: existingOrder.order.discount_paise || 0,
+          giftCardPaise: existingOrder.order.gift_card_paise || 0,
+          couponCode: existingOrder.order.coupon_code || null,
+          giftCardCode: existingOrder.order.gift_card_code || null,
+          totalPaise: existingOrder.order.total_paise,
+          currency: existingOrder.order.currency,
+          createdAt: existingOrder.order.created_at,
+          paymentMethod: 'razorpay',
+          razorpayOrderId:
+            existingOrder.order.razorpay_order_id || razorpayOrderId,
+          razorpayPaymentId:
+            existingOrder.order.razorpay_payment_id || razorpayPaymentId,
+          statusHistory: parseStatusHistorySafe(existingOrder.order.status_history_json),
+          items: existingOrder.items.map((l) => ({
+            productId: l.product_id,
+            variantId: l.variant_id,
+            productTitle: l.product_title,
+            variantLabel: l.variant_label,
+            sku: l.sku,
+            unitPricePaise: l.unit_price_paise,
+            quantity: l.quantity,
+            lineTotalPaise: l.line_total_paise,
+          })),
+        };
+        const responseBody: Record<string, unknown> = {
+          success: true,
+          verified: true,
+          already_processed: true,
+          order_id: razorpayOrderId,
+          payment_id: serialized.razorpayPaymentId,
+          message: 'Payment already verified and order confirmed.',
+          order: serialized,
+        };
+        completedCheckoutsMemory.set(razorpayOrderId, {
+          paymentId: serialized.razorpayPaymentId,
+          order: serialized,
+          responseBody,
+        });
+        return { status: 200, body: responseBody };
+      }
+    }
+
+    let pendingRecord = await loadPendingCheckoutRecord(razorpayOrderId, store);
 
     if (pendingRecord?.status === 'confirmed' && pendingRecord.confirmedOrder) {
       const responseBody: Record<string, unknown> = {
@@ -1678,70 +2444,45 @@ export async function handleVerifyPaymentRequest(params: {
       return { status: 200, body: responseBody };
     }
 
-    // Parse & validate orderData against server catalog if provided
-    const rawOrderData =
-      body.orderData && typeof body.orderData === 'object'
-        ? (body.orderData as Record<string, unknown>)
-        : null;
-    const customerFromOrderData = parseCustomerDetails(rawOrderData) || pendingRecord?.customer || null;
-    const parsedOrderItems = rawOrderData && Array.isArray(rawOrderData.items)
-      ? parseCartLines(rawOrderData.items)
-      : [];
-
-    let catalogValidatedForOrder: { lines: ValidatedOrderLine[]; totalPaise: number } | null = null;
-    if (parsedOrderItems.length > 0) {
-      try {
-        catalogValidatedForOrder = await validateCartAgainstCatalog({
-          items: parsedOrderItems,
-          store,
+    if (!store) {
+      const existingFsOrder = await fetchExistingFirestoreOrder(
+        orderDocId,
+        razorpayOrderId,
+        razorpayPaymentId
+      );
+      if (existingFsOrder) {
+        const responseBody: Record<string, unknown> = {
+          success: true,
+          verified: true,
+          already_processed: true,
+          order_id: razorpayOrderId,
+          payment_id: existingFsOrder.razorpayPaymentId || razorpayPaymentId,
+          message: 'Payment already verified and order confirmed.',
+          order: existingFsOrder,
+        };
+        completedCheckoutsMemory.set(razorpayOrderId, {
+          paymentId: existingFsOrder.razorpayPaymentId || razorpayPaymentId,
+          order: existingFsOrder,
+          responseBody,
         });
-      } catch (err) {
-        if (err instanceof StoreHttpError) {
-          return {
-            status: err.httpStatus,
-            body: {
-              status: err.httpStatus,
-              success: false,
-              verified: false,
-              code: err.code,
-              error: err.message,
-            },
-          };
-        }
-        throw err;
+        return { status: 200, body: responseBody };
       }
     }
 
     const expectedAmountPaise =
       pendingRecord?.amountPaise ??
       verifiedToken?.amt ??
-      catalogValidatedForOrder?.totalPaise ??
+      params.expectedAmountOverride ??
       null;
 
-    // If both pending/token amount and orderData catalog total exist, verify they match
-    if (
-      pendingRecord &&
-      catalogValidatedForOrder &&
-      pendingRecord.amountPaise !== catalogValidatedForOrder.totalPaise
-    ) {
-      return {
-        status: 400,
-        body: {
-          status: 400,
-          success: false,
-          verified: false,
-          code: 'AMOUNT_MISMATCH',
-          error: 'Order items total does not match the authorized Razorpay order amount.',
-        },
-      };
-    }
-
-    // Verify payment & order status server-side against Razorpay API
+    // 2. Verify payment & order status server-side against Razorpay API
     let fetchedPayment: RazorpayPaymentEntity;
     let fetchedOrder: RazorpayOrderEntity | null = null;
     try {
       const razorpay = (razorpayClientFactory || defaultRazorpayFactory)(keyId, keySecret);
-      fetchedPayment = await razorpay.payments.fetch(razorpayPaymentId);
+      fetchedPayment =
+        params.fetchedPaymentPreloaded || (await razorpay.payments.fetch(razorpayPaymentId));
+
       if (fetchedPayment.order_id && fetchedPayment.order_id !== razorpayOrderId) {
         return {
           status: 400,
@@ -1842,9 +2583,9 @@ export async function handleVerifyPaymentRequest(params: {
             success: false,
             verified: false,
             code: 'RAZORPAY_AUTH_FAILED',
-            keyMode: creds.mode,
+            keyMode,
             keyPrefix: masked,
-            error: `Razorpay API authentication failed for ${creds.mode} key "${masked}" while verifying payment. Ensure RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET match your active Razorpay key pair.`,
+            error: `Razorpay API authentication failed for ${keyMode} key "${masked}" while verifying payment. Ensure RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET match your active Razorpay key pair.`,
           },
         };
       }
@@ -1860,91 +2601,204 @@ export async function handleVerifyPaymentRequest(params: {
       };
     }
 
-    const finalLines =
-      catalogValidatedForOrder?.lines || pendingRecord?.items || [];
+    const finalLines = params.itemsOverride || pendingRecord?.items || [];
+    const effectiveCustomer = params.customerOverride || pendingRecord?.customer || null;
+    const effectiveUid =
+      params.customerUserId ||
+      pendingRecord?.customerUserId ||
+      verifiedToken?.uid ||
+      (typeof fetchedOrder?.notes?.customer_user_id === 'string' && fetchedOrder.notes.customer_user_id
+        ? fetchedOrder.notes.customer_user_id
+        : null) ||
+      null;
+
     const finalTotalPaise =
       expectedAmountPaise ?? Math.round(Number(fetchedPayment.amount));
+    const finalSubtotalPaise =
+      pendingRecord?.subtotalPaise ??
+      verifiedToken?.sub ??
+      (finalLines.length > 0
+        ? finalLines.reduce((sum, l) => sum + l.lineTotalPaise, 0)
+        : finalTotalPaise);
+    const finalDiscountPaise =
+      pendingRecord?.discountPaise ?? verifiedToken?.disc ?? 0;
+    const finalGiftCardPaise =
+      pendingRecord?.giftCardPaise ?? verifiedToken?.gc ?? 0;
+    const finalCouponCode =
+      pendingRecord?.couponCode ?? verifiedToken?.cpn ?? null;
+    const finalGiftCardCode =
+      pendingRecord?.giftCardCode ?? verifiedToken?.gcc ?? null;
 
-    if (customerFromOrderData && finalLines.length > 0) {
-      let confirmedReceipt: SerializedOrderReceipt;
+    if (effectiveCustomer && finalLines.length > 0) {
+      try {
+        let confirmedReceipt: SerializedOrderReceipt;
 
-      if (store) {
-        const placeInput: PlaceOrderInput = {
-          customerUserId,
-          customerName: customerFromOrderData.customerName,
-          customerEmail: customerFromOrderData.customerEmail,
-          customerPhone: customerFromOrderData.customerPhone,
-          shippingAddress: customerFromOrderData.shippingAddress,
-          items: finalLines.map((l) => ({
-            productId: l.productId,
-            variantId: l.variantId,
-            quantity: l.quantity,
-            expectedPricePaise: l.unitPricePaise,
-          })),
+        if (store) {
+          const suffix = crypto
+            .createHash('sha256')
+            .update(razorpayOrderId)
+            .digest('hex')
+            .slice(0, 6)
+            .toUpperCase();
+          const placeInput: PlaceOrderInput = {
+            id: orderDocId,
+            orderNumber: `SC-${suffix}`,
+            customerUserId: effectiveUid,
+            customerName: effectiveCustomer.customerName,
+            customerEmail: effectiveCustomer.customerEmail,
+            customerPhone: effectiveCustomer.customerPhone,
+            shippingAddress: effectiveCustomer.shippingAddress,
+            status: 'confirmed',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'confirmed',
+            paymentMethod: 'razorpay',
+            razorpayOrderId,
+            razorpayPaymentId,
+            couponCode: finalCouponCode,
+            giftCardCode: finalGiftCardCode,
+            discountPaise: finalDiscountPaise,
+            giftCardPaise: finalGiftCardPaise,
+            statusHistory: [
+              {
+                status: 'confirmed',
+                note:
+                  source === 'webhook'
+                    ? 'Confirmed automatically via Razorpay webhook'
+                    : source === 'recover'
+                      ? 'Recovered from captured Razorpay payment'
+                      : 'Payment verified via Razorpay',
+                actor: 'system',
+                at: Date.now(),
+              },
+            ],
+            items: finalLines.map((l) => ({
+              productId: l.productId,
+              variantId: l.variantId,
+              quantity: l.quantity,
+              expectedPricePaise: l.unitPricePaise,
+            })),
+          };
+          const { order, items } = await store.placeOrder(placeInput);
+          confirmedReceipt = {
+            id: order.id,
+            orderNumber: order.order_number,
+            customerUserId: order.customer_user_id,
+            status: order.status,
+            paymentStatus: order.payment_status || 'paid',
+            fulfillmentStatus: order.fulfillment_status || 'confirmed',
+            subtotalPaise: order.subtotal_paise,
+            discountPaise: order.discount_paise || 0,
+            giftCardPaise: order.gift_card_paise || 0,
+            couponCode: order.coupon_code || null,
+            giftCardCode: order.gift_card_code || null,
+            totalPaise: order.total_paise,
+            currency: order.currency,
+            createdAt: order.created_at,
+            paymentMethod: 'razorpay',
+            razorpayOrderId: order.razorpay_order_id || razorpayOrderId,
+            razorpayPaymentId: order.razorpay_payment_id || razorpayPaymentId,
+            statusHistory: parseStatusHistorySafe(order.status_history_json),
+            items: items.map((l) => ({
+              productId: l.product_id,
+              variantId: l.variant_id,
+              productTitle: l.product_title,
+              variantLabel: l.variant_label,
+              sku: l.sku,
+              unitPricePaise: l.unit_price_paise,
+              quantity: l.quantity,
+              lineTotalPaise: l.line_total_paise,
+            })),
+          };
+        } else {
+          confirmedReceipt = await persistConfirmedOrderToFirestoreOnce({
+            razorpayOrderId,
+            razorpayPaymentId,
+            customerUserId: effectiveUid,
+            customer: effectiveCustomer,
+            lines: finalLines,
+            subtotalPaise: finalSubtotalPaise,
+            discountPaise: finalDiscountPaise,
+            giftCardPaise: finalGiftCardPaise,
+            couponCode: finalCouponCode,
+            giftCardCode: finalGiftCardCode,
+            totalPaise: finalTotalPaise,
+            customerIdToken,
+            strictPersistence,
+          });
+        }
+
+        if (pendingRecord) {
+          pendingRecord = {
+            ...pendingRecord,
+            customerUserId: effectiveUid,
+            status: 'confirmed',
+            razorpayPaymentId,
+            confirmedOrder: confirmedReceipt,
+          };
+          pendingCheckoutsMemory.set(razorpayOrderId, pendingRecord);
+          await persistPendingCheckoutRecord({
+            record: pendingRecord,
+            store,
+            strictPersistence: false,
+            customerIdToken,
+          }).catch(() => {});
+        }
+
+        const responseBody: Record<string, unknown> = {
+          success: true,
+          verified: true,
+          order_id: razorpayOrderId,
+          payment_id: razorpayPaymentId,
+          message: 'Payment verified and order confirmed.',
+          order: confirmedReceipt,
         };
-        const { order, items } = await store.placeOrder(placeInput);
-        await store.updateOrderStatus(order.id, 'confirmed').catch(() => false);
-        confirmedReceipt = {
-          id: order.id,
-          orderNumber: order.order_number,
-          status: 'confirmed',
-          subtotalPaise: order.subtotal_paise,
-          totalPaise: order.total_paise,
-          currency: order.currency,
-          createdAt: order.created_at,
-          paymentMethod: 'razorpay',
-          razorpayOrderId,
-          razorpayPaymentId,
-          items: items.map((l) => ({
-            productId: l.product_id,
-            variantId: l.variant_id,
-            productTitle: l.product_title,
-            variantLabel: l.variant_label,
-            sku: l.sku,
-            unitPricePaise: l.unit_price_paise,
-            quantity: l.quantity,
-            lineTotalPaise: l.line_total_paise,
-          })),
-        };
-      } else {
-        confirmedReceipt = await persistConfirmedOrderToFirestoreOnce({
-          razorpayOrderId,
-          razorpayPaymentId,
-          customerUserId,
-          customer: customerFromOrderData,
-          lines: finalLines,
-          totalPaise: finalTotalPaise,
+        completedCheckoutsMemory.set(razorpayOrderId, {
+          paymentId: razorpayPaymentId,
+          order: confirmedReceipt,
+          responseBody,
         });
-      }
 
-      if (pendingRecord) {
-        pendingRecord = {
-          ...pendingRecord,
-          status: 'confirmed',
-          razorpayPaymentId,
-          confirmedOrder: confirmedReceipt,
+        return { status: 200, body: responseBody };
+      } catch (persistErr) {
+        // Payment WAS verified and captured, but saving the order to the DB failed/delayed.
+        // Return 202 pending confirmation so client does NOT charge again or lose reference.
+        if (pendingRecord) {
+          pendingRecord = {
+            ...pendingRecord,
+            customerUserId: effectiveUid,
+            status: 'payment_received_pending_confirm',
+            razorpayPaymentId,
+          };
+          pendingCheckoutsMemory.set(razorpayOrderId, pendingRecord);
+          await persistPendingCheckoutRecord({
+            record: pendingRecord,
+            store,
+            strictPersistence: false,
+            customerIdToken,
+          }).catch(() => {});
+        }
+
+        return {
+          status: 202,
+          body: {
+            status: 202,
+            success: true,
+            verified: true,
+            pending_confirmation: true,
+            code: 'ORDER_CONFIRMATION_PENDING',
+            order_id: razorpayOrderId,
+            payment_id: razorpayPaymentId,
+            message: 'Payment received. We’re confirming your order',
+            error:
+              persistErr instanceof Error
+                ? persistErr.message
+                : 'Order confirmation is delayed.',
+          },
         };
-        pendingCheckoutsMemory.set(razorpayOrderId, pendingRecord);
-        await savePendingCheckoutToFirestore(pendingRecord);
       }
-
-      const responseBody: Record<string, unknown> = {
-        success: true,
-        verified: true,
-        order_id: razorpayOrderId,
-        payment_id: razorpayPaymentId,
-        message: 'Payment verified and order confirmed.',
-        order: confirmedReceipt,
-      };
-      completedCheckoutsMemory.set(razorpayOrderId, {
-        paymentId: razorpayPaymentId,
-        order: confirmedReceipt,
-        responseBody,
-      });
-
-      return { status: 200, body: responseBody };
     }
 
+    // Payment captured/verified without order item lines (legacy standalone payment check)
     const responseBody: Record<string, unknown> = {
       success: true,
       verified: true,
@@ -1959,40 +2813,551 @@ export async function handleVerifyPaymentRequest(params: {
     return { status: 200, body: responseBody };
   };
 
-  const promise = runVerification().finally(() => {
+  const promise = runFinalization().finally(() => {
     inFlightVerifications.delete(razorpayOrderId);
   });
   inFlightVerifications.set(razorpayOrderId, promise);
+  return promise;
+}
 
-  try {
-    return await promise;
-  } catch (err) {
-    if (err instanceof StoreHttpError) {
-      return {
-        status: err.httpStatus,
-        body: {
-          status: err.httpStatus,
-          success: false,
-          verified: false,
-          code: err.code,
-          error: err.message,
-        },
-      };
-    }
+export async function handleVerifyPaymentRequest(params: {
+  body: Record<string, unknown>;
+  store?: BoutiqueStore | null;
+  customerUserId?: string | null;
+  customerIdToken?: string | null;
+  razorpayClientFactory?: RazorpayClientFactory;
+  strictPersistence?: boolean;
+}): Promise<CheckoutHandlerResponse> {
+  const {
+    body,
+    store = null,
+    customerUserId = null,
+    customerIdToken = null,
+    razorpayClientFactory,
+    strictPersistence = false,
+  } = params;
+
+  const razorpayOrderId =
+    typeof body.razorpay_order_id === 'string'
+      ? body.razorpay_order_id.trim()
+      : typeof body.order_id === 'string'
+        ? body.order_id.trim()
+        : '';
+  const razorpayPaymentId =
+    typeof body.razorpay_payment_id === 'string'
+      ? body.razorpay_payment_id.trim()
+      : typeof body.payment_id === 'string'
+        ? body.payment_id.trim()
+        : '';
+  const razorpaySignature =
+    typeof body.razorpay_signature === 'string'
+      ? body.razorpay_signature.trim()
+      : typeof body.signature === 'string'
+        ? body.signature.trim()
+        : '';
+  const checkoutToken =
+    typeof body.checkout_token === 'string' ? body.checkout_token.trim() : '';
+  const expectedOrderIdParam =
+    typeof body.expected_order_id === 'string' ? body.expected_order_id.trim() : '';
+
+  if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
     return {
-      status: 500,
+      status: 400,
       body: {
-        status: 500,
+        status: 400,
         success: false,
-        verified: true,
-        code: 'ORDER_RECORD_FAILED',
+        verified: false,
+        code: 'MISSING_FIELDS',
         error:
-          err instanceof Error
-            ? err.message
-            : 'Payment verified, but order recording failed.',
+          'Missing required payment verification fields (razorpay_order_id, razorpay_payment_id, razorpay_signature).',
       },
     };
   }
+
+  const creds = resolveRazorpayCredentials();
+  if (!creds.ok) {
+    return {
+      status: 401,
+      body: {
+        status: 401,
+        success: false,
+        verified: false,
+        code: creds.code,
+        error: creds.error,
+      },
+    };
+  }
+  const { keyId, keySecret, mode: keyMode } = creds;
+
+  if (expectedOrderIdParam && expectedOrderIdParam !== razorpayOrderId) {
+    return {
+      status: 400,
+      body: {
+        status: 400,
+        success: false,
+        verified: false,
+        code: 'ORDER_MISMATCH',
+        error: 'Payment order ID does not match the stored checkout order.',
+      },
+    };
+  }
+
+  let verifiedToken: SignedCheckoutTokenPayload | null = null;
+  if (checkoutToken) {
+    verifiedToken = verifySignedCheckoutToken(checkoutToken, keySecret);
+    if (!verifiedToken || verifiedToken.oid !== razorpayOrderId) {
+      return {
+        status: 400,
+        body: {
+          status: 400,
+          success: false,
+          verified: false,
+          code: 'ORDER_MISMATCH',
+          error: 'Checkout session does not match the Razorpay order ID.',
+        },
+      };
+    }
+  }
+
+  const expectedSignature = crypto
+    .createHmac('sha256', keySecret)
+    .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+    .digest('hex');
+
+  const expectedBuf = Buffer.from(expectedSignature, 'utf8');
+  const actualBuf = Buffer.from(razorpaySignature, 'utf8');
+  const isValidSignature =
+    expectedBuf.length === actualBuf.length && crypto.timingSafeEqual(expectedBuf, actualBuf);
+
+  if (!isValidSignature) {
+    return {
+      status: 400,
+      body: {
+        status: 400,
+        success: false,
+        verified: false,
+        code: 'INVALID_SIGNATURE',
+        error: 'Invalid payment signature. Payment could not be verified.',
+      },
+    };
+  }
+
+  const rawOrderData =
+    body.orderData && typeof body.orderData === 'object'
+      ? (body.orderData as Record<string, unknown>)
+      : null;
+  const customerFromOrderData = parseCustomerDetails(rawOrderData);
+  const parsedOrderItems =
+    rawOrderData && Array.isArray(rawOrderData.items)
+      ? parseCartLines(rawOrderData.items)
+      : [];
+
+  let catalogValidatedForOrder: { lines: ValidatedOrderLine[]; totalPaise: number } | null = null;
+  if (parsedOrderItems.length > 0) {
+    try {
+      catalogValidatedForOrder = await validateCartAgainstCatalog({
+        items: parsedOrderItems,
+        store,
+      });
+    } catch (err) {
+      if (err instanceof StoreHttpError) {
+        return {
+          status: err.httpStatus,
+          body: {
+            status: err.httpStatus,
+            success: false,
+            verified: false,
+            code: err.code,
+            error: err.message,
+          },
+        };
+      }
+      throw err;
+    }
+  }
+
+  const pendingRecord = await loadPendingCheckoutRecord(razorpayOrderId, store);
+  const expectedAmount =
+    pendingRecord?.amountPaise ?? verifiedToken?.amt ?? null;
+  const effectiveSubtotal = catalogValidatedForOrder?.totalPaise ?? null;
+  if (
+    pendingRecord &&
+    effectiveSubtotal !== null &&
+    pendingRecord.subtotalPaise !== effectiveSubtotal
+  ) {
+    return {
+      status: 400,
+      body: {
+        status: 400,
+        success: false,
+        verified: false,
+        code: 'AMOUNT_MISMATCH',
+        error: 'Order items total does not match the authorized Razorpay order amount.',
+      },
+    };
+  }
+
+  return finalizePaidRazorpayOrder({
+    razorpayOrderId,
+    razorpayPaymentId,
+    keyId,
+    keySecret,
+    keyMode,
+    store,
+    customerUserId,
+    customerIdToken,
+    customerOverride: customerFromOrderData,
+    itemsOverride: catalogValidatedForOrder?.lines || null,
+    expectedAmountOverride: expectedAmount ?? effectiveSubtotal,
+    verifiedToken,
+    razorpayClientFactory,
+    source: 'verify',
+    strictPersistence,
+  });
+}
+
+export async function handleRazorpayWebhookRequest(params: {
+  rawBody: string;
+  signatureHeader: string | string[] | undefined;
+  store?: BoutiqueStore | null;
+  razorpayClientFactory?: RazorpayClientFactory;
+}): Promise<CheckoutHandlerResponse> {
+  const { rawBody, signatureHeader, store = null, razorpayClientFactory } = params;
+  const sig = (Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader || '').trim();
+  const webhookSecret = sanitizeEnvCredential(process.env.RAZORPAY_WEBHOOK_SECRET);
+
+  if (!webhookSecret) {
+    return {
+      status: 503,
+      body: {
+        status: 503,
+        code: 'WEBHOOK_NOT_CONFIGURED',
+        error: 'RAZORPAY_WEBHOOK_SECRET is not configured on the server.',
+      },
+    };
+  }
+
+  if (!sig) {
+    return {
+      status: 401,
+      body: {
+        status: 401,
+        code: 'MISSING_WEBHOOK_SIGNATURE',
+        error: 'Missing X-Razorpay-Signature header.',
+      },
+    };
+  }
+
+  const expectedSig = crypto
+    .createHmac('sha256', webhookSecret)
+    .update(rawBody)
+    .digest('hex');
+  const expectedBuf = Buffer.from(expectedSig, 'utf8');
+  const actualBuf = Buffer.from(sig, 'utf8');
+  if (expectedBuf.length !== actualBuf.length || !crypto.timingSafeEqual(expectedBuf, actualBuf)) {
+    return {
+      status: 401,
+      body: {
+        status: 401,
+        code: 'INVALID_WEBHOOK_SIGNATURE',
+        error: 'Webhook signature verification failed.',
+      },
+    };
+  }
+
+  let event: Record<string, unknown>;
+  try {
+    event = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return {
+      status: 400,
+      body: { status: 400, code: 'INVALID_JSON', error: 'Invalid webhook payload.' },
+    };
+  }
+
+  const eventType = typeof event.event === 'string' ? event.event : '';
+  if (eventType !== 'payment.captured' && eventType !== 'order.paid') {
+    return {
+      status: 200,
+      body: { received: true, ignored: true, event: eventType },
+    };
+  }
+
+  const payload =
+    event.payload && typeof event.payload === 'object'
+      ? (event.payload as Record<string, unknown>)
+      : {};
+  const paymentWrapper =
+    payload.payment && typeof payload.payment === 'object'
+      ? (payload.payment as Record<string, unknown>)
+      : {};
+  const paymentEntity =
+    paymentWrapper.entity && typeof paymentWrapper.entity === 'object'
+      ? (paymentWrapper.entity as RazorpayPaymentEntity)
+      : null;
+  const orderWrapper =
+    payload.order && typeof payload.order === 'object'
+      ? (payload.order as Record<string, unknown>)
+      : {};
+  const orderEntity =
+    orderWrapper.entity && typeof orderWrapper.entity === 'object'
+      ? (orderWrapper.entity as RazorpayOrderEntity)
+      : null;
+
+  const razorpayOrderId =
+    (typeof paymentEntity?.order_id === 'string' && paymentEntity.order_id.trim()) ||
+    (typeof orderEntity?.id === 'string' && orderEntity.id.trim()) ||
+    '';
+  const razorpayPaymentId =
+    typeof paymentEntity?.id === 'string' ? paymentEntity.id.trim() : '';
+
+  if (!razorpayOrderId || !razorpayPaymentId) {
+    return {
+      status: 400,
+      body: {
+        status: 400,
+        code: 'MISSING_FIELDS',
+        error: 'Webhook payload missing payment.entity.id or order_id.',
+      },
+    };
+  }
+
+  const creds = resolveRazorpayCredentials();
+  if (!creds.ok) {
+    return {
+      status: 401,
+      body: { status: 401, code: creds.code, error: creds.error },
+    };
+  }
+
+  return finalizePaidRazorpayOrder({
+    razorpayOrderId,
+    razorpayPaymentId,
+    keyId: creds.keyId,
+    keySecret: creds.keySecret,
+    keyMode: creds.mode,
+    store,
+    customerUserId: null,
+    razorpayClientFactory,
+    source: 'webhook',
+    strictPersistence: shouldRequireDurablePersistence({ store }),
+  });
+}
+
+export async function handleOrderStatusRequest(params: {
+  razorpayOrderId: string;
+  razorpayPaymentId?: string;
+  store?: BoutiqueStore | null;
+  customerUserId?: string | null;
+  customerIdToken?: string | null;
+  razorpayClientFactory?: RazorpayClientFactory;
+}): Promise<CheckoutHandlerResponse> {
+  const {
+    razorpayOrderId,
+    razorpayPaymentId,
+    store = null,
+    customerUserId = null,
+    customerIdToken = null,
+    razorpayClientFactory,
+  } = params;
+
+  const cleanOid = razorpayOrderId.trim();
+  if (!cleanOid) {
+    return {
+      status: 400,
+      body: { status: 400, code: 'MISSING_ORDER_ID', error: 'razorpay_order_id is required.' },
+    };
+  }
+
+  const orderDocId = buildDeterministicOrderId(cleanOid);
+  if (store) {
+    const existing = await store.getOrderById(orderDocId).catch(() => null);
+    if (existing) {
+      if (
+        existing.order.customer_user_id &&
+        customerUserId &&
+        existing.order.customer_user_id !== customerUserId
+      ) {
+        return {
+          status: 403,
+          body: { status: 403, code: 'FORBIDDEN', error: 'Access denied for this order.' },
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          confirmed: true,
+          pending_confirmation: false,
+          order_id: cleanOid,
+          payment_id: existing.order.razorpay_payment_id || razorpayPaymentId || null,
+          order: {
+            id: existing.order.id,
+            orderNumber: existing.order.order_number,
+            customerUserId: existing.order.customer_user_id,
+            status: existing.order.status,
+            paymentStatus: existing.order.payment_status || 'paid',
+            fulfillmentStatus: existing.order.fulfillment_status || existing.order.status,
+            subtotalPaise: existing.order.subtotal_paise,
+            discountPaise: existing.order.discount_paise || 0,
+            giftCardPaise: existing.order.gift_card_paise || 0,
+            couponCode: existing.order.coupon_code || null,
+            giftCardCode: existing.order.gift_card_code || null,
+            totalPaise: existing.order.total_paise,
+            currency: existing.order.currency,
+            createdAt: existing.order.created_at,
+            paymentMethod: 'razorpay',
+            razorpayOrderId: cleanOid,
+            razorpayPaymentId: existing.order.razorpay_payment_id || razorpayPaymentId || '',
+            statusHistory: parseStatusHistorySafe(existing.order.status_history_json),
+            items: existing.items.map((l) => ({
+              productId: l.product_id,
+              variantId: l.variant_id,
+              productTitle: l.product_title,
+              variantLabel: l.variant_label,
+              sku: l.sku,
+              unitPricePaise: l.unit_price_paise,
+              quantity: l.quantity,
+              lineTotalPaise: l.line_total_paise,
+            })),
+          },
+        },
+      };
+    }
+  } else {
+    const existingFs = await fetchExistingFirestoreOrder(
+      orderDocId,
+      cleanOid,
+      razorpayPaymentId || ''
+    );
+    if (existingFs) {
+      return {
+        status: 200,
+        body: {
+          confirmed: true,
+          pending_confirmation: false,
+          order_id: cleanOid,
+          payment_id: existingFs.razorpayPaymentId || razorpayPaymentId || null,
+          order: existingFs,
+        },
+      };
+    }
+  }
+
+  const pendingRecord = await loadPendingCheckoutRecord(cleanOid, store);
+  const pid = razorpayPaymentId?.trim() || pendingRecord?.razorpayPaymentId || '';
+  if (!pid) {
+    return {
+      status: 200,
+      body: {
+        confirmed: false,
+        pending_confirmation: pendingRecord?.status === 'payment_received_pending_confirm',
+        order_id: cleanOid,
+        status: pendingRecord?.status || 'pending',
+      },
+    };
+  }
+
+  const creds = resolveRazorpayCredentials();
+  if (!creds.ok) {
+    return {
+      status: 202,
+      body: {
+        confirmed: false,
+        pending_confirmation: true,
+        order_id: cleanOid,
+        payment_id: pid,
+        message: 'Payment received. We’re confirming your order',
+      },
+    };
+  }
+
+  return finalizePaidRazorpayOrder({
+    razorpayOrderId: cleanOid,
+    razorpayPaymentId: pid,
+    keyId: creds.keyId,
+    keySecret: creds.keySecret,
+    keyMode: creds.mode,
+    store,
+    customerUserId,
+    customerIdToken,
+    razorpayClientFactory,
+    source: 'status',
+  });
+}
+
+export async function handleRecoverRazorpayOrder(params: {
+  razorpayOrderId: string;
+  razorpayPaymentId?: string;
+  customerFallback?: OrderCustomerDetails | null;
+  store?: BoutiqueStore | null;
+  razorpayClientFactory?: RazorpayClientFactory;
+}): Promise<CheckoutHandlerResponse> {
+  const {
+    razorpayOrderId,
+    razorpayPaymentId,
+    customerFallback = null,
+    store = null,
+    razorpayClientFactory,
+  } = params;
+
+  const cleanOid = razorpayOrderId.trim();
+  if (!cleanOid) {
+    return {
+      status: 400,
+      body: { status: 400, code: 'MISSING_ORDER_ID', error: 'razorpayOrderId is required.' },
+    };
+  }
+
+  const creds = resolveRazorpayCredentials();
+  if (!creds.ok) {
+    return {
+      status: 401,
+      body: { status: 401, code: creds.code, error: creds.error },
+    };
+  }
+
+  let pid = (razorpayPaymentId || '').trim();
+  if (!pid) {
+    const pending = await loadPendingCheckoutRecord(cleanOid, store);
+    pid = pending?.razorpayPaymentId || '';
+  }
+
+  const razorpay = (razorpayClientFactory || defaultRazorpayFactory)(creds.keyId, creds.keySecret);
+  if (!pid && typeof razorpay.orders.fetchPayments === 'function') {
+    try {
+      const paymentsList = await razorpay.orders.fetchPayments(cleanOid);
+      const captured = (paymentsList.items || []).find(
+        (p) => p.status === 'captured' || p.captured === true || p.status === 'authorized'
+      );
+      if (captured?.id) pid = captured.id;
+    } catch {
+      // fall through
+    }
+  }
+
+  if (!pid) {
+    return {
+      status: 404,
+      body: {
+        status: 404,
+        code: 'NO_CAPTURED_PAYMENT',
+        error: `No captured or authorized Razorpay payment found for order ${cleanOid}. Provide the Razorpay Payment ID (pay_...) to recover.`,
+      },
+    };
+  }
+
+  return finalizePaidRazorpayOrder({
+    razorpayOrderId: cleanOid,
+    razorpayPaymentId: pid,
+    keyId: creds.keyId,
+    keySecret: creds.keySecret,
+    keyMode: creds.mode,
+    store,
+    customerUserId: null,
+    customerOverride: customerFallback,
+    razorpayClientFactory,
+    source: 'recover',
+  });
 }
 
 export function clearRazorpayCheckoutCachesForTest() {

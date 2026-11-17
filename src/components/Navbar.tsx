@@ -49,8 +49,9 @@ export function Navbar({
   onNavigateAuth,
   onNavigateSection,
 }: NavbarProps) {
-  const { user, logout } = useAuth();
+  const { user, apiRequest, logout } = useAuth();
   const { settings } = useStorefront();
+  const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [isScrolled, setIsScrolled] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
@@ -76,6 +77,28 @@ export function Navbar({
     window.addEventListener('scroll', handleScroll, { passive: true });
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
+
+  useEffect(() => {
+    if (!user) {
+      setUnreadNotifications(0);
+      return;
+    }
+    let cancelled = false;
+    const loadUnread = () => {
+      void apiRequest<{ unreadCount?: number }>('/api/account/notifications').then((res) => {
+        if (!cancelled && res.ok) {
+          setUnreadNotifications(Math.max(0, Number(res.data.unreadCount || 0)));
+        }
+      });
+    };
+    loadUnread();
+    const handleUpdated = () => loadUnread();
+    window.addEventListener('sahithi:notifications-updated', handleUpdated);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('sahithi:notifications-updated', handleUpdated);
+    };
+  }, [user, apiRequest]);
 
   useEffect(() => {
     if (!accountMenuOpen) return;
@@ -249,6 +272,14 @@ export function Navbar({
                 >
                   <User className="h-4 w-4 text-[#B76E79]" aria-hidden="true" />
                   <span className="max-w-[120px] truncate">{displayFirstName}</span>
+                  {unreadNotifications > 0 && (
+                    <span
+                      aria-label={`${unreadNotifications} unread notifications`}
+                      className="text-xs font-semibold tabular-nums text-[#B76E79]"
+                    >
+                      ({unreadNotifications})
+                    </span>
+                  )}
                   <ChevronDown className="h-3.5 w-3.5 text-[#49243E]/70" aria-hidden="true" />
                 </button>
 
@@ -287,10 +318,17 @@ export function Navbar({
                         setAccountMenuOpen(false);
                         onNavigateAuth('/account');
                       }}
-                      className="mt-1 flex min-h-[40px] w-full items-center gap-2 rounded-xl px-3 text-left text-sm font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/35"
+                      className="mt-1 flex min-h-[40px] w-full items-center justify-between gap-2 rounded-xl px-3 text-left text-sm font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/35"
                     >
-                      <User className="h-4 w-4 text-[#B76E79]" aria-hidden="true" />
-                      <span>Account Dashboard</span>
+                      <span className="flex items-center gap-2">
+                        <User className="h-4 w-4 text-[#B76E79]" aria-hidden="true" />
+                        <span>Your Account</span>
+                      </span>
+                      {unreadNotifications > 0 && (
+                        <span className="text-xs font-semibold tabular-nums text-[#B76E79]">
+                          {unreadNotifications} new
+                        </span>
+                      )}
                     </button>
                     <button
                       type="button"
@@ -451,7 +489,10 @@ export function Navbar({
                       className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl border border-[#49243E]/20 bg-white px-4 py-2.5 text-sm font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/30"
                     >
                       <User className="h-4 w-4 text-[#B76E79]" aria-hidden="true" />
-                      <span className="truncate">{user.fullName || 'Account Dashboard'}</span>
+                      <span className="truncate">
+                        {user.fullName || 'Your Account'}
+                        {unreadNotifications > 0 ? ` (${unreadNotifications})` : ''}
+                      </span>
                     </button>
                     <button
                       type="button"

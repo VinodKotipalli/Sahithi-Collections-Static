@@ -13,11 +13,19 @@ import {
   type CategoryRow,
   type ContactMessageRow,
   type ContactMessageStatus,
+  type CouponRow,
+  type CustomerAddressRow,
+  type CustomerNotificationRow,
   type EmailTokenRow,
+  type GiftCardRow,
   type LegacyPhoneOnlyAccount,
+  type LoyaltyConfigData,
   type OrderItemRow,
+  type OrderReturnRequestRecord,
   type OrderRow,
+  type OrderStatusHistoryEntry,
   type OrderWithItems,
+  type PendingCheckoutRow,
   type PlaceOrderInput,
   type ProductAuditLogRow,
   type ProductImageRow,
@@ -29,12 +37,14 @@ import {
   type SessionRow,
   type SiteSettingsData,
   type StorefrontContentData,
+  type StoreUserSummary,
   type UserRow,
 } from './store.ts';
 import {
   DEFAULT_SITE_SETTINGS,
   DEFAULT_STOREFRONT_CONTENT,
   extractReferencedMediaFilenames,
+  mergeLoyaltyConfig,
   mergeSiteSettings,
   mergeStorefrontContent,
 } from './storefront-defaults.ts';
@@ -918,12 +928,54 @@ interface FirestoreOrderDoc {
   customer_phone: string;
   shipping_address: string;
   status: string;
+  payment_status?: string;
+  fulfillment_status?: string;
+  payment_method?: string;
+  razorpay_order_id?: string | null;
+  razorpay_payment_id?: string | null;
+  coupon_code?: string | null;
+  gift_card_code?: string | null;
+  discount_paise?: number;
+  gift_card_paise?: number;
+  status_history_json?: string;
+  return_request_json?: string | null;
   subtotal_paise: number;
   total_paise: number;
   currency: string;
   created_at: number;
+  updated_at?: number;
   product_ids: string[];
   items: OrderItemRow[];
+}
+
+function normalizeRestOrderRow(o: FirestoreOrderDoc): OrderRow {
+  return {
+    id: o.id,
+    order_number: o.order_number,
+    customer_user_id: o.customer_user_id ?? null,
+    customer_name: o.customer_name,
+    customer_email: o.customer_email,
+    customer_phone: o.customer_phone,
+    shipping_address: o.shipping_address,
+    status: o.status,
+    payment_status: o.payment_status ?? (o.razorpay_payment_id ? 'paid' : 'unpaid'),
+    fulfillment_status: o.fulfillment_status ?? o.status ?? 'placed',
+    payment_method:
+      o.payment_method ?? (o.razorpay_order_id || o.razorpay_payment_id ? 'razorpay' : 'cod'),
+    razorpay_order_id: o.razorpay_order_id ?? null,
+    razorpay_payment_id: o.razorpay_payment_id ?? null,
+    coupon_code: o.coupon_code ?? null,
+    gift_card_code: o.gift_card_code ?? null,
+    discount_paise: Number(o.discount_paise || 0),
+    gift_card_paise: Number(o.gift_card_paise || 0),
+    status_history_json: o.status_history_json || '[]',
+    return_request_json: o.return_request_json ?? null,
+    subtotal_paise: Number(o.subtotal_paise || 0),
+    total_paise: Number(o.total_paise || 0),
+    currency: o.currency || 'INR',
+    created_at: Number(o.created_at || 0),
+    updated_at: Number(o.updated_at || o.created_at || 0),
+  };
 }
 
 function fromFirestoreProduct(doc: FirestoreProductDoc): ProductWithParts {
@@ -1990,12 +2042,13 @@ export class FirestoreRestStore implements BoutiqueStore {
   }
 
   async getAdminOverview(): Promise<AdminOverviewData> {
-    const [products, orders, categories, messageDocs, auditDocs] = await Promise.all([
+    const [products, orders, categories, messageDocs, auditDocs, userDocs] = await Promise.all([
       this.getAllProductDocs(),
       this.getAllOrderDocs(),
       this.listCategories(),
       this.runQuery('contact_messages'),
       this.runQuery('product_audit_logs'),
+      this.runQuery('users').catch(() => []),
     ]);
 
     const orderCounts = this.computeOrderCounts(orders);
@@ -2020,25 +2073,22 @@ export class FirestoreRestStore implements BoutiqueStore {
       .filter((o) => o.status !== 'cancelled')
       .reduce((sum, o) => sum + Number(o.total_paise || 0), 0);
     const pendingOrders = orders.filter((o) => o.status === 'pending').length;
+    const openReturnRequests = orders.reduce((acc, o) => {
+      if (!o.return_request_json) return acc;
+      try {
+        const req = JSON.parse(o.return_request_json) as { status?: string };
+        return req?.status === 'pending' ? acc + 1 : acc;
+      } catch {
+        return acc;
+      }
+    }, 0);
+    const totalCustomers = userDocs.filter((u) => Boolean(u.data?.email_verified)).length;
 
     const recentOrders: OrderWithItems[] = [...orders]
       .sort((a, b) => b.created_at - a.created_at)
       .slice(0, 5)
       .map((o) => ({
-        order: {
-          id: o.id,
-          order_number: o.order_number,
-          customer_user_id: o.customer_user_id ?? null,
-          customer_name: o.customer_name,
-          customer_email: o.customer_email,
-          customer_phone: o.customer_phone,
-          shipping_address: o.shipping_address,
-          status: o.status,
-          subtotal_paise: Number(o.subtotal_paise),
-          total_paise: Number(o.total_paise),
-          currency: o.currency,
-          created_at: Number(o.created_at),
-        },
+        order: normalizeRestOrderRow(o),
         items: o.items || [],
       }));
 
@@ -2057,6 +2107,8 @@ export class FirestoreRestStore implements BoutiqueStore {
         unreadMessages: messages.filter((m) => m.status === 'unread').length,
         totalMessages: messages.length,
         totalAuditEvents: auditLogs.length,
+        totalCustomers,
+        openReturnRequests,
       },
       lowStockItems: lowStockList.slice(0, 5).map((doc) => ({
         ...fromFirestoreProduct(doc),
@@ -2794,21 +2846,61 @@ export class FirestoreRestStore implements BoutiqueStore {
     return new Map(items.map((item) => [item.product.id, item]));
   }
 
+  async savePendingCheckout(record: PendingCheckoutRow): Promise<void> {
+    await this.setDoc(
+      `pending_checkouts/${record.id}`,
+      record as unknown as Record<string, unknown>
+    );
+  }
+
+  async getPendingCheckout(razorpayOrderId: string): Promise<PendingCheckoutRow | null> {
+    const doc = await this.getDoc(`pending_checkouts/${razorpayOrderId}`);
+    if (!doc) return null;
+    return doc.data as unknown as PendingCheckoutRow;
+  }
+
   async placeOrder(input: PlaceOrderInput): Promise<{ order: OrderRow; items: OrderItemRow[] }> {
+    if (input.id) {
+      const existingById = await this.getDoc(`orders/${input.id}`).catch(() => null);
+      if (existingById) {
+        const d = existingById.data as unknown as FirestoreOrderDoc;
+        return { order: normalizeRestOrderRow(d), items: d.items || [] };
+      }
+    }
+    if (input.razorpayOrderId) {
+      const existingByRzp = await this.runQuery('orders', {
+        where: {
+          fieldFilter: {
+            field: { fieldPath: 'razorpay_order_id' },
+            op: 'EQUAL',
+            value: { stringValue: input.razorpayOrderId },
+          },
+        },
+        limit: 1,
+      }).catch(() => []);
+      if (existingByRzp[0]) {
+        const d = existingByRzp[0].data as unknown as FirestoreOrderDoc;
+        return { order: normalizeRestOrderRow(d), items: d.items || [] };
+      }
+    }
+
     const publishedMap = await this.getPublicProductsMap();
     const now = Date.now();
-    const orderId = crypto.randomUUID();
-    const orderNumber = `SC-${now.toString(36).toUpperCase().slice(-5)}${crypto
-      .randomBytes(2)
-      .toString('hex')
-      .toUpperCase()}`;
+    const orderId = input.id || crypto.randomUUID();
+    const orderNumber =
+      input.orderNumber ||
+      `SC-${now.toString(36).toUpperCase().slice(-5)}${crypto
+        .randomBytes(2)
+        .toString('hex')
+        .toUpperCase()}`;
 
     let subtotalPaise = 0;
     const orderItems: OrderItemRow[] = [];
     const productIds = new Set<string>();
+    const pendingStockUpdates = new Map<string, ProductWithParts>();
 
     for (const reqItem of input.items) {
-      const prodWrap = publishedMap.get(reqItem.productId);
+      const prodWrap = pendingStockUpdates.get(reqItem.productId) || publishedMap.get(reqItem.productId);
       if (!prodWrap) {
         throw new StoreHttpError(
           409,
@@ -2841,6 +2933,16 @@ export class FirestoreRestStore implements BoutiqueStore {
         );
       }
 
+      const nextVariants = prodWrap.variants.map((v) =>
+        v.id === variant.id ? { ...v, stock_qty: v.stock_qty - reqItem.quantity } : v
+      );
+      const nextTotalStock = nextVariants.reduce((sum, v) => sum + v.stock_qty, 0);
+      pendingStockUpdates.set(prodWrap.product.id, {
+        ...prodWrap,
+        product: { ...prodWrap.product, stock_qty: nextTotalStock, updated_at: now },
+        variants: nextVariants,
+      });
+
       const lineTotal = variant.price_paise * reqItem.quantity;
       subtotalPaise += lineTotal;
       productIds.add(prodWrap.product.id);
@@ -2859,6 +2961,32 @@ export class FirestoreRestStore implements BoutiqueStore {
       });
     }
 
+    const cleanCouponCode = input.couponCode?.trim().toUpperCase() || null;
+    const cleanGiftCardCode = input.giftCardCode?.trim().toUpperCase() || null;
+    const discountPaise = Math.max(0, Math.min(subtotalPaise, Math.round(input.discountPaise || 0)));
+    const giftCardPaise = Math.max(
+      0,
+      Math.min(subtotalPaise - discountPaise, Math.round(input.giftCardPaise || 0))
+    );
+    const totalPaise = Math.max(0, subtotalPaise - discountPaise - giftCardPaise);
+
+    const status = input.status || 'pending';
+    const paymentStatus = input.paymentStatus || (input.paymentMethod === 'razorpay' ? 'paid' : 'unpaid');
+    const fulfillmentStatus = input.fulfillmentStatus || (status === 'confirmed' ? 'confirmed' : 'placed');
+    const paymentMethod = input.paymentMethod || 'cod';
+    const statusHistory: OrderStatusHistoryEntry[] =
+      input.statusHistory && input.statusHistory.length > 0
+        ? input.statusHistory
+        : [
+            {
+              status: fulfillmentStatus,
+              note: paymentMethod === 'razorpay' ? 'Payment verified via Razorpay' : 'Order placed',
+              actor: 'system',
+              at: now,
+            },
+          ];
+    const statusHistoryJson = JSON.stringify(statusHistory);
+
     const orderDoc: FirestoreOrderDoc = {
       id: orderId,
       order_number: orderNumber,
@@ -2867,33 +2995,98 @@ export class FirestoreRestStore implements BoutiqueStore {
       customer_email: input.customerEmail,
       customer_phone: input.customerPhone,
       shipping_address: input.shippingAddress,
-      status: 'pending',
+      status,
+      payment_status: paymentStatus,
+      fulfillment_status: fulfillmentStatus,
+      payment_method: paymentMethod,
+      razorpay_order_id: input.razorpayOrderId || null,
+      razorpay_payment_id: input.razorpayPaymentId || null,
+      coupon_code: cleanCouponCode,
+      gift_card_code: cleanGiftCardCode,
+      discount_paise: discountPaise,
+      gift_card_paise: giftCardPaise,
+      status_history_json: statusHistoryJson,
+      return_request_json: null,
       subtotal_paise: subtotalPaise,
-      total_paise: subtotalPaise,
+      total_paise: totalPaise,
       currency: 'INR',
       created_at: now,
+      updated_at: now,
       product_ids: Array.from(productIds),
       items: orderItems,
     };
 
     await this.setDoc(`orders/${orderId}`, orderDoc as unknown as Record<string, unknown>);
 
-    const orderRow: OrderRow = {
-      id: orderDoc.id,
-      order_number: orderDoc.order_number,
-      customer_user_id: orderDoc.customer_user_id,
-      customer_name: orderDoc.customer_name,
-      customer_email: orderDoc.customer_email,
-      customer_phone: orderDoc.customer_phone,
-      shipping_address: orderDoc.shipping_address,
-      status: orderDoc.status,
-      subtotal_paise: orderDoc.subtotal_paise,
-      total_paise: orderDoc.total_paise,
-      currency: orderDoc.currency,
-      created_at: orderDoc.created_at,
-    };
+    // Best-effort stock, coupon, gift card, and notification updates when permissions allow
+    for (const [pid, updatedWrap] of pendingStockUpdates.entries()) {
+      const prodDoc = await this.getDoc(`products/${pid}`).catch(() => null);
+      if (prodDoc) {
+        await this.patchDoc(`products/${pid}`, {
+          variants: updatedWrap.variants,
+          stock_qty: updatedWrap.product.stock_qty,
+          updated_at: now,
+        }).catch(() => {});
+      }
+    }
+    if (cleanCouponCode) {
+      const cpn = await this.getCouponByCode(cleanCouponCode).catch(() => null);
+      if (cpn) {
+        await this.patchDoc(`coupons/${cpn.id}`, {
+          used_count: Number(cpn.used_count || 0) + 1,
+          updated_at: now,
+        }).catch(() => {});
+      }
+    }
+    if (cleanGiftCardCode && giftCardPaise > 0) {
+      const gc = await this.getGiftCardByCode(cleanGiftCardCode).catch(() => null);
+      if (gc) {
+        await this.patchDoc(`gift_cards/${gc.id}`, {
+          balance_paise: Math.max(0, Number(gc.balance_paise || 0) - giftCardPaise),
+          last_used_at: now,
+          updated_at: now,
+        }).catch(() => {});
+      }
+    }
+    if (input.customerUserId) {
+      await this.createCustomerNotification({
+        id: `notif_placed_${orderId}`,
+        userId: input.customerUserId,
+        type: 'order_placed',
+        title: `Order ${orderNumber} placed`,
+        message:
+          paymentMethod === 'razorpay'
+            ? `Payment verified for order ${orderNumber} (₹${(totalPaise / 100).toLocaleString('en-IN')}).`
+            : `Your boutique order ${orderNumber} has been received.`,
+        orderId,
+        orderNumber,
+      }).catch(() => {});
+    }
 
-    return { order: orderRow, items: orderItems };
+    return { order: normalizeRestOrderRow(orderDoc), items: orderItems };
+  }
+
+  async getOrderById(orderId: string): Promise<OrderWithItems | null> {
+    const doc = await this.getDoc(`orders/${orderId}`);
+    if (!doc) return null;
+    const d = doc.data as unknown as FirestoreOrderDoc;
+    return { order: normalizeRestOrderRow(d), items: d.items || [] };
+  }
+
+  async listCustomerOrders(userId: string): Promise<OrderWithItems[]> {
+    const docs = await this.runQuery('orders', {
+      where: {
+        fieldFilter: {
+          field: { fieldPath: 'customer_user_id' },
+          op: 'EQUAL',
+          value: { stringValue: userId },
+        },
+      },
+    });
+    return docs
+      .map((d) => d.data as unknown as FirestoreOrderDoc)
+      .sort((a, b) => Number(b.created_at) - Number(a.created_at))
+      .map((d) => ({ order: normalizeRestOrderRow(d), items: d.items || [] }));
   }
 
   async listAdminOrders(page: number, pageSize: number) {
@@ -2903,20 +3096,7 @@ export class FirestoreRestStore implements BoutiqueStore {
     const offset = (page - 1) * pageSize;
 
     const items: OrderWithItems[] = orders.slice(offset, offset + pageSize).map((o) => ({
-      order: {
-        id: o.id,
-        order_number: o.order_number,
-        customer_user_id: o.customer_user_id ?? null,
-        customer_name: o.customer_name,
-        customer_email: o.customer_email,
-        customer_phone: o.customer_phone,
-        shipping_address: o.shipping_address,
-        status: o.status,
-        subtotal_paise: Number(o.subtotal_paise),
-        total_paise: Number(o.total_paise),
-        currency: o.currency,
-        created_at: Number(o.created_at),
-      },
+      order: normalizeRestOrderRow(o),
       items: o.items || [],
     }));
 
@@ -2924,10 +3104,506 @@ export class FirestoreRestStore implements BoutiqueStore {
   }
 
   async updateOrderStatus(orderId: string, nextStatus: string): Promise<boolean> {
+    const updated = await this.updateOrderStatusWithHistory(orderId, nextStatus, {
+      actor: 'owner',
+      notifyCustomer: true,
+    });
+    return Boolean(updated);
+  }
+
+  async updateOrderStatusWithHistory(
+    orderId: string,
+    nextStatus: string,
+    options?: {
+      actor?: 'owner' | 'system' | 'customer';
+      note?: string;
+      notifyCustomer?: boolean;
+    }
+  ): Promise<OrderWithItems | null> {
     const existing = await this.getDoc(`orders/${orderId}`);
+    if (!existing) return null;
+    const docData = existing.data as unknown as FirestoreOrderDoc;
+    const now = Date.now();
+
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(docData.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+
+    const changed = docData.status !== nextStatus || docData.fulfillment_status !== nextStatus;
+    if (changed || options?.note) {
+      history.push({
+        status: nextStatus,
+        note: options?.note?.trim() || undefined,
+        actor: options?.actor || 'owner',
+        at: now,
+      });
+    }
+
+    const patch = {
+      status: nextStatus,
+      fulfillment_status: nextStatus,
+      status_history_json: JSON.stringify(history),
+      updated_at: now,
+    };
+    await this.patchDoc(`orders/${orderId}`, patch);
+
+    if (options?.notifyCustomer !== false && changed && docData.customer_user_id) {
+      const label = nextStatus.replace(/_/g, ' ');
+      await this.createCustomerNotification({
+        id: `notif_status_${orderId}_${nextStatus}_${now}`,
+        userId: docData.customer_user_id,
+        type: 'order_status',
+        title: `Order ${docData.order_number} is now ${label}`,
+        message: options?.note?.trim()
+          ? `${options.note.trim()} (Order ${docData.order_number})`
+          : `Your order ${docData.order_number} status has been updated to ${label}.`,
+        orderId,
+        orderNumber: docData.order_number,
+      }).catch(() => {});
+    }
+
+    const updatedDoc: FirestoreOrderDoc = { ...docData, ...patch };
+    return { order: normalizeRestOrderRow(updatedDoc), items: updatedDoc.items || [] };
+  }
+
+  async submitOrderReturnRequest(input: {
+    orderId: string;
+    userId: string;
+    type: 'cancel' | 'return';
+    reason: string;
+  }): Promise<OrderWithItems | null> {
+    const existing = await this.getDoc(`orders/${input.orderId}`);
+    if (!existing) return null;
+    const docData = existing.data as unknown as FirestoreOrderDoc;
+    if (docData.customer_user_id !== input.userId) {
+      throw new StoreHttpError(403, 'FORBIDDEN', 'You can only request changes for your own orders.');
+    }
+
+    const now = Date.now();
+    const requestRecord: OrderReturnRequestRecord = {
+      id: `req_${crypto.randomUUID().slice(0, 12)}`,
+      type: input.type,
+      reason: input.reason.trim().slice(0, 500),
+      status: 'pending',
+      requestedAt: now,
+      resolvedAt: null,
+    };
+
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(docData.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+    history.push({
+      status: input.type === 'cancel' ? 'cancellation_requested' : 'return_requested',
+      note: requestRecord.reason,
+      actor: 'customer',
+      at: now,
+    });
+
+    const patch = {
+      return_request_json: JSON.stringify(requestRecord),
+      status_history_json: JSON.stringify(history),
+      updated_at: now,
+    };
+    await this.patchDoc(`orders/${input.orderId}`, patch);
+
+    const updatedDoc: FirestoreOrderDoc = { ...docData, ...patch };
+    return { order: normalizeRestOrderRow(updatedDoc), items: updatedDoc.items || [] };
+  }
+
+  async resolveOrderReturnRequest(input: {
+    orderId: string;
+    decision: 'approved' | 'rejected';
+    note?: string;
+  }): Promise<OrderWithItems | null> {
+    const existing = await this.getDoc(`orders/${input.orderId}`);
+    if (!existing) return null;
+    const docData = existing.data as unknown as FirestoreOrderDoc;
+    if (!docData.return_request_json) return null;
+
+    let reqRecord: OrderReturnRequestRecord;
+    try {
+      reqRecord = JSON.parse(docData.return_request_json) as OrderReturnRequestRecord;
+    } catch {
+      return null;
+    }
+
+    const now = Date.now();
+    reqRecord.status = input.decision;
+    reqRecord.resolvedAt = now;
+    if (input.note?.trim()) {
+      reqRecord.resolutionNote = input.note.trim().slice(0, 300);
+    }
+
+    const nextFulfillment =
+      input.decision === 'approved'
+        ? reqRecord.type === 'cancel'
+          ? 'cancelled'
+          : 'returned'
+        : docData.fulfillment_status || docData.status;
+    const nextStatus =
+      input.decision === 'approved'
+        ? reqRecord.type === 'cancel'
+          ? 'cancelled'
+          : 'returned'
+        : docData.status;
+
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(docData.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+    history.push({
+      status: `${reqRecord.type}_${input.decision}`,
+      note: reqRecord.resolutionNote || `Request ${input.decision} by store owner`,
+      actor: 'owner',
+      at: now,
+    });
+
+    const patch = {
+      status: nextStatus,
+      fulfillment_status: nextFulfillment,
+      return_request_json: JSON.stringify(reqRecord),
+      status_history_json: JSON.stringify(history),
+      updated_at: now,
+    };
+    await this.patchDoc(`orders/${input.orderId}`, patch);
+
+    if (docData.customer_user_id) {
+      await this.createCustomerNotification({
+        id: `notif_req_${docData.id}_${input.decision}_${now}`,
+        userId: docData.customer_user_id,
+        type: 'request_update',
+        title: `${reqRecord.type === 'cancel' ? 'Cancellation' : 'Return'} request ${input.decision}`,
+        message:
+          reqRecord.resolutionNote ||
+          `Your ${reqRecord.type} request for order ${docData.order_number} was ${input.decision}.`,
+        orderId: docData.id,
+        orderNumber: docData.order_number,
+      }).catch(() => {});
+    }
+
+    const updatedDoc: FirestoreOrderDoc = { ...docData, ...patch };
+    return { order: normalizeRestOrderRow(updatedDoc), items: updatedDoc.items || [] };
+  }
+
+  async listCustomerAddresses(userId: string): Promise<CustomerAddressRow[]> {
+    const docs = await this.runQuery('addresses', { parentRelPath: `users/${userId}` });
+    return docs
+      .map((d) => d.data as unknown as CustomerAddressRow)
+      .sort((a, b) => Number(b.is_default) - Number(a.is_default) || Number(b.updated_at) - Number(a.updated_at));
+  }
+
+  async upsertCustomerAddress(
+    userId: string,
+    input: {
+      id?: string;
+      fullName: string;
+      phone: string;
+      line1: string;
+      line2?: string;
+      city: string;
+      state: string;
+      pincode: string;
+      landmark?: string;
+      label: 'Home' | 'Work' | 'Other';
+      isDefault: boolean;
+    }
+  ): Promise<CustomerAddressRow> {
+    const now = Date.now();
+    const id = input.id && /^[a-zA-Z0-9_-]{3,80}$/.test(input.id) ? input.id : `addr_${crypto.randomUUID().slice(0, 12)}`;
+    const existingList = await this.listCustomerAddresses(userId);
+    const shouldBeDefault = input.isDefault || existingList.length === 0 ? 1 : 0;
+    const prev = existingList.find((a) => a.id === id);
+
+    if (shouldBeDefault) {
+      for (const addr of existingList) {
+        if (addr.id !== id && addr.is_default) {
+          await this.patchDoc(`users/${userId}/addresses/${addr.id}`, { is_default: 0 }).catch(() => {});
+        }
+      }
+    }
+
+    const row: CustomerAddressRow = {
+      id,
+      user_id: userId,
+      full_name: input.fullName.trim(),
+      phone: input.phone.trim(),
+      line1: input.line1.trim(),
+      line2: (input.line2 || '').trim(),
+      city: input.city.trim(),
+      state: input.state.trim(),
+      pincode: input.pincode.trim(),
+      landmark: (input.landmark || '').trim(),
+      label: input.label,
+      is_default: shouldBeDefault,
+      created_at: prev?.created_at || now,
+      updated_at: now,
+    };
+
+    await this.setDoc(`users/${userId}/addresses/${id}`, row as unknown as Record<string, unknown>);
+    return row;
+  }
+
+  async deleteCustomerAddress(userId: string, addressId: string): Promise<boolean> {
+    const existing = await this.getDoc(`users/${userId}/addresses/${addressId}`);
     if (!existing) return false;
-    await this.patchDoc(`orders/${orderId}`, { status: nextStatus });
+    await this.deleteDoc(`users/${userId}/addresses/${addressId}`);
     return true;
+  }
+
+  async getCustomerWishlist(userId: string): Promise<string[]> {
+    const doc = await this.getDoc(`users/${userId}/wishlist/items`);
+    if (!doc) return [];
+    const list = doc.data.product_ids;
+    return Array.isArray(list) ? list.filter((x): x is string => typeof x === 'string') : [];
+  }
+
+  async setCustomerWishlist(userId: string, productIds: string[]): Promise<string[]> {
+    const unique = Array.from(new Set(productIds.filter((id) => typeof id === 'string' && id.trim())));
+    await this.setDoc(`users/${userId}/wishlist/items`, {
+      product_ids: unique,
+      updated_at: Date.now(),
+    });
+    return unique;
+  }
+
+  async listCustomerNotifications(userId: string): Promise<CustomerNotificationRow[]> {
+    const docs = await this.runQuery('notifications', { parentRelPath: `users/${userId}` });
+    return docs
+      .map((d) => d.data as unknown as CustomerNotificationRow)
+      .sort((a, b) => Number(b.created_at) - Number(a.created_at))
+      .slice(0, 60);
+  }
+
+  async createCustomerNotification(input: {
+    id?: string;
+    userId: string;
+    type: CustomerNotificationRow['type'];
+    title: string;
+    message: string;
+    orderId?: string | null;
+    orderNumber?: string | null;
+  }): Promise<CustomerNotificationRow> {
+    const id = input.id || `notif_${crypto.randomUUID().slice(0, 12)}`;
+    const existing = await this.getDoc(`users/${input.userId}/notifications/${id}`).catch(() => null);
+    if (existing) {
+      return existing.data as unknown as CustomerNotificationRow;
+    }
+    const row: CustomerNotificationRow = {
+      id,
+      user_id: input.userId,
+      type: input.type,
+      title: input.title.trim().slice(0, 140),
+      message: input.message.trim().slice(0, 500),
+      order_id: input.orderId || null,
+      order_number: input.orderNumber || null,
+      is_read: 0,
+      read_at: null,
+      created_at: Date.now(),
+    };
+    await this.setDoc(
+      `users/${input.userId}/notifications/${id}`,
+      row as unknown as Record<string, unknown>
+    );
+    return row;
+  }
+
+  async markCustomerNotificationRead(userId: string, notificationId: string): Promise<boolean> {
+    const existing = await this.getDoc(`users/${userId}/notifications/${notificationId}`);
+    if (!existing) return false;
+    await this.patchDoc(`users/${userId}/notifications/${notificationId}`, {
+      is_read: 1,
+      read_at: Date.now(),
+    });
+    return true;
+  }
+
+  async markAllCustomerNotificationsRead(userId: string): Promise<void> {
+    const list = await this.listCustomerNotifications(userId);
+    const now = Date.now();
+    for (const item of list) {
+      if (!item.is_read) {
+        await this.patchDoc(`users/${userId}/notifications/${item.id}`, {
+          is_read: 1,
+          read_at: now,
+        }).catch(() => {});
+      }
+    }
+  }
+
+  async listCoupons(activeOnly = false): Promise<CouponRow[]> {
+    const docs = await this.runQuery('coupons');
+    return docs
+      .map((d) => d.data as unknown as CouponRow)
+      .filter((c) => !activeOnly || Boolean(c.active))
+      .sort((a, b) => Number(b.created_at) - Number(a.created_at));
+  }
+
+  async getCouponByCode(code: string): Promise<CouponRow | null> {
+    const clean = code.trim().toUpperCase();
+    const docs = await this.runQuery('coupons', {
+      where: {
+        fieldFilter: {
+          field: { fieldPath: 'code' },
+          op: 'EQUAL',
+          value: { stringValue: clean },
+        },
+      },
+      limit: 1,
+    });
+    return docs[0] ? (docs[0].data as unknown as CouponRow) : null;
+  }
+
+  async upsertCoupon(input: {
+    id?: string;
+    code: string;
+    title: string;
+    description: string;
+    discountType: 'percent' | 'flat_paise';
+    discountValue: number;
+    maxDiscountPaise?: number | null;
+    minSpendPaise: number;
+    usageLimit?: number | null;
+    active: boolean;
+    startsAt?: number | null;
+    expiresAt?: number | null;
+  }): Promise<CouponRow> {
+    const now = Date.now();
+    const cleanCode = input.code.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+    const id = input.id || `cpn_${cleanCode.toLowerCase()}`;
+    const existing = await this.getDoc(`coupons/${id}`).catch(() => null);
+    const prev = existing ? (existing.data as unknown as CouponRow) : null;
+    const row: CouponRow = {
+      id,
+      code: cleanCode,
+      title: input.title.trim(),
+      description: input.description.trim(),
+      discount_type: input.discountType,
+      discount_value: Math.round(input.discountValue),
+      max_discount_paise: input.maxDiscountPaise ?? null,
+      min_spend_paise: Math.max(0, Math.round(input.minSpendPaise)),
+      usage_limit: input.usageLimit ?? null,
+      used_count: prev ? Number(prev.used_count || 0) : 0,
+      active: input.active ? 1 : 0,
+      starts_at: input.startsAt ?? null,
+      expires_at: input.expiresAt ?? null,
+      created_at: prev?.created_at || now,
+      updated_at: now,
+    };
+    await this.setDoc(`coupons/${id}`, row as unknown as Record<string, unknown>);
+    return row;
+  }
+
+  async deleteCoupon(id: string): Promise<boolean> {
+    const existing = await this.getDoc(`coupons/${id}`);
+    if (!existing) return false;
+    await this.deleteDoc(`coupons/${id}`);
+    return true;
+  }
+
+  async listGiftCards(): Promise<GiftCardRow[]> {
+    const docs = await this.runQuery('gift_cards');
+    return docs
+      .map((d) => d.data as unknown as GiftCardRow)
+      .sort((a, b) => Number(b.created_at) - Number(a.created_at));
+  }
+
+  async getGiftCardByCode(code: string): Promise<GiftCardRow | null> {
+    const clean = code.trim().toUpperCase();
+    const docs = await this.runQuery('gift_cards', {
+      where: {
+        fieldFilter: {
+          field: { fieldPath: 'code' },
+          op: 'EQUAL',
+          value: { stringValue: clean },
+        },
+      },
+      limit: 1,
+    });
+    return docs[0] ? (docs[0].data as unknown as GiftCardRow) : null;
+  }
+
+  async upsertGiftCard(input: {
+    id?: string;
+    code: string;
+    recipientEmail?: string;
+    note?: string;
+    initialBalancePaise: number;
+    balancePaise: number;
+    active: boolean;
+    expiresAt?: number | null;
+  }): Promise<GiftCardRow> {
+    const now = Date.now();
+    const cleanCode = input.code.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+    const id = input.id || `gc_${cleanCode.toLowerCase()}`;
+    const existing = await this.getDoc(`gift_cards/${id}`).catch(() => null);
+    const prev = existing ? (existing.data as unknown as GiftCardRow) : null;
+    const row: GiftCardRow = {
+      id,
+      code: cleanCode,
+      recipient_email: (input.recipientEmail || '').trim().toLowerCase(),
+      note: (input.note || '').trim(),
+      initial_balance_paise: Math.max(0, Math.round(input.initialBalancePaise)),
+      balance_paise: Math.max(0, Math.round(input.balancePaise)),
+      active: input.active ? 1 : 0,
+      expires_at: input.expiresAt ?? null,
+      last_used_at: prev?.last_used_at ?? null,
+      created_at: prev?.created_at || now,
+      updated_at: now,
+    };
+    await this.setDoc(`gift_cards/${id}`, row as unknown as Record<string, unknown>);
+    return row;
+  }
+
+  async deleteGiftCard(id: string): Promise<boolean> {
+    const existing = await this.getDoc(`gift_cards/${id}`);
+    if (!existing) return false;
+    await this.deleteDoc(`gift_cards/${id}`);
+    return true;
+  }
+
+  async getLoyaltyConfig(): Promise<LoyaltyConfigData> {
+    const doc = await this.getDoc('site_documents/loyalty_config');
+    if (!doc || !doc.data.value) {
+      return mergeLoyaltyConfig(undefined);
+    }
+    return mergeLoyaltyConfig(doc.data.value);
+  }
+
+  async saveLoyaltyConfig(config: LoyaltyConfigData): Promise<LoyaltyConfigData> {
+    const merged = mergeLoyaltyConfig(config);
+    await this.setDoc('site_documents/loyalty_config', {
+      key: 'loyalty_config',
+      value: merged,
+      updated_at: Date.now(),
+    });
+    return merged;
+  }
+
+  async listUsersSummary(): Promise<StoreUserSummary[]> {
+    const docs = await this.runQuery('users');
+    return docs
+      .map((d) => d.data)
+      .filter((d) => Boolean(d.email_verified))
+      .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
+      .slice(0, 100)
+      .map((d) => ({
+        id: String(d.id || ''),
+        fullName: String(d.full_name || ''),
+        email: typeof d.email === 'string' ? d.email : '',
+        emailVerified: Boolean(d.email_verified),
+        createdAt: Number(d.created_at || 0),
+      }));
   }
 
   async listAuditLogs(params: { productId?: string; page: number; pageSize: number }) {

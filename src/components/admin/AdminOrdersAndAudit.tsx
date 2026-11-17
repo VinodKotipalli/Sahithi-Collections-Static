@@ -9,6 +9,7 @@ import {
   Loader2,
   LogOut,
   PackageCheck,
+  RefreshCw,
   ShieldCheck,
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
@@ -23,11 +24,31 @@ interface AdminOrdersPanelProps {
   onPageChange: (page: number) => void;
   onUpdateOrderStatus: (
     orderId: string,
-    status: string
+    status: string,
+    note?: string
   ) => Promise<{ ok: boolean; error?: string }>;
+  onResolveReturnRequest: (
+    orderId: string,
+    decision: 'approved' | 'rejected',
+    note?: string
+  ) => Promise<{ ok: boolean; error?: string }>;
+  onRecoverOrder: (
+    razorpayOrderId: string,
+    razorpayPaymentId?: string
+  ) => Promise<{ ok: boolean; message?: string; error?: string }>;
 }
 
-const ORDER_STATUSES = ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled'] as const;
+const ORDER_STATUSES = [
+  'pending',
+  'placed',
+  'confirmed',
+  'packed',
+  'shipped',
+  'delivered',
+  'cancelled',
+  'return_requested',
+  'returned',
+] as const;
 
 export function AdminOrdersPanel({
   orders,
@@ -36,165 +57,413 @@ export function AdminOrdersPanel({
   totalPages,
   onPageChange,
   onUpdateOrderStatus,
+  onResolveReturnRequest,
+  onRecoverOrder,
 }: AdminOrdersPanelProps) {
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [resolvingId, setResolvingId] = useState<string | null>(null);
+  const [resolutionNotes, setResolutionNotes] = useState<Record<string, string>>({});
+  const [statusNotes, setStatusNotes] = useState<Record<string, string>>({});
   const [orderErrors, setOrderErrors] = useState<Record<string, string>>({});
 
-  if (loading) {
-    return (
-      <div className="space-y-3 rounded-3xl border border-[#49243E]/12 bg-white p-6">
-        {Array.from({ length: 3 }).map((_, idx) => (
-          <div key={idx} className="h-24 animate-pulse rounded-2xl bg-[#FFF9F5]" />
-        ))}
-      </div>
-    );
-  }
+  // Captured payment recovery form
+  const [recoverOrderId, setRecoverOrderId] = useState('');
+  const [recoverPaymentId, setRecoverPaymentId] = useState('');
+  const [recoverBusy, setRecoverBusy] = useState(false);
+  const [recoverFeedback, setRecoverFeedback] = useState<{
+    kind: 'ok' | 'err';
+    text: string;
+  } | null>(null);
 
-  if (orders.length === 0) {
-    return (
-      <section className="flex flex-col items-center justify-center rounded-3xl border border-[#49243E]/12 bg-white px-6 py-16 text-center">
-        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[#F3D5DF]/45 text-[#49243E]">
-          <PackageCheck className="h-5 w-5" aria-hidden="true" />
-        </div>
-        <h3 className="mt-4 font-serif text-2xl font-semibold text-[#49243E]">
-          No customer orders recorded yet
-        </h3>
-        <p className="mt-1.5 max-w-md text-sm text-[#242124]/70">
-          When shoppers place orders from the Boutique Bag, real order totals, snapshots, and variant deductions will appear here.
-        </p>
-      </section>
-    );
-  }
+  const handleRecoverSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (recoverBusy) return;
+    setRecoverFeedback(null);
+    const ord = recoverOrderId.trim();
+    const pay = recoverPaymentId.trim();
+    if (!ord) {
+      setRecoverFeedback({
+        kind: 'err',
+        text: 'Enter a Razorpay Order ID (order_...) to check or recover a captured payment.',
+      });
+      return;
+    }
+    setRecoverBusy(true);
+    const res = await onRecoverOrder(ord, pay || undefined);
+    setRecoverBusy(false);
+    if (!res.ok) {
+      setRecoverFeedback({
+        kind: 'err',
+        text: res.error || 'Could not recover this Razorpay payment.',
+      });
+      return;
+    }
+    setRecoverOrderId('');
+    setRecoverPaymentId('');
+    setRecoverFeedback({
+      kind: 'ok',
+      text: res.message || `Verified & synced Razorpay order ${ord}.`,
+    });
+  };
 
   return (
-    <section
-      aria-label="Customer orders"
-      className="space-y-4 rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6"
-    >
-      <div className="space-y-3">
-        {orders.map((order) => (
-          <div
-            key={order.id}
-            className="rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5]/55 p-4"
-          >
-            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#49243E]/10 pb-3">
-              <div>
-                <p className="font-mono text-xs font-semibold text-[#B76E79]">
-                  {order.orderNumber}
-                </p>
-                <h3 className="mt-0.5 font-serif text-xl font-semibold text-[#49243E]">
-                  {order.customerName}
-                </h3>
-                <p className="text-xs text-[#242124]/65">
-                  {order.customerEmail} · {order.customerPhone} · Placed {formatTimestamp(order.createdAt)}
-                </p>
-                <p className="mt-1 text-xs text-[#242124]/75">{order.shippingAddress}</p>
-              </div>
-
-              <div className="flex items-center gap-3">
-                <div className="text-right tabular-nums">
-                  <span className="block text-[10px] font-semibold uppercase tracking-wider text-[#49243E]/60">
-                    Total
-                  </span>
-                  <span className="font-serif text-xl font-semibold text-[#49243E]">
-                    {formatPaiseINR(order.totalPaise)}
-                  </span>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  {updatingId === order.id && (
-                    <Loader2 className="h-4 w-4 animate-spin text-[#B76E79]" aria-hidden="true" />
-                  )}
-                  <select
-                    aria-label={`Fulfillment status for ${order.orderNumber}`}
-                    disabled={updatingId === order.id}
-                    value={order.status}
-                    onChange={async (e) => {
-                      const nextStatus = e.target.value;
-                      setUpdatingId(order.id);
-                      setOrderErrors((prev) => {
-                        if (!prev[order.id]) return prev;
-                        const next = { ...prev };
-                        delete next[order.id];
-                        return next;
-                      });
-                      try {
-                        const result = await onUpdateOrderStatus(order.id, nextStatus);
-                        if (!result.ok) {
-                          setOrderErrors((prev) => ({
-                            ...prev,
-                            [order.id]:
-                              result.error || 'Could not update order status. Please try again.',
-                          }));
-                        }
-                      } finally {
-                        setUpdatingId(null);
-                      }
-                    }}
-                    className="h-10 rounded-xl border border-[#49243E]/20 bg-white px-3 text-xs font-medium capitalize text-[#49243E] focus:border-[#49243E] focus:outline-none disabled:opacity-60"
-                  >
-                    {ORDER_STATUSES.map((s) => (
-                      <option key={s} value={s}>
-                        {s}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            </div>
-
-            {orderErrors[order.id] && (
-              <p role="alert" className="mt-2.5 text-xs font-medium text-[#9F1239]">
-                {orderErrors[order.id]}
-              </p>
-            )}
-
-            <ul className="mt-3 divide-y divide-[#49243E]/8">
-              {order.items.map((item) => (
-                <li key={item.id} className="flex items-center justify-between py-2 text-xs">
-                  <div>
-                    <span className="font-semibold text-[#49243E]">{item.productTitle}</span>
-                    <span className="text-[#242124]/65">
-                      {' '}
-                      · {item.variantLabel} · SKU {item.sku} &times; {item.quantity}
-                    </span>
-                  </div>
-                  <span className="font-semibold tabular-nums text-[#242124]">
-                    {formatPaiseINR(item.lineTotalPaise)}
-                  </span>
-                </li>
-              ))}
-            </ul>
+    <div className="space-y-6">
+      {/* Razorpay Captured Payment Recovery Panel */}
+      <section
+        aria-label="Recover captured Razorpay payment"
+        className="rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6"
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="font-serif text-xl font-semibold text-[#49243E]">
+              Recover Captured Razorpay Payment
+            </h2>
+            <p className="mt-1 text-xs text-[#242124]/65">
+              If a shopper closed the browser before checkout returned, enter the Razorpay Order ID (and optional Payment ID) to verify capture directly with Razorpay and materialize the order once.
+            </p>
           </div>
-        ))}
-      </div>
-
-      <div className="flex items-center justify-between border-t border-[#49243E]/10 pt-4">
-        <span className="text-xs text-[#242124]/65 tabular-nums">
-          Page {page} of {totalPages}
-        </span>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            disabled={page <= 1}
-            onClick={() => onPageChange(page - 1)}
-            className="inline-flex min-h-[38px] items-center gap-1 rounded-xl border border-[#49243E]/18 px-3 text-xs font-medium text-[#49243E] disabled:opacity-45"
-          >
-            <ChevronLeft className="h-4 w-4" aria-hidden="true" />
-            <span>Previous</span>
-          </button>
-          <button
-            type="button"
-            disabled={page >= totalPages}
-            onClick={() => onPageChange(page + 1)}
-            className="inline-flex min-h-[38px] items-center gap-1 rounded-xl border border-[#49243E]/18 px-3 text-xs font-medium text-[#49243E] disabled:opacity-45"
-          >
-            <span>Next</span>
-            <ChevronRight className="h-4 w-4" aria-hidden="true" />
-          </button>
         </div>
-      </div>
-    </section>
+
+        <form onSubmit={handleRecoverSubmit} className="mt-4 flex flex-col gap-3 sm:flex-row">
+          <input
+            type="text"
+            value={recoverOrderId}
+            onChange={(e) => setRecoverOrderId(e.target.value)}
+            placeholder="Razorpay Order ID (order_...)"
+            className="min-h-[44px] flex-1 rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/65 px-3.5 font-mono text-xs text-[#49243E] focus:border-[#49243E] focus:bg-white focus:outline-none"
+          />
+          <input
+            type="text"
+            value={recoverPaymentId}
+            onChange={(e) => setRecoverPaymentId(e.target.value)}
+            placeholder="Payment ID (pay_..., optional)"
+            className="min-h-[44px] flex-1 rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/65 px-3.5 font-mono text-xs text-[#49243E] focus:border-[#49243E] focus:bg-white focus:outline-none"
+          />
+          <button
+            type="submit"
+            disabled={recoverBusy}
+            className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-[#49243E] px-5 text-xs font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31] disabled:opacity-60"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${recoverBusy ? 'animate-spin' : ''}`} aria-hidden="true" />
+            <span>{recoverBusy ? 'Verifying…' : 'Verify & Recover'}</span>
+          </button>
+        </form>
+
+        {recoverFeedback && (
+          <p
+            role={recoverFeedback.kind === 'err' ? 'alert' : 'status'}
+            className={`mt-3 text-xs font-medium ${
+              recoverFeedback.kind === 'err' ? 'text-[#9B2C3E]' : 'text-[#166534]'
+            }`}
+          >
+            {recoverFeedback.text}
+          </p>
+        )}
+      </section>
+
+      {loading ? (
+        <div className="space-y-3 rounded-3xl border border-[#49243E]/12 bg-white p-6">
+          {Array.from({ length: 3 }).map((_, idx) => (
+            <div key={idx} className="h-24 animate-pulse rounded-2xl bg-[#FFF9F5]" />
+          ))}
+        </div>
+      ) : orders.length === 0 ? (
+        <section className="flex flex-col items-center justify-center rounded-3xl border border-[#49243E]/12 bg-white px-6 py-16 text-center">
+          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[#F3D5DF]/45 text-[#49243E]">
+            <PackageCheck className="h-5 w-5" aria-hidden="true" />
+          </div>
+          <h3 className="mt-4 font-serif text-2xl font-semibold text-[#49243E]">
+            No customer orders recorded yet
+          </h3>
+          <p className="mt-1.5 max-w-md text-sm text-[#242124]/70">
+            When shoppers place orders from the Boutique Bag, real order totals, snapshots, and variant deductions will appear here.
+          </p>
+        </section>
+      ) : (
+        <section
+          aria-label="Customer orders"
+          className="space-y-4 rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6"
+        >
+          <div className="space-y-4">
+            {orders.map((order) => {
+              const payment = order.paymentStatus || (order.razorpayPaymentId ? 'paid' : 'unpaid');
+              const fulfillment = order.fulfillmentStatus || order.status || 'pending';
+
+              return (
+                <div
+                  key={order.id}
+                  className="space-y-3 rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5]/55 p-4 sm:p-5"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#49243E]/10 pb-3">
+                    <div className="min-w-0">
+                      <p className="font-mono text-xs font-semibold text-[#B76E79]">
+                        {order.orderNumber}
+                        {order.customerUserId ? ' · Registered Customer' : ' · Guest Checkout'}
+                      </p>
+                      <h3 className="mt-0.5 font-serif text-xl font-semibold text-[#49243E]">
+                        {order.customerName}
+                      </h3>
+                      <p className="mt-0.5 text-xs font-semibold uppercase tracking-wider text-[#49243E]">
+                        Payment: {payment} · Fulfillment: {fulfillment.replace(/_/g, ' ')}
+                      </p>
+                      <p className="mt-1 text-xs tabular-nums text-[#242124]/65">
+                        {order.customerEmail} · {order.customerPhone} · Placed{' '}
+                        {formatTimestamp(order.createdAt)}
+                      </p>
+                      {order.razorpayOrderId && (
+                        <p className="mt-1 font-mono text-[11px] text-[#242124]/65">
+                          Razorpay Order: {order.razorpayOrderId}
+                          {order.razorpayPaymentId ? ` · Payment: ${order.razorpayPaymentId}` : ''}
+                        </p>
+                      )}
+                      <p className="mt-1 text-xs text-[#242124]/75">{order.shippingAddress}</p>
+                    </div>
+
+                    <div className="flex flex-col items-end gap-2">
+                      <div className="text-right tabular-nums">
+                        <span className="block text-[10px] font-semibold uppercase tracking-wider text-[#49243E]/60">
+                          Total
+                        </span>
+                        <span className="font-serif text-xl font-semibold text-[#49243E]">
+                          {formatPaiseINR(order.totalPaise)}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-end gap-2">
+                        {updatingId === order.id && (
+                          <Loader2 className="h-4 w-4 animate-spin text-[#B76E79]" aria-hidden="true" />
+                        )}
+                        <input
+                          type="text"
+                          value={statusNotes[order.id] || ''}
+                          onChange={(e) =>
+                            setStatusNotes((prev) => ({ ...prev, [order.id]: e.target.value }))
+                          }
+                          placeholder="Optional customer note"
+                          className="h-10 w-44 rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs text-[#242124] focus:border-[#49243E] focus:outline-none"
+                        />
+                        <select
+                          aria-label={`Fulfillment status for ${order.orderNumber}`}
+                          disabled={updatingId === order.id}
+                          value={fulfillment}
+                          onChange={async (e) => {
+                            const nextStatus = e.target.value;
+                            setUpdatingId(order.id);
+                            setOrderErrors((prev) => {
+                              if (!prev[order.id]) return prev;
+                              const next = { ...prev };
+                              delete next[order.id];
+                              return next;
+                            });
+                            try {
+                              const result = await onUpdateOrderStatus(
+                                order.id,
+                                nextStatus,
+                                statusNotes[order.id]?.trim() || undefined
+                              );
+                              if (!result.ok) {
+                                setOrderErrors((prev) => ({
+                                  ...prev,
+                                  [order.id]:
+                                    result.error ||
+                                    'Could not update order status. Please try again.',
+                                }));
+                              } else {
+                                setStatusNotes((prev) => {
+                                  const next = { ...prev };
+                                  delete next[order.id];
+                                  return next;
+                                });
+                              }
+                            } finally {
+                              setUpdatingId(null);
+                            }
+                          }}
+                          className="h-10 rounded-xl border border-[#49243E]/20 bg-white px-3 text-xs font-medium capitalize text-[#49243E] focus:border-[#49243E] focus:outline-none disabled:opacity-60"
+                        >
+                          {ORDER_STATUSES.map((s) => (
+                            <option key={s} value={s}>
+                              {s.replace(/_/g, ' ')}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
+                  {orderErrors[order.id] && (
+                    <p role="alert" className="text-xs font-medium text-[#9F1239]">
+                      {orderErrors[order.id]}
+                    </p>
+                  )}
+
+                  <ul className="divide-y divide-[#49243E]/8">
+                    {order.items.map((item) => (
+                      <li key={item.id} className="flex items-center justify-between py-2 text-xs">
+                        <div>
+                          <span className="font-semibold text-[#49243E]">{item.productTitle}</span>
+                          <span className="text-[#242124]/65">
+                            {' '}
+                            · {item.variantLabel} · SKU {item.sku} &times; {item.quantity}
+                          </span>
+                        </div>
+                        <span className="font-semibold tabular-nums text-[#242124]">
+                          {formatPaiseINR(item.lineTotalPaise)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+
+                  {((order.discountPaise || 0) > 0 || (order.giftCardPaise || 0) > 0) && (
+                    <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs tabular-nums text-[#166534]">
+                      {(order.discountPaise || 0) > 0 && (
+                        <span>
+                          Coupon {order.couponCode || ''}: -{formatPaiseINR(order.discountPaise || 0)}
+                        </span>
+                      )}
+                      {(order.giftCardPaise || 0) > 0 && (
+                        <span>
+                          Gift Card {order.giftCardCode || ''}: -{formatPaiseINR(order.giftCardPaise || 0)}
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {Array.isArray(order.statusHistory) && order.statusHistory.length > 0 && (
+                    <div className="rounded-xl border border-[#49243E]/10 bg-white p-3 text-xs">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-[#49243E]/70">
+                        Status History
+                      </p>
+                      <ul className="mt-1.5 space-y-1">
+                        {order.statusHistory.map((h, idx) => (
+                          <li key={idx} className="flex flex-wrap justify-between gap-2 text-[#242124]/80">
+                            <span>
+                              <strong className="capitalize text-[#49243E]">
+                                {h.status.replace(/_/g, ' ')}
+                              </strong>{' '}
+                              ({h.actor}){h.note ? ` — ${h.note}` : ''}
+                            </span>
+                            <span className="tabular-nums text-[#242124]/55">
+                              {formatTimestamp(h.at)}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {order.returnRequest && (
+                    <div className="space-y-2.5 rounded-xl border border-[#B76E79]/40 bg-white p-3.5 text-xs">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="font-semibold text-[#49243E]">
+                          Customer {order.returnRequest.type === 'cancel' ? 'Cancellation' : 'Return'}{' '}
+                          Request · <span className="uppercase">{order.returnRequest.status}</span>
+                        </p>
+                        <span className="tabular-nums text-[#242124]/60">
+                          {formatTimestamp(order.returnRequest.requestedAt)}
+                        </span>
+                      </div>
+                      <p className="text-[#242124]/80">Reason: {order.returnRequest.reason}</p>
+                      {order.returnRequest.resolutionNote && (
+                        <p className="text-[#49243E]">
+                          Owner Note: {order.returnRequest.resolutionNote}
+                        </p>
+                      )}
+                      {order.returnRequest.status === 'pending' && (
+                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                          <input
+                            type="text"
+                            value={resolutionNotes[order.id] || ''}
+                            onChange={(e) =>
+                              setResolutionNotes((prev) => ({
+                                ...prev,
+                                [order.id]: e.target.value,
+                              }))
+                            }
+                            placeholder="Resolution note for customer"
+                            className="min-h-[38px] flex-1 rounded-lg border border-[#49243E]/18 bg-[#FFF9F5]/65 px-3 text-xs"
+                          />
+                          <button
+                            type="button"
+                            disabled={resolvingId === order.id}
+                            onClick={async () => {
+                              setResolvingId(order.id);
+                              const res = await onResolveReturnRequest(
+                                order.id,
+                                'approved',
+                                resolutionNotes[order.id]?.trim() || undefined
+                              );
+                              setResolvingId(null);
+                              if (!res.ok) {
+                                setOrderErrors((prev) => ({
+                                  ...prev,
+                                  [order.id]: res.error || 'Could not approve request.',
+                                }));
+                              }
+                            }}
+                            className="inline-flex min-h-[38px] items-center rounded-lg bg-[#49243E] px-3.5 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31] disabled:opacity-60"
+                          >
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            disabled={resolvingId === order.id}
+                            onClick={async () => {
+                              setResolvingId(order.id);
+                              const res = await onResolveReturnRequest(
+                                order.id,
+                                'rejected',
+                                resolutionNotes[order.id]?.trim() || undefined
+                              );
+                              setResolvingId(null);
+                              if (!res.ok) {
+                                setOrderErrors((prev) => ({
+                                  ...prev,
+                                  [order.id]: res.error || 'Could not reject request.',
+                                }));
+                              }
+                            }}
+                            className="inline-flex min-h-[38px] items-center rounded-lg border border-[#B76E79]/40 bg-[#FFF9F5] px-3.5 text-xs font-medium text-[#9B2C3E] hover:bg-[#F3D5DF]/40 disabled:opacity-60"
+                          >
+                            Reject
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex items-center justify-between border-t border-[#49243E]/10 pt-4">
+            <span className="text-xs tabular-nums text-[#242124]/65">
+              Page {page} of {totalPages}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={page <= 1}
+                onClick={() => onPageChange(page - 1)}
+                className="inline-flex min-h-[38px] items-center gap-1 rounded-xl border border-[#49243E]/18 px-3 text-xs font-medium text-[#49243E] disabled:opacity-45"
+              >
+                <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+                <span>Previous</span>
+              </button>
+              <button
+                type="button"
+                disabled={page >= totalPages}
+                onClick={() => onPageChange(page + 1)}
+                className="inline-flex min-h-[38px] items-center gap-1 rounded-xl border border-[#49243E]/18 px-3 text-xs font-medium text-[#49243E] disabled:opacity-45"
+              >
+                <span>Next</span>
+                <ChevronRight className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
+    </div>
   );
 }
 
@@ -246,19 +515,21 @@ export function AdminAuditPanel({
     >
       <ul className="divide-y divide-[#49243E]/10">
         {logs.map((entry) => (
-          <li key={entry.id} className="flex flex-col gap-1 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+          <li
+            key={entry.id}
+            className="flex flex-col gap-1 py-3.5 sm:flex-row sm:items-center sm:justify-between"
+          >
             <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="rounded-md bg-[#F3D5DF]/45 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-[#49243E]">
+              <p className="font-serif text-base font-semibold text-[#49243E]">
+                <span className="font-sans text-[11px] font-semibold uppercase tracking-wider text-[#B76E79]">
                   {entry.action}
                 </span>
-                <span className="font-serif text-base font-semibold text-[#49243E]">
-                  {entry.productTitle}
-                </span>
-              </div>
+                {' · '}
+                <span>{entry.productTitle}</span>
+              </p>
               <p className="mt-1 text-xs text-[#242124]/75">{entry.summary}</p>
             </div>
-            <div className="shrink-0 text-xs text-[#242124]/55 tabular-nums sm:text-right">
+            <div className="shrink-0 text-xs tabular-nums text-[#242124]/55 sm:text-right">
               <div>{formatTimestamp(entry.createdAt)}</div>
               <div className="font-mono text-[10px]">
                 Actor: {entry.actorUserId ? `${entry.actorUserId.slice(0, 8)}...` : 'Owner'}
@@ -269,7 +540,7 @@ export function AdminAuditPanel({
       </ul>
 
       <div className="flex items-center justify-between border-t border-[#49243E]/10 pt-4">
-        <span className="text-xs text-[#242124]/65 tabular-nums">
+        <span className="text-xs tabular-nums text-[#242124]/65">
           Page {page} of {totalPages}
         </span>
         <div className="flex items-center gap-2">
@@ -325,7 +596,10 @@ export function AdminSecurityPanel({ ownerBinding, onSignedOut }: AdminSecurityP
       const res = await reauthenticateWithPassword(currentPassword);
       if (res.ok) {
         setCurrentPassword('');
-        setFeedback({ kind: 'ok', text: 'Owner password verified. Sensitive actions unlocked for 10 minutes.' });
+        setFeedback({
+          kind: 'ok',
+          text: 'Owner password verified. Sensitive actions unlocked for 10 minutes.',
+        });
       } else {
         setFeedback({ kind: 'err', text: res.error });
       }
@@ -347,7 +621,10 @@ export function AdminSecurityPanel({ ownerBinding, onSignedOut }: AdminSecurityP
       const res = await changePassword(newPassword);
       if (res.ok) {
         setNewPassword('');
-        setFeedback({ kind: 'ok', text: 'Owner password updated and other sessions revoked.' });
+        setFeedback({
+          kind: 'ok',
+          text: 'Owner password updated and other sessions revoked.',
+        });
       } else {
         setFeedback({ kind: 'err', text: res.error });
       }

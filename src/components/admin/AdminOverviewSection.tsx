@@ -7,7 +7,10 @@ import {
   Mail,
   Package,
   Plus,
+  RotateCcw,
   ShoppingBag,
+  Tag,
+  Users,
 } from 'lucide-react';
 import type { AdminOverviewResponse, AdminProduct } from '../../types/boutique';
 import { formatPaiseINR, formatTimestamp } from '../../utils/format';
@@ -17,6 +20,7 @@ export type OverviewTargetTab =
   | 'catalog'
   | 'categories'
   | 'orders'
+  | 'coupons'
   | 'content'
   | 'messages'
   | 'settings'
@@ -45,8 +49,8 @@ export function AdminOverviewSection({
   if (loading || !overview) {
     return (
       <div className="space-y-6">
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          {Array.from({ length: 6 }).map((_, idx) => (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          {Array.from({ length: 8 }).map((_, idx) => (
             <div key={idx} className="rounded-2xl border border-[#49243E]/12 bg-white p-5">
               <div className="h-3 w-24 animate-pulse rounded bg-[#49243E]/10" />
               <div className="mt-4 h-8 w-20 animate-pulse rounded bg-[#49243E]/15" />
@@ -62,7 +66,8 @@ export function AdminOverviewSection({
     );
   }
 
-  const { metrics, lowStockItems, recentOrders, recentMessages, recentAuditLogs } = normalizeAdminOverview(overview);
+  const { metrics, lowStockItems, recentOrders, recentMessages, recentAuditLogs } =
+    normalizeAdminOverview(overview);
 
   const cards = [
     {
@@ -97,6 +102,23 @@ export function AdminOverviewSection({
       onClick: () => onNavigateTab('orders'),
     },
     {
+      label: 'Customer Accounts',
+      value: String(metrics.totalCustomers ?? 0),
+      detail: 'Registered boutique profiles',
+      icon: Users,
+      onClick: () => onNavigateTab('coupons'),
+    },
+    {
+      label: 'Return Requests',
+      value: String(metrics.openReturnRequests ?? 0),
+      detail:
+        (metrics.openReturnRequests ?? 0) > 0
+          ? 'Open cancel/return reviews'
+          : 'No open requests',
+      icon: RotateCcw,
+      onClick: () => onNavigateTab('orders'),
+    },
+    {
       label: 'Customer Messages',
       value: String(metrics.totalMessages),
       detail:
@@ -124,7 +146,10 @@ export function AdminOverviewSection({
   return (
     <div className="space-y-6">
       {/* KPI Grid */}
-      <section aria-label="Store metrics overview" className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      <section
+        aria-label="Store metrics overview"
+        className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4"
+      >
         {cards.map((card) => {
           const Icon = card.icon;
           return (
@@ -145,7 +170,7 @@ export function AdminOverviewSection({
               <p className="mt-3 font-serif text-3xl font-semibold tabular-nums text-[#49243E]">
                 {card.value}
               </p>
-              <p className="mt-1.5 text-xs text-[#242124]/65 tabular-nums">{card.detail}</p>
+              <p className="mt-1.5 text-xs tabular-nums text-[#242124]/65">{card.detail}</p>
             </button>
           );
         })}
@@ -159,7 +184,7 @@ export function AdminOverviewSection({
         <div>
           <h2 className="font-serif text-lg font-semibold text-[#49243E]">Quick Actions</h2>
           <p className="text-xs text-[#242124]/65">
-            Jump straight into catalog curation, homepage copy, or customer care.
+            Jump straight into catalog curation, coupons &amp; activity, or customer care.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2.5">
@@ -170,6 +195,14 @@ export function AdminOverviewSection({
           >
             <Plus className="h-4 w-4" aria-hidden="true" />
             <span>Add Product</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onNavigateTab('coupons')}
+            className="inline-flex min-h-[44px] items-center gap-1.5 rounded-xl border border-[#49243E]/18 bg-[#FFF9F5] px-4 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/40"
+          >
+            <Tag className="h-3.5 w-3.5 text-[#B76E79]" aria-hidden="true" />
+            <span>Promos, Loyalty &amp; Activity</span>
           </button>
           <button
             type="button"
@@ -191,7 +224,10 @@ export function AdminOverviewSection({
       {/* Activity Columns */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         {/* Recent Orders */}
-        <section aria-label="Recent orders" className="rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6">
+        <section
+          aria-label="Recent orders"
+          className="rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6"
+        >
           <div className="flex items-center justify-between border-b border-[#49243E]/10 pb-3.5">
             <h2 className="font-serif text-xl font-semibold text-[#49243E]">Recent Orders</h2>
             <button
@@ -210,30 +246,37 @@ export function AdminOverviewSection({
             </p>
           ) : (
             <ul className="divide-y divide-[#49243E]/10">
-              {recentOrders.map((order) => (
-                <li key={order.id} className="flex items-center justify-between gap-3 py-3 text-xs">
-                  <div className="min-w-0">
-                    <p className="truncate font-semibold text-[#49243E]">
-                      {order.customerName}{' '}
-                      <span className="font-mono font-normal text-[#B76E79]">
-                        · {order.orderNumber}
-                      </span>
-                    </p>
-                    <p className="mt-0.5 truncate text-[#242124]/60 capitalize tabular-nums">
-                      {order.status} · {formatTimestamp(order.createdAt)}
-                    </p>
-                  </div>
-                  <span className="shrink-0 font-semibold tabular-nums text-[#49243E]">
-                    {formatPaiseINR(order.totalPaise)}
-                  </span>
-                </li>
-              ))}
+              {recentOrders.map((order) => {
+                const pay = order.paymentStatus || (order.razorpayPaymentId ? 'paid' : 'unpaid');
+                const ful = (order.fulfillmentStatus || order.status || 'pending').replace(/_/g, ' ');
+                return (
+                  <li key={order.id} className="flex items-center justify-between gap-3 py-3 text-xs">
+                    <div className="min-w-0">
+                      <p className="truncate font-semibold text-[#49243E]">
+                        {order.customerName}{' '}
+                        <span className="font-mono font-normal text-[#B76E79]">
+                          · {order.orderNumber}
+                        </span>
+                      </p>
+                      <p className="mt-0.5 truncate capitalize tabular-nums text-[#242124]/60">
+                        Payment {pay} · Fulfillment {ful} · {formatTimestamp(order.createdAt)}
+                      </p>
+                    </div>
+                    <span className="shrink-0 font-semibold tabular-nums text-[#49243E]">
+                      {formatPaiseINR(order.totalPaise)}
+                    </span>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </section>
 
         {/* Recent Customer Messages */}
-        <section aria-label="Recent messages" className="rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6">
+        <section
+          aria-label="Recent messages"
+          className="rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6"
+        >
           <div className="flex items-center justify-between border-b border-[#49243E]/10 pb-3.5">
             <h2 className="font-serif text-xl font-semibold text-[#49243E]">Customer Enquiries</h2>
             <button
@@ -259,7 +302,7 @@ export function AdminOverviewSection({
                       {msg.senderName}{' '}
                       <span className="font-normal text-[#242124]/65">· {msg.subject}</span>
                     </p>
-                    <p className="mt-0.5 truncate text-[#242124]/60">
+                    <p className="mt-0.5 truncate tabular-nums text-[#242124]/60">
                       {msg.status === 'unread' ? 'Unread · ' : `${msg.status} · `}
                       {formatTimestamp(msg.createdAt)}
                     </p>
@@ -278,7 +321,10 @@ export function AdminOverviewSection({
         </section>
 
         {/* Low Stock Items */}
-        <section aria-label="Low stock products" className="rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6">
+        <section
+          aria-label="Low stock products"
+          className="rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6"
+        >
           <div className="flex items-center justify-between border-b border-[#49243E]/10 pb-3.5">
             <h2 className="font-serif text-xl font-semibold text-[#49243E]">Low Stock Alerts</h2>
             <button
@@ -328,7 +374,10 @@ export function AdminOverviewSection({
         </section>
 
         {/* Recent Catalog Activity */}
-        <section aria-label="Recent catalog activity" className="rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6">
+        <section
+          aria-label="Recent catalog activity"
+          className="rounded-3xl border border-[#49243E]/12 bg-white p-5 sm:p-6"
+        >
           <div className="flex items-center justify-between border-b border-[#49243E]/10 pb-3.5">
             <h2 className="font-serif text-xl font-semibold text-[#49243E]">Recent Activity</h2>
             <button
@@ -355,7 +404,7 @@ export function AdminOverviewSection({
                     <span>{entry.productTitle}</span>
                   </p>
                   <p className="mt-0.5 text-[#242124]/70">{entry.summary}</p>
-                  <p className="mt-0.5 text-[11px] text-[#242124]/50 tabular-nums">
+                  <p className="mt-0.5 text-[11px] tabular-nums text-[#242124]/50">
                     {formatTimestamp(entry.createdAt)}
                   </p>
                 </li>

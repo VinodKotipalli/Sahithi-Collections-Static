@@ -4,10 +4,15 @@ import type {
   CategoryRow,
   ContactMessageRow,
   ContactMessageStatus,
+  CouponRow,
+  CustomerAddressRow,
+  CustomerNotificationRow,
   EmailTokenRow,
+  GiftCardRow,
   LegacyPhoneOnlyAccount,
   OrderItemRow,
   OrderRow,
+  PendingCheckoutRow,
   ProductAuditLogRow,
   ProductImageRow,
   ProductMediaRow,
@@ -19,6 +24,7 @@ import type {
   StorefrontContentData,
   UserRow,
 } from './db.ts';
+import type { LoyaltyConfigData } from './storefront-defaults.ts';
 import type { RuntimeTargetEnv, StorageBackend } from './env.ts';
 
 export type {
@@ -26,10 +32,16 @@ export type {
   CategoryRow,
   ContactMessageRow,
   ContactMessageStatus,
+  CouponRow,
+  CustomerAddressRow,
+  CustomerNotificationRow,
   EmailTokenRow,
+  GiftCardRow,
   LegacyPhoneOnlyAccount,
+  LoyaltyConfigData,
   OrderItemRow,
   OrderRow,
+  PendingCheckoutRow,
   ProductAuditLogRow,
   ProductImageRow,
   ProductMediaRow,
@@ -52,6 +64,11 @@ export interface AdminProductRecord extends ProductWithParts {
   orderCount: number;
 }
 
+export interface AdminOverviewMetricsExtra {
+  totalCustomers?: number;
+  openReturnRequests?: number;
+}
+
 export interface AdminOverviewData {
   metrics: {
     totalProducts: number;
@@ -67,6 +84,8 @@ export interface AdminOverviewData {
     unreadMessages: number;
     totalMessages: number;
     totalAuditEvents: number;
+    totalCustomers?: number;
+    openReturnRequests?: number;
   };
   lowStockItems: AdminProductRecord[];
   recentOrders: OrderWithItems[];
@@ -89,18 +108,56 @@ export interface OrderWithItems {
   items: OrderItemRow[];
 }
 
+export interface OrderStatusHistoryEntry {
+  status: string;
+  note?: string;
+  actor: 'customer' | 'owner' | 'system';
+  at: number;
+}
+
+export interface OrderReturnRequestRecord {
+  id: string;
+  type: 'cancel' | 'return';
+  reason: string;
+  status: 'pending' | 'approved' | 'rejected';
+  requestedAt: number;
+  resolvedAt?: number | null;
+  resolutionNote?: string;
+}
+
 export interface PlaceOrderInput {
+  id?: string;
+  orderNumber?: string;
   customerUserId: string | null;
   customerName: string;
   customerEmail: string;
   customerPhone: string;
   shippingAddress: string;
+  status?: string;
+  paymentStatus?: string;
+  fulfillmentStatus?: string;
+  paymentMethod?: 'razorpay' | 'cod';
+  razorpayOrderId?: string | null;
+  razorpayPaymentId?: string | null;
+  couponCode?: string | null;
+  giftCardCode?: string | null;
+  discountPaise?: number;
+  giftCardPaise?: number;
+  statusHistory?: OrderStatusHistoryEntry[];
   items: Array<{
     productId: string;
     variantId: string;
     quantity: number;
     expectedPricePaise: number | null;
   }>;
+}
+
+export interface StoreUserSummary {
+  id: string;
+  fullName: string;
+  email: string;
+  emailVerified: boolean;
+  createdAt: number;
 }
 
 export class StoreHttpError extends Error {
@@ -281,9 +338,13 @@ export interface BoutiqueStore {
     isLinkedToPublished: boolean;
   } | null>;
 
-  // Cart & orders
+  // Cart, pending checkouts & orders
   getProductsForCartValidation(productIds: string[]): Promise<Map<string, ProductWithParts>>;
+  savePendingCheckout(record: PendingCheckoutRow): Promise<void>;
+  getPendingCheckout(razorpayOrderId: string): Promise<PendingCheckoutRow | null>;
   placeOrder(input: PlaceOrderInput): Promise<{ order: OrderRow; items: OrderItemRow[] }>;
+  getOrderById(orderId: string): Promise<OrderWithItems | null>;
+  listCustomerOrders(userId: string): Promise<OrderWithItems[]>;
   listAdminOrders(page: number, pageSize: number): Promise<{
     items: OrderWithItems[];
     total: number;
@@ -292,6 +353,95 @@ export interface BoutiqueStore {
     totalPages: number;
   }>;
   updateOrderStatus(orderId: string, nextStatus: string): Promise<boolean>;
+  updateOrderStatusWithHistory(
+    orderId: string,
+    nextStatus: string,
+    options?: {
+      actor?: 'owner' | 'system' | 'customer';
+      note?: string;
+      notifyCustomer?: boolean;
+    }
+  ): Promise<OrderWithItems | null>;
+  submitOrderReturnRequest(input: {
+    orderId: string;
+    userId: string;
+    type: 'cancel' | 'return';
+    reason: string;
+  }): Promise<OrderWithItems | null>;
+  resolveOrderReturnRequest(input: {
+    orderId: string;
+    decision: 'approved' | 'rejected';
+    note?: string;
+  }): Promise<OrderWithItems | null>;
+
+  // Customer account preferences, addresses, wishlist, notifications, rewards
+  listCustomerAddresses(userId: string): Promise<CustomerAddressRow[]>;
+  upsertCustomerAddress(
+    userId: string,
+    input: {
+      id?: string;
+      fullName: string;
+      phone: string;
+      line1: string;
+      line2?: string;
+      city: string;
+      state: string;
+      pincode: string;
+      landmark?: string;
+      label: 'Home' | 'Work' | 'Other';
+      isDefault: boolean;
+    }
+  ): Promise<CustomerAddressRow>;
+  deleteCustomerAddress(userId: string, addressId: string): Promise<boolean>;
+  getCustomerWishlist(userId: string): Promise<string[]>;
+  setCustomerWishlist(userId: string, productIds: string[]): Promise<string[]>;
+  listCustomerNotifications(userId: string): Promise<CustomerNotificationRow[]>;
+  createCustomerNotification(input: {
+    id?: string;
+    userId: string;
+    type: CustomerNotificationRow['type'];
+    title: string;
+    message: string;
+    orderId?: string | null;
+    orderNumber?: string | null;
+  }): Promise<CustomerNotificationRow>;
+  markCustomerNotificationRead(userId: string, notificationId: string): Promise<boolean>;
+  markAllCustomerNotificationsRead(userId: string): Promise<void>;
+
+  // Coupons, gift cards & loyalty
+  listCoupons(activeOnly?: boolean): Promise<CouponRow[]>;
+  getCouponByCode(code: string): Promise<CouponRow | null>;
+  upsertCoupon(input: {
+    id?: string;
+    code: string;
+    title: string;
+    description: string;
+    discountType: 'percent' | 'flat_paise';
+    discountValue: number;
+    maxDiscountPaise?: number | null;
+    minSpendPaise: number;
+    usageLimit?: number | null;
+    active: boolean;
+    startsAt?: number | null;
+    expiresAt?: number | null;
+  }): Promise<CouponRow>;
+  deleteCoupon(id: string): Promise<boolean>;
+  listGiftCards(): Promise<GiftCardRow[]>;
+  getGiftCardByCode(code: string): Promise<GiftCardRow | null>;
+  upsertGiftCard(input: {
+    id?: string;
+    code: string;
+    recipientEmail?: string;
+    note?: string;
+    initialBalancePaise: number;
+    balancePaise: number;
+    active: boolean;
+    expiresAt?: number | null;
+  }): Promise<GiftCardRow>;
+  deleteGiftCard(id: string): Promise<boolean>;
+  getLoyaltyConfig(): Promise<LoyaltyConfigData>;
+  saveLoyaltyConfig(config: LoyaltyConfigData): Promise<LoyaltyConfigData>;
+  listUsersSummary(): Promise<StoreUserSummary[]>;
 
   // Audit logs
   listAuditLogs(params: {

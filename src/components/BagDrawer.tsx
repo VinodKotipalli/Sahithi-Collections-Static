@@ -4,10 +4,12 @@ import {
   CheckCircle2,
   CreditCard,
   Loader2,
+  MapPin,
   Minus,
   Plus,
   RefreshCw,
   ShoppingBag,
+  Tag,
   Trash2,
   X,
 } from 'lucide-react';
@@ -16,11 +18,17 @@ import { useAuth } from '../context/AuthContext';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 import {
+  checkRazorpayOrderStatus,
   createRazorpayOrder,
   ensureRazorpayCheckoutScript,
   verifyRazorpayPayment,
 } from '../services/razorpayCheckout';
-import type { BagItem, BagValidationResult, PlacedOrderReceipt } from '../types/boutique';
+import type {
+  BagItem,
+  BagValidationResult,
+  CustomerAddress,
+  PlacedOrderReceipt,
+} from '../types/boutique';
 import { formatPaiseINR, formatTimestamp } from '../utils/format';
 import { BoutiqueImage } from './BoutiqueImage';
 
@@ -35,6 +43,25 @@ interface BagDrawerProps {
   ) => void;
   onClearBag: () => void;
   onOrderCompleted: () => void;
+}
+
+interface PendingConfirmationState {
+  razorpayOrderId: string;
+  razorpayPaymentId: string;
+  message: string;
+  checking: boolean;
+}
+
+function formatSavedAddressText(addr: CustomerAddress): string {
+  const parts = [
+    addr.line1,
+    addr.line2 || '',
+    `${addr.city}, ${addr.state} ${addr.pincode}`,
+    addr.landmark ? `Landmark: ${addr.landmark}` : '',
+  ]
+    .map((p) => p.trim())
+    .filter(Boolean);
+  return parts.join(', ');
 }
 
 export function BagDrawer({
@@ -56,6 +83,8 @@ export function BagDrawer({
   const emailId = useId();
   const phoneId = useId();
   const addressId = useId();
+  const couponId = useId();
+  const giftCardId = useId();
 
   const [validation, setValidation] = useState<BagValidationResult | null>(null);
   const [validating, setValidating] = useState(false);
@@ -64,11 +93,29 @@ export function BagDrawer({
   const [errorText, setErrorText] = useState<string | null>(null);
   const [paymentErrorText, setPaymentErrorText] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<PlacedOrderReceipt | null>(null);
+  const [pendingConfirmation, setPendingConfirmation] =
+    useState<PendingConfirmationState | null>(null);
 
   const [customerName, setCustomerName] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
   const [shippingAddress, setShippingAddress] = useState('');
+
+  // Saved addresses for signed-in shoppers
+  const [savedAddresses, setSavedAddresses] = useState<CustomerAddress[]>([]);
+  const [selectedAddressId, setSelectedAddressId] = useState<string>('');
+
+  // Coupon & gift card state
+  const [couponInput, setCouponInput] = useState('');
+  const [giftCardInput, setGiftCardInput] = useState('');
+  const [appliedCouponCode, setAppliedCouponCode] = useState<string | null>(null);
+  const [appliedGiftCardCode, setAppliedGiftCardCode] = useState<string | null>(null);
+  const [discountPaise, setDiscountPaise] = useState(0);
+  const [giftCardPaise, setGiftCardPaise] = useState(0);
+  const [promoBusy, setPromoBusy] = useState(false);
+  const [promoFeedback, setPromoFeedback] = useState<{ kind: 'ok' | 'err'; text: string } | null>(
+    null
+  );
 
   useFocusTrap(isOpen, drawerRef, onClose);
 
@@ -76,8 +123,31 @@ export function BagDrawer({
     if (user) {
       setCustomerName((prev) => prev || user.fullName || '');
       setCustomerEmail((prev) => prev || user.email || '');
+    } else {
+      setSavedAddresses([]);
+      setSelectedAddressId('');
     }
   }, [user]);
+
+  useEffect(() => {
+    if (!isOpen || !user) return;
+    let cancelled = false;
+    void apiRequest<{ items?: CustomerAddress[] }>('/api/account/addresses').then((res) => {
+      if (cancelled || !res.ok || !Array.isArray(res.data.items)) return;
+      const list = res.data.items;
+      setSavedAddresses(list);
+      if (list.length > 0) {
+        const defaultAddr = list.find((a) => a.isDefault) || list[0];
+        setSelectedAddressId((prev) => prev || defaultAddr.id);
+        setCustomerName((prev) => prev || defaultAddr.fullName || user.fullName || '');
+        setCustomerPhone((prev) => prev || defaultAddr.phone || '');
+        setShippingAddress((prev) => prev || formatSavedAddressText(defaultAddr));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, user, apiRequest]);
 
   const revalidateBag = async () => {
     if (items.length === 0) {
@@ -105,6 +175,105 @@ export function BagDrawer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, items.length]);
 
+  const displaySubtotalPaise =
+    validation?.subtotalPaise ??
+    items.reduce((sum, it) => sum + it.seenPricePaise * it.quantity, 0);
+
+  const effectiveDiscountPaise = appliedCouponCode
+    ? Math.min(displaySubtotalPaise, discountPaise)
+    : 0;
+  const effectiveGiftCardPaise = appliedGiftCardCode
+    ? Math.min(Math.max(0, displaySubtotalPaise - effectiveDiscountPaise), giftCardPaise)
+    : 0;
+  const netPayablePaise = Math.max(
+    0,
+    displaySubtotalPaise - effectiveDiscountPaise - effectiveGiftCardPaise
+  );
+
+  // Re-validate applied promos when bag subtotal changes
+  useEffect(() => {
+    if (!isOpen || (!appliedCouponCode && !appliedGiftCardCode) || displaySubtotalPaise <= 0) {
+      return;
+    }
+    let cancelled = false;
+    void apiRequest<{
+      valid: boolean;
+      discountPaise: number;
+      giftCardPaise: number;
+    }>('/api/coupons/validate', {
+      method: 'POST',
+      body: JSON.stringify({
+        subtotalPaise: displaySubtotalPaise,
+        couponCode: appliedCouponCode || undefined,
+        giftCardCode: appliedGiftCardCode || undefined,
+      }),
+    }).then((res) => {
+      if (cancelled) return;
+      if (res.ok) {
+        setDiscountPaise(res.data.discountPaise || 0);
+        setGiftCardPaise(res.data.giftCardPaise || 0);
+      } else {
+        setAppliedCouponCode(null);
+        setAppliedGiftCardCode(null);
+        setDiscountPaise(0);
+        setGiftCardPaise(0);
+        setPromoFeedback({ kind: 'err', text: res.error });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, displaySubtotalPaise, appliedCouponCode, appliedGiftCardCode, apiRequest]);
+
+  const handleApplyPromo = async (nextCoupon?: string | null, nextGiftCard?: string | null) => {
+    const codeCoupon = (nextCoupon !== undefined ? (nextCoupon ?? '') : couponInput).trim().toUpperCase();
+    const codeGiftCard = (nextGiftCard !== undefined ? (nextGiftCard ?? '') : giftCardInput)
+      .trim()
+      .toUpperCase();
+
+    if (!codeCoupon && !codeGiftCard) {
+      setAppliedCouponCode(null);
+      setAppliedGiftCardCode(null);
+      setDiscountPaise(0);
+      setGiftCardPaise(0);
+      setPromoFeedback(null);
+      return;
+    }
+
+    setPromoBusy(true);
+    setPromoFeedback(null);
+    const res = await apiRequest<{
+      valid: boolean;
+      discountPaise: number;
+      giftCardPaise: number;
+      payablePaise: number;
+    }>('/api/coupons/validate', {
+      method: 'POST',
+      body: JSON.stringify({
+        subtotalPaise: displaySubtotalPaise,
+        couponCode: codeCoupon || undefined,
+        giftCardCode: codeGiftCard || undefined,
+      }),
+    });
+    setPromoBusy(false);
+
+    if (!res.ok) {
+      setPromoFeedback({ kind: 'err', text: res.error });
+      return;
+    }
+
+    setAppliedCouponCode(codeCoupon || null);
+    setAppliedGiftCardCode(codeGiftCard || null);
+    setDiscountPaise(res.data.discountPaise || 0);
+    setGiftCardPaise(res.data.giftCardPaise || 0);
+    setPromoFeedback({
+      kind: 'ok',
+      text: `Savings applied (${formatPaiseINR(
+        (res.data.discountPaise || 0) + (res.data.giftCardPaise || 0)
+      )} off).`,
+    });
+  };
+
   const handleConfirmPriceChanges = () => {
     if (!validation) return;
     const updates = validation.items
@@ -130,13 +299,52 @@ export function BagDrawer({
     );
   };
 
-  const displaySubtotalPaise =
-    validation?.subtotalPaise ??
-    items.reduce((sum, it) => sum + it.seenPricePaise * it.quantity, 0);
+  const handleSelectSavedAddress = (addrId: string) => {
+    setSelectedAddressId(addrId);
+    const picked = savedAddresses.find((a) => a.id === addrId);
+    if (!picked) return;
+    setCustomerName(picked.fullName || user?.fullName || '');
+    setCustomerPhone(picked.phone || '');
+    setShippingAddress(formatSavedAddressText(picked));
+  };
+
+  const handleCheckPendingOrderStatus = async () => {
+    if (!pendingConfirmation || pendingConfirmation.checking) return;
+    setPendingConfirmation((prev) => (prev ? { ...prev, checking: true } : prev));
+    setPaymentErrorText(null);
+    const statusRes = await checkRazorpayOrderStatus({
+      razorpayOrderId: pendingConfirmation.razorpayOrderId,
+      razorpayPaymentId: pendingConfirmation.razorpayPaymentId,
+    });
+    if (!statusRes.ok) {
+      setPendingConfirmation((prev) => (prev ? { ...prev, checking: false } : prev));
+      setPaymentErrorText(statusRes.error);
+      return;
+    }
+    if (statusRes.confirmed && statusRes.order?.orderNumber) {
+      setPendingConfirmation(null);
+      setReceipt(statusRes.order);
+      setCheckoutOpen(false);
+      onClearBag();
+      onOrderCompleted();
+      return;
+    }
+    setPendingConfirmation((prev) =>
+      prev
+        ? {
+            ...prev,
+            checking: false,
+            message:
+              statusRes.message ||
+              'Payment received. We’re still confirming your order—please check again in a few seconds.',
+          }
+        : null
+    );
+  };
 
   const handlePlaceOrder = async (e: FormEvent) => {
     e.preventDefault();
-    if (checkoutInFlightRef.current || submitting) return;
+    if (checkoutInFlightRef.current || submitting || pendingConfirmation) return;
     setErrorText(null);
     setPaymentErrorText(null);
 
@@ -145,8 +353,10 @@ export function BagDrawer({
       return;
     }
 
-    if (displaySubtotalPaise < 100) {
-      setPaymentErrorText('Minimum order amount is ₹1.00 (100 paise).');
+    if (netPayablePaise < 100) {
+      setPaymentErrorText(
+        'Net payable amount after promo discounts must be at least ₹1.00 (100 paise) for Razorpay Checkout.'
+      );
       return;
     }
 
@@ -178,6 +388,8 @@ export function BagDrawer({
         createRazorpayOrder({
           items: payloadItems,
           customer: customerDetails,
+          couponCode: appliedCouponCode || undefined,
+          giftCardCode: appliedGiftCardCode || undefined,
           currency: 'INR',
           receipt: `sc_rcpt_${Date.now()}`,
         }),
@@ -238,8 +450,12 @@ export function BagDrawer({
             razorpay_payment_id: paymentResponse.razorpay_payment_id,
             razorpay_signature: paymentResponse.razorpay_signature,
             checkout_token,
+            couponCode: appliedCouponCode || undefined,
+            giftCardCode: appliedGiftCardCode || undefined,
             orderData: {
               ...customerDetails,
+              couponCode: appliedCouponCode || undefined,
+              giftCardCode: appliedGiftCardCode || undefined,
               items: payloadItems,
             },
           });
@@ -253,39 +469,30 @@ export function BagDrawer({
             return;
           }
 
-          if (verifyRes.data.order) {
-            setReceipt(verifyRes.data.order);
-          } else {
-            setReceipt({
-              id: verifyRes.data.order_id,
-              orderNumber: verifyRes.data.order_id,
-              status: 'confirmed',
-              subtotalPaise: amount,
-              totalPaise: amount,
-              currency,
-              createdAt: Date.now(),
-              paymentMethod: 'razorpay',
+          if (verifyRes.data.pending_confirmation) {
+            setPendingConfirmation({
               razorpayOrderId: verifyRes.data.order_id,
               razorpayPaymentId: verifyRes.data.payment_id,
-              items: items.map((it) => {
-                const vItem = validation?.items.find(
-                  (v) => v.productId === it.productId && v.variantId === it.variantId
-                );
-                const unitPricePaise = vItem?.currentPricePaise ?? it.seenPricePaise;
-                return {
-                  productId: it.productId,
-                  variantId: it.variantId,
-                  productTitle: vItem?.title || it.fallbackTitle,
-                  variantLabel: vItem?.variantLabel || it.fallbackVariant,
-                  sku: it.variantId,
-                  unitPricePaise,
-                  quantity: it.quantity,
-                  lineTotalPaise: unitPricePaise * it.quantity,
-                };
-              }),
+              message:
+                verifyRes.data.message ||
+                'Payment received. We’re confirming your order and will update your confirmation shortly.',
+              checking: false,
             });
+            return;
           }
 
+          if (!verifyRes.data.order || !verifyRes.data.order.orderNumber) {
+            setPendingConfirmation({
+              razorpayOrderId: verifyRes.data.order_id,
+              razorpayPaymentId: verifyRes.data.payment_id,
+              message:
+                'Payment received. We’re confirming your order in our system. Tap Check Order Status below before retrying payment.',
+              checking: false,
+            });
+            return;
+          }
+
+          setReceipt(verifyRes.data.order);
           setCheckoutOpen(false);
           onClearBag();
           onOrderCompleted();
@@ -350,7 +557,9 @@ export function BagDrawer({
                 <p className="text-xs text-[#242124]/65 tabular-nums">
                   {receipt
                     ? `Order ${receipt.orderNumber}`
-                    : `${items.reduce((s, i) => s + i.quantity, 0)} item(s) · Live INR pricing`}
+                    : pendingConfirmation
+                      ? `Confirming ${pendingConfirmation.razorpayOrderId}`
+                      : `${items.reduce((s, i) => s + i.quantity, 0)} item(s) · Live INR pricing`}
                 </p>
               </div>
               <button
@@ -378,32 +587,61 @@ export function BagDrawer({
                       <h3 className="font-serif text-2xl font-semibold text-[#49243E]">
                         {receipt.orderNumber}
                       </h3>
-                      <p className="mt-1 text-xs text-[#242124]/70">
+                      <p className="mt-1 text-xs text-[#242124]/70 tabular-nums">
                         Placed {formatTimestamp(receipt.createdAt)} · Paid via Razorpay
-                        {receipt.razorpayPaymentId ? ` (${receipt.razorpayPaymentId})` : ''}
+                        {receipt.razorpayPaymentId ? ` · Ref ${receipt.razorpayPaymentId}` : ''}
                       </p>
                     </div>
                   </div>
 
                   <ul className="divide-y divide-[#49243E]/10 border-y border-[#49243E]/10 py-2">
                     {receipt.items.map((line, idx) => (
-                      <li key={`${line.sku}-${idx}`} className="flex items-center justify-between py-2.5 text-sm">
+                      <li
+                        key={`${line.sku}-${idx}`}
+                        className="flex items-center justify-between py-2.5 text-sm"
+                      >
                         <div className="min-w-0 pr-3">
-                          <p className="font-medium text-[#49243E] truncate">{line.productTitle}</p>
+                          <p className="truncate font-medium text-[#49243E]">
+                            {line.productTitle}
+                          </p>
                           <p className="text-xs text-[#242124]/65">
                             {line.variantLabel} &times; {line.quantity}
                           </p>
                         </div>
-                        <span className="font-semibold tabular-nums text-[#242124] shrink-0">
+                        <span className="shrink-0 font-semibold tabular-nums text-[#242124]">
                           {formatPaiseINR(line.lineTotalPaise)}
                         </span>
                       </li>
                     ))}
                   </ul>
 
-                  <div className="flex items-center justify-between text-base font-semibold text-[#49243E]">
-                    <span>Order Total</span>
-                    <span className="tabular-nums">{formatPaiseINR(receipt.totalPaise)}</span>
+                  <div className="space-y-1.5 text-sm">
+                    <div className="flex items-center justify-between text-xs text-[#242124]/70">
+                      <span>Subtotal</span>
+                      <span className="tabular-nums">{formatPaiseINR(receipt.subtotalPaise)}</span>
+                    </div>
+                    {(receipt.discountPaise || 0) > 0 && (
+                      <div className="flex items-center justify-between text-xs text-[#166534]">
+                        <span>Coupon {receipt.couponCode ? `(${receipt.couponCode})` : ''}</span>
+                        <span className="tabular-nums">
+                          -{formatPaiseINR(receipt.discountPaise || 0)}
+                        </span>
+                      </div>
+                    )}
+                    {(receipt.giftCardPaise || 0) > 0 && (
+                      <div className="flex items-center justify-between text-xs text-[#166534]">
+                        <span>
+                          Gift Card {receipt.giftCardCode ? `(${receipt.giftCardCode})` : ''}
+                        </span>
+                        <span className="tabular-nums">
+                          -{formatPaiseINR(receipt.giftCardPaise || 0)}
+                        </span>
+                      </div>
+                    )}
+                    <div className="flex items-center justify-between border-t border-[#49243E]/10 pt-2 text-base font-semibold text-[#49243E]">
+                      <span>Order Total</span>
+                      <span className="tabular-nums">{formatPaiseINR(receipt.totalPaise)}</span>
+                    </div>
                   </div>
 
                   <button
@@ -412,6 +650,72 @@ export function BagDrawer({
                     className="min-h-[44px] w-full rounded-xl bg-[#49243E] px-5 text-sm font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31]"
                   >
                     Continue Browsing
+                  </button>
+                </div>
+              ) : pendingConfirmation ? (
+                <div className="space-y-4 rounded-2xl border border-[#B76E79]/45 bg-white p-5">
+                  <div className="flex items-start gap-3">
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#F3D5DF]/45 text-[#49243E]">
+                      <RefreshCw
+                        className={`h-5 w-5 ${pendingConfirmation.checking ? 'animate-spin' : ''}`}
+                        aria-hidden="true"
+                      />
+                    </div>
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-wider text-[#B76E79]">
+                        Confirmation In Progress
+                      </p>
+                      <h3 className="mt-0.5 font-serif text-xl font-semibold text-[#49243E]">
+                        Payment received. We&rsquo;re confirming your order
+                      </h3>
+                    </div>
+                  </div>
+
+                  <p className="text-xs leading-relaxed text-[#242124]/75">
+                    {pendingConfirmation.message} Do not pay again for this bag while your confirmation finishes syncing.
+                  </p>
+
+                  <dl className="space-y-1.5 rounded-xl border border-[#49243E]/12 bg-[#FFF9F5] p-3 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <dt className="text-[#242124]/65">Razorpay Order Ref</dt>
+                      <dd className="font-mono font-semibold text-[#49243E]">
+                        {pendingConfirmation.razorpayOrderId}
+                      </dd>
+                    </div>
+                    {pendingConfirmation.razorpayPaymentId && (
+                      <div className="flex items-center justify-between gap-2">
+                        <dt className="text-[#242124]/65">Payment Ref</dt>
+                        <dd className="font-mono font-semibold text-[#49243E]">
+                          {pendingConfirmation.razorpayPaymentId}
+                        </dd>
+                      </div>
+                    )}
+                  </dl>
+
+                  {paymentErrorText && (
+                    <div
+                      role="alert"
+                      className="flex items-start gap-2 rounded-xl border border-[#B76E79]/55 bg-[#F3D5DF]/40 p-3 text-xs text-[#49243E]"
+                    >
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#B76E79]" aria-hidden="true" />
+                      <span>{paymentErrorText}</span>
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    disabled={pendingConfirmation.checking}
+                    onClick={() => void handleCheckPendingOrderStatus()}
+                    className="inline-flex min-h-[46px] w-full items-center justify-center gap-2 rounded-xl bg-[#49243E] px-5 text-sm font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31] disabled:opacity-60"
+                  >
+                    {pendingConfirmation.checking ? (
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                    ) : (
+                      <RefreshCw className="h-4 w-4" aria-hidden="true" />
+                    )}
+                    <span>
+                      {pendingConfirmation.checking ? 'Checking Status…' : 'Check Order Status'}
+                    </span>
                   </button>
                 </div>
               ) : items.length === 0 ? (
@@ -457,7 +761,7 @@ export function BagDrawer({
                       <button
                         type="button"
                         onClick={handleConfirmPriceChanges}
-                        className="mt-2.5 inline-flex min-h-[36px] items-center rounded-lg bg-[#49243E] px-3 text-xs font-medium text-[#FFF9F5]"
+                        className="mt-2.5 inline-flex min-h-[40px] items-center rounded-lg bg-[#49243E] px-3 text-xs font-medium text-[#FFF9F5]"
                       >
                         Acknowledge Updated Prices
                       </button>
@@ -530,7 +834,7 @@ export function BagDrawer({
                                     onClick={() =>
                                       onUpdateQty(item.productId, item.variantId, item.quantity - 1)
                                     }
-                                    className="flex h-8 w-8 items-center justify-center text-[#49243E] hover:bg-[#F3D5DF]/40"
+                                    className="flex h-10 w-10 items-center justify-center text-[#49243E] hover:bg-[#F3D5DF]/40"
                                   >
                                     <Minus className="h-3.5 w-3.5" aria-hidden="true" />
                                   </button>
@@ -544,7 +848,7 @@ export function BagDrawer({
                                     onClick={() =>
                                       onUpdateQty(item.productId, item.variantId, item.quantity + 1)
                                     }
-                                    className="flex h-8 w-8 items-center justify-center text-[#49243E] hover:bg-[#F3D5DF]/40 disabled:opacity-40"
+                                    className="flex h-10 w-10 items-center justify-center text-[#49243E] hover:bg-[#F3D5DF]/40 disabled:opacity-40"
                                   >
                                     <Plus className="h-3.5 w-3.5" aria-hidden="true" />
                                   </button>
@@ -559,7 +863,7 @@ export function BagDrawer({
                                 type="button"
                                 onClick={() => onRemoveItem(item.productId, item.variantId)}
                                 aria-label={`Remove ${item.fallbackTitle} from bag`}
-                                className="inline-flex min-h-[36px] items-center gap-1 rounded-lg px-2.5 text-xs font-medium text-[#242124]/65 hover:bg-[#F3D5DF]/40 hover:text-[#49243E]"
+                                className="inline-flex min-h-[40px] items-center gap-1 rounded-lg px-2.5 text-xs font-medium text-[#242124]/65 hover:bg-[#F3D5DF]/40 hover:text-[#49243E]"
                               >
                                 <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
                                 <span>Remove</span>
@@ -572,10 +876,36 @@ export function BagDrawer({
                   </ul>
 
                   {checkoutOpen && !validation?.hasUnavailable && (
-                    <form onSubmit={handlePlaceOrder} className="space-y-3 rounded-2xl border border-[#49243E]/12 bg-white p-4">
+                    <form
+                      onSubmit={handlePlaceOrder}
+                      className="space-y-3.5 rounded-2xl border border-[#49243E]/12 bg-white p-4"
+                    >
                       <h3 className="font-serif text-xl font-semibold text-[#49243E]">
                         Delivery &amp; Order Details
                       </h3>
+
+                      {user && savedAddresses.length > 0 && (
+                        <div className="space-y-1.5 rounded-xl border border-[#49243E]/12 bg-[#FFF9F5]/80 p-3">
+                          <div className="flex items-center gap-1.5 text-xs font-semibold text-[#49243E]">
+                            <MapPin className="h-3.5 w-3.5 text-[#B76E79]" aria-hidden="true" />
+                            <span>Saved Delivery Addresses</span>
+                          </div>
+                          <select
+                            aria-label="Choose a saved delivery address"
+                            value={selectedAddressId}
+                            onChange={(e) => handleSelectSavedAddress(e.target.value)}
+                            className="min-h-[42px] w-full rounded-lg border border-[#49243E]/18 bg-white px-3 text-xs font-medium text-[#49243E] focus:border-[#49243E] focus:outline-none"
+                          >
+                            {savedAddresses.map((addr) => (
+                              <option key={addr.id} value={addr.id}>
+                                {addr.label} · {addr.fullName} — {addr.line1}, {addr.city} ({addr.pincode})
+                                {addr.isDefault ? ' [Default]' : ''}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+
                       <div>
                         <label htmlFor={nameId} className="block text-xs font-medium text-[#49243E]">
                           Full Name
@@ -587,7 +917,7 @@ export function BagDrawer({
                           value={customerName}
                           onChange={(e) => setCustomerName(e.target.value)}
                           placeholder="Ananya Reddy"
-                          className="mt-1 min-h-[42px] w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
+                          className="mt-1 min-h-[44px] w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
                         />
                       </div>
                       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -602,7 +932,7 @@ export function BagDrawer({
                             value={customerEmail}
                             onChange={(e) => setCustomerEmail(e.target.value)}
                             placeholder="name@example.com"
-                            className="mt-1 min-h-[42px] w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
+                            className="mt-1 min-h-[44px] w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
                           />
                         </div>
                         <div>
@@ -616,7 +946,7 @@ export function BagDrawer({
                             value={customerPhone}
                             onChange={(e) => setCustomerPhone(e.target.value)}
                             placeholder="+91 98765 43210"
-                            className="mt-1 min-h-[42px] w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
+                            className="mt-1 min-h-[44px] w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
                           />
                         </div>
                       </div>
@@ -634,6 +964,83 @@ export function BagDrawer({
                           className="mt-1 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 p-3 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
                         />
                       </div>
+
+                      {/* Coupon & Gift Card Section */}
+                      <div className="space-y-2.5 rounded-xl border border-[#49243E]/12 bg-[#FFF9F5]/70 p-3">
+                        <div className="flex items-center gap-1.5 text-xs font-semibold text-[#49243E]">
+                          <Tag className="h-3.5 w-3.5 text-[#B76E79]" aria-hidden="true" />
+                          <span>Coupon or Gift Card</span>
+                        </div>
+
+                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                          <div>
+                            <label htmlFor={couponId} className="sr-only">
+                              Coupon code
+                            </label>
+                            <input
+                              id={couponId}
+                              type="text"
+                              value={couponInput}
+                              onChange={(e) => setCouponInput(e.target.value.toUpperCase())}
+                              placeholder="COUPON CODE"
+                              className="min-h-[40px] w-full rounded-lg border border-[#49243E]/18 bg-white px-3 font-mono text-xs uppercase text-[#49243E] focus:border-[#49243E] focus:outline-none"
+                            />
+                          </div>
+                          <div>
+                            <label htmlFor={giftCardId} className="sr-only">
+                              Gift card code
+                            </label>
+                            <input
+                              id={giftCardId}
+                              type="text"
+                              value={giftCardInput}
+                              onChange={(e) => setGiftCardInput(e.target.value.toUpperCase())}
+                              placeholder="GIFT CARD CODE"
+                              className="min-h-[40px] w-full rounded-lg border border-[#49243E]/18 bg-white px-3 font-mono text-xs uppercase text-[#49243E] focus:border-[#49243E] focus:outline-none"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={promoBusy}
+                            onClick={() => void handleApplyPromo()}
+                            className="inline-flex min-h-[38px] items-center justify-center rounded-lg border border-[#49243E]/25 bg-white px-3 text-xs font-semibold text-[#49243E] hover:bg-[#F3D5DF]/40 disabled:opacity-60"
+                          >
+                            {promoBusy ? 'Validating…' : 'Apply Codes'}
+                          </button>
+                          {(appliedCouponCode || appliedGiftCardCode) && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCouponInput('');
+                                setGiftCardInput('');
+                                setAppliedCouponCode(null);
+                                setAppliedGiftCardCode(null);
+                                setDiscountPaise(0);
+                                setGiftCardPaise(0);
+                                setPromoFeedback(null);
+                              }}
+                              className="inline-flex min-h-[38px] items-center px-2 text-xs font-medium text-[#B76E79] hover:text-[#49243E]"
+                            >
+                              Clear Codes
+                            </button>
+                          )}
+                        </div>
+
+                        {promoFeedback && (
+                          <p
+                            role={promoFeedback.kind === 'err' ? 'alert' : 'status'}
+                            className={`text-xs ${
+                              promoFeedback.kind === 'err' ? 'text-[#9B2C3E]' : 'text-[#166534]'
+                            }`}
+                          >
+                            {promoFeedback.text}
+                          </p>
+                        )}
+                      </div>
+
                       {paymentErrorText && (
                         <div
                           role="alert"
@@ -659,7 +1066,7 @@ export function BagDrawer({
                         <span>
                           {submitting
                             ? 'Processing Payment…'
-                            : `Pay with Razorpay (${formatPaiseINR(displaySubtotalPaise)})`}
+                            : `Pay with Razorpay (${formatPaiseINR(netPayablePaise)})`}
                         </span>
                       </button>
                     </form>
@@ -669,25 +1076,47 @@ export function BagDrawer({
             </div>
 
             {/* Footer */}
-            {!receipt && items.length > 0 && (
-              <div className="border-t border-[#49243E]/10 bg-[#FFF9F5] px-5 py-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium text-[#242124]/70">
-                    Verified Server Subtotal
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void revalidateBag()}
-                      aria-label="Refresh live prices and stock"
-                      className="rounded-lg p-1.5 text-[#49243E]/70 hover:bg-[#F3D5DF]/40 hover:text-[#49243E]"
-                    >
-                      <RefreshCw className={`h-3.5 w-3.5 ${validating ? 'animate-spin' : ''}`} />
-                    </button>
-                    <span className="text-lg font-semibold tabular-nums text-[#49243E]">
-                      {formatPaiseINR(displaySubtotalPaise)}
+            {!receipt && !pendingConfirmation && items.length > 0 && (
+              <div className="space-y-3 border-t border-[#49243E]/10 bg-[#FFF9F5] px-5 py-4">
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-[#242124]/70">
+                      Verified Server Subtotal
                     </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void revalidateBag()}
+                        aria-label="Refresh live prices and stock"
+                        className="rounded-lg p-1.5 text-[#49243E]/70 hover:bg-[#F3D5DF]/40 hover:text-[#49243E]"
+                      >
+                        <RefreshCw className={`h-3.5 w-3.5 ${validating ? 'animate-spin' : ''}`} />
+                      </button>
+                      <span className="text-sm font-semibold tabular-nums text-[#49243E]">
+                        {formatPaiseINR(displaySubtotalPaise)}
+                      </span>
+                    </div>
                   </div>
+                  {effectiveDiscountPaise > 0 && (
+                    <div className="flex items-center justify-between text-xs text-[#166534]">
+                      <span>Coupon Discount ({appliedCouponCode})</span>
+                      <span className="tabular-nums">-{formatPaiseINR(effectiveDiscountPaise)}</span>
+                    </div>
+                  )}
+                  {effectiveGiftCardPaise > 0 && (
+                    <div className="flex items-center justify-between text-xs text-[#166534]">
+                      <span>Gift Card ({appliedGiftCardCode})</span>
+                      <span className="tabular-nums">
+                        -{formatPaiseINR(effectiveGiftCardPaise)}
+                      </span>
+                    </div>
+                  )}
+                  {(effectiveDiscountPaise > 0 || effectiveGiftCardPaise > 0) && (
+                    <div className="flex items-center justify-between border-t border-[#49243E]/10 pt-1.5 text-base font-semibold text-[#49243E]">
+                      <span>Net Payable</span>
+                      <span className="tabular-nums">{formatPaiseINR(netPayablePaise)}</span>
+                    </div>
+                  )}
                 </div>
 
                 {!checkoutOpen && (

@@ -637,3 +637,79 @@ export function extractReferencedMediaFilenames(
   }
   return filenames;
 }
+
+export interface LoyaltyConfigData {
+  rewardsEnabled: boolean;
+  pointsPerHundredInr: number;
+  rupeeValuePerPointPaise: number;
+  plusEnabled: boolean;
+  plusTierName: string;
+  plusQualificationSpendPaise: number;
+  plusBenefits: string[];
+  giftCardsEnabled: boolean;
+}
+
+export const DEFAULT_LOYALTY_CONFIG: LoyaltyConfigData = {
+  rewardsEnabled: true,
+  pointsPerHundredInr: 1,
+  rupeeValuePerPointPaise: 100,
+  plusEnabled: true,
+  plusTierName: 'Sahithi Plus',
+  plusQualificationSpendPaise: 1_500_000, // ₹15,000 cumulative paid orders
+  plusBenefits: [
+    'Priority dispatch on festive & silk drops',
+    'Early access to seasonal private lookbooks',
+    'Complimentary gift-wrap & alteration guidance',
+  ],
+  giftCardsEnabled: true,
+};
+
+export function mergeLoyaltyConfig(
+  partial?: Partial<LoyaltyConfigData> | null
+): LoyaltyConfigData {
+  if (!partial || typeof partial !== 'object') {
+    return structuredClone(DEFAULT_LOYALTY_CONFIG);
+  }
+  return {
+    rewardsEnabled:
+      typeof partial.rewardsEnabled === 'boolean'
+        ? partial.rewardsEnabled
+        : DEFAULT_LOYALTY_CONFIG.rewardsEnabled,
+    pointsPerHundredInr:
+      typeof partial.pointsPerHundredInr === 'number' &&
+      Number.isFinite(partial.pointsPerHundredInr) &&
+      partial.pointsPerHundredInr >= 0
+        ? Math.min(20, Math.round(partial.pointsPerHundredInr))
+        : DEFAULT_LOYALTY_CONFIG.pointsPerHundredInr,
+    rupeeValuePerPointPaise:
+      typeof partial.rupeeValuePerPointPaise === 'number' &&
+      Number.isFinite(partial.rupeeValuePerPointPaise) &&
+      partial.rupeeValuePerPointPaise >= 0
+        ? Math.min(5000, Math.round(partial.rupeeValuePerPointPaise))
+        : DEFAULT_LOYALTY_CONFIG.rupeeValuePerPointPaise,
+    plusEnabled:
+      typeof partial.plusEnabled === 'boolean'
+        ? partial.plusEnabled
+        : DEFAULT_LOYALTY_CONFIG.plusEnabled,
+    plusTierName:
+      typeof partial.plusTierName === 'string' && partial.plusTierName.trim()
+        ? partial.plusTierName.trim().slice(0, 60)
+        : DEFAULT_LOYALTY_CONFIG.plusTierName,
+    plusQualificationSpendPaise:
+      typeof partial.plusQualificationSpendPaise === 'number' &&
+      Number.isFinite(partial.plusQualificationSpendPaise) &&
+      partial.plusQualificationSpendPaise >= 100
+        ? Math.round(partial.plusQualificationSpendPaise)
+        : DEFAULT_LOYALTY_CONFIG.plusQualificationSpendPaise,
+    plusBenefits: Array.isArray(partial.plusBenefits)
+      ? partial.plusBenefits
+          .filter((b): b is string => typeof b === 'string' && b.trim().length > 0)
+          .map((b) => b.trim().slice(0, 140))
+          .slice(0, 6)
+      : DEFAULT_LOYALTY_CONFIG.plusBenefits,
+    giftCardsEnabled:
+      typeof partial.giftCardsEnabled === 'boolean'
+        ? partial.giftCardsEnabled
+        : DEFAULT_LOYALTY_CONFIG.giftCardsEnabled,
+  };
+}

@@ -1,14 +1,21 @@
 import { normalizeAdminOverview } from './adminOverview';
 import firebaseAppletConfig from '../../firebase-applet-config.json';
 import {
+  DEFAULT_LOYALTY_CONFIG,
   DEFAULT_SITE_SETTINGS,
   DEFAULT_STOREFRONT_CONTENT,
   INITIAL_SEED_CATEGORIES,
+  mergeLoyaltyConfig,
   mergeSiteSettings,
   mergeStorefrontContent,
 } from '../../server/storefront-defaults.ts';
 import { PRODUCTS } from '../config/products';
 import type { AuthCapabilities, AuthUser, ApiResult } from '../context/AuthContext';
+import type {
+  LoyaltyConfig,
+  OrderReturnRequest,
+  OrderStatusHistoryEntry,
+} from '../types/boutique';
 
 export const AUTHORIZED_OWNER_EMAIL = 'saivinodkotipalli2003@gmail.com';
 const PASSWORD_MIN_LENGTH = 8;
@@ -650,6 +657,11 @@ async function getValidClientSession(): Promise<ClientFirebaseSession | null> {
   return promise;
 }
 
+export async function getValidClientIdToken(): Promise<string | null> {
+  const session = await getValidClientSession().catch(() => null);
+  return session?.idToken ?? null;
+}
+
 function buildPublicAuthUser(session: ClientFirebaseSession): AuthUser {
   const reauthExpiresAt = session.lastReauthAt + REAUTH_WINDOW_MS;
   const isOwner =
@@ -786,6 +798,205 @@ async function firestoreListDocs<T>(
   return (data.documents ?? [])
     .map((d) => docToRecord<T>(d))
     .filter((item): item is T => item !== null);
+}
+
+async function firestoreRunQuery<T>(
+  collectionId: string,
+  filters: Array<{ field: string; value: string | boolean | number }>,
+  idToken?: string
+): Promise<T[]> {
+  const parentUrl = firestoreBaseUrl();
+  const runUrl = `${parentUrl}:runQuery`;
+  const fieldFilters = filters.map((f) => ({
+    fieldFilter: {
+      field: { fieldPath: f.field },
+      op: 'EQUAL',
+      value: toFirestoreValue(f.value),
+    },
+  }));
+  const where =
+    fieldFilters.length === 1
+      ? fieldFilters[0]
+      : fieldFilters.length > 1
+        ? { compositeFilter: { op: 'AND', filters: fieldFilters } }
+        : undefined;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (idToken) headers.Authorization = `Bearer ${idToken}`;
+  const res = await fetch(runUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      structuredQuery: {
+        from: [{ collectionId }],
+        ...(where ? { where } : {}),
+        limit: 300,
+      },
+    }),
+  });
+  if (!res.ok) return [];
+  const rows = (await res.json().catch(() => [])) as Array<{ document?: FirestoreDocResponse }>;
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .map((entry) => docToRecord<T>(entry.document ?? null))
+    .filter((item): item is T => item !== null);
+}
+
+function parseJsonOrValue<T>(raw: unknown, fallback: T): T {
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      return fallback;
+    }
+  }
+  return raw && typeof raw === 'object' ? (raw as T) : fallback;
+}
+
+function serializeClientOrderDoc(o: Record<string, unknown>) {
+  const createdAt = Number(o.created_at || Date.now());
+  const updatedAt = Number(o.updated_at || createdAt);
+  const status = String(o.status || 'pending');
+  const fulfillmentStatus = String(o.fulfillment_status || status);
+  const rzPaymentId =
+    typeof o.razorpay_payment_id === 'string' && o.razorpay_payment_id ? o.razorpay_payment_id : null;
+  const rzOrderId =
+    typeof o.razorpay_order_id === 'string' && o.razorpay_order_id ? o.razorpay_order_id : null;
+  const paymentStatus = String(o.payment_status || (rzPaymentId ? 'paid' : 'unpaid'));
+  const statusHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
+    o.status_history ?? o.status_history_json,
+    [{ status: fulfillmentStatus, note: 'Order placed', actor: 'system', at: createdAt }]
+  );
+  const returnRequest = parseJsonOrValue<OrderReturnRequest | null>(
+    o.return_request ?? o.return_request_json,
+    null
+  );
+  const subtotalPaise = Number(o.subtotal_paise || 0);
+  const totalPaise = Number(o.total_paise || 0);
+  const items = Array.isArray(o.items) ? (o.items as Array<Record<string, unknown>>) : [];
+
+  return {
+    id: String(o.id || ''),
+    orderNumber: String(o.order_number || ''),
+    customerUserId: typeof o.customer_user_id === 'string' ? o.customer_user_id : null,
+    customerName: String(o.customer_name || ''),
+    customerPhone: String(o.customer_phone || ''),
+    customerEmail: String(o.customer_email || ''),
+    shippingAddress: String(o.shipping_address || ''),
+    status,
+    paymentStatus,
+    fulfillmentStatus,
+    paymentMethod: String(o.payment_method || (rzOrderId || rzPaymentId ? 'razorpay' : 'cod')),
+    razorpayOrderId: rzOrderId,
+    razorpayPaymentId: rzPaymentId,
+    couponCode: typeof o.coupon_code === 'string' && o.coupon_code ? o.coupon_code : null,
+    giftCardCode: typeof o.gift_card_code === 'string' && o.gift_card_code ? o.gift_card_code : null,
+    subtotalPaise,
+    discountPaise: Number(o.discount_paise || 0),
+    giftCardPaise: Number(o.gift_card_paise || 0),
+    totalPaise,
+    subtotal: Number((subtotalPaise / 100).toFixed(2)),
+    total: Number((totalPaise / 100).toFixed(2)),
+    currency: String(o.currency || 'INR'),
+    statusHistory,
+    returnRequest,
+    notes: typeof o.notes === 'string' ? o.notes : '',
+    createdAt,
+    updatedAt,
+    items: items.map((it) => {
+      const qty = Number(it.quantity ?? it.qty ?? 1);
+      const unitPaise = Number(it.unit_price_paise || 0);
+      return {
+        id: String(it.id || ''),
+        productId: String(it.product_id || ''),
+        variantId: it.variant_id ? String(it.variant_id) : null,
+        productTitle: String(it.product_title || it.title_snapshot || 'Boutique Piece'),
+        titleSnapshot: String(it.title_snapshot || it.product_title || 'Boutique Piece'),
+        variantLabel:
+          String(
+            it.variant_label ||
+              [it.size_snapshot, it.color_snapshot].filter(Boolean).join(' / ') ||
+              'Standard'
+          ),
+        sku: String(it.sku || it.sku_snapshot || ''),
+        skuSnapshot: String(it.sku_snapshot || it.sku || ''),
+        sizeSnapshot: String(it.size_snapshot || ''),
+        colorSnapshot: String(it.color_snapshot || ''),
+        unitPricePaise: unitPaise,
+        unitPrice: Number((unitPaise / 100).toFixed(2)),
+        quantity: qty,
+        qty,
+        lineTotalPaise: Number(it.line_total_paise ?? unitPaise * qty),
+      };
+    }),
+  };
+}
+
+function serializeClientCouponDoc(c: Record<string, unknown>) {
+  return {
+    id: String(c.id || ''),
+    code: String(c.code || ''),
+    title: String(c.title || ''),
+    description: String(c.description || ''),
+    discountType: (c.discount_type === 'flat_paise' ? 'flat_paise' : 'percent') as 'percent' | 'flat_paise',
+    discountValue: Number(c.discount_value || 0),
+    maxDiscountPaise: c.max_discount_paise !== null && c.max_discount_paise !== undefined ? Number(c.max_discount_paise) : null,
+    minSpendPaise: Number(c.min_spend_paise || 0),
+    usageLimit: c.usage_limit !== null && c.usage_limit !== undefined ? Number(c.usage_limit) : null,
+    usedCount: Number(c.used_count || 0),
+    active: Boolean(c.active === true || c.active === 1),
+    startsAt: c.starts_at ? Number(c.starts_at) : null,
+    expiresAt: c.expires_at ? Number(c.expires_at) : null,
+    createdAt: Number(c.created_at || Date.now()),
+    updatedAt: Number(c.updated_at || Date.now()),
+  };
+}
+
+function serializeClientGiftCardDoc(g: Record<string, unknown>) {
+  return {
+    id: String(g.id || ''),
+    code: String(g.code || ''),
+    recipientEmail: String(g.recipient_email || ''),
+    note: String(g.note || ''),
+    initialBalancePaise: Number(g.initial_balance_paise || 0),
+    balancePaise: Number(g.balance_paise || 0),
+    active: Boolean(g.active === true || g.active === 1),
+    expiresAt: g.expires_at ? Number(g.expires_at) : null,
+    lastUsedAt: g.last_used_at ? Number(g.last_used_at) : null,
+    createdAt: Number(g.created_at || Date.now()),
+    updatedAt: Number(g.updated_at || Date.now()),
+  };
+}
+
+function serializeClientAddressDoc(a: Record<string, unknown>) {
+  return {
+    id: String(a.id || ''),
+    fullName: String(a.full_name || ''),
+    phone: String(a.phone || ''),
+    line1: String(a.line1 || ''),
+    line2: String(a.line2 || ''),
+    city: String(a.city || ''),
+    state: String(a.state || ''),
+    pincode: String(a.pincode || ''),
+    landmark: String(a.landmark || ''),
+    label: (a.label === 'Work' || a.label === 'Other' ? a.label : 'Home') as 'Home' | 'Work' | 'Other',
+    isDefault: Boolean(a.is_default === true || a.is_default === 1),
+    createdAt: Number(a.created_at || Date.now()),
+    updatedAt: Number(a.updated_at || Date.now()),
+  };
+}
+
+function serializeClientNotificationDoc(n: Record<string, unknown>) {
+  return {
+    id: String(n.id || ''),
+    type: String(n.type || 'order_status'),
+    title: String(n.title || ''),
+    message: String(n.message || ''),
+    orderId: typeof n.order_id === 'string' ? n.order_id : null,
+    orderNumber: typeof n.order_number === 'string' ? n.order_number : null,
+    read: Boolean(n.is_read === 1 || n.is_read === true || n.read === true),
+    readAt: n.read_at ? Number(n.read_at) : null,
+    createdAt: Number(n.created_at || Date.now()),
+  };
 }
 
 interface StoredProductDoc {
@@ -2829,6 +3040,753 @@ export async function handleClientlessApiRequest<T>(
       };
     }
 
+    // 12b. Customer Account Menu Endpoints (/api/account/* except profile/reauth/change-password handled above)
+    if (cleanPath === '/api/account/orders' && upperMethod === 'GET') {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const docs = await firestoreRunQuery<Record<string, unknown>>(
+        'orders',
+        [{ field: 'customer_user_id', value: session.uid }],
+        session.idToken
+      );
+      const items = docs
+        .map((d) => serializeClientOrderDoc(d))
+        .sort((a, b) => b.createdAt - a.createdAt);
+      return { ok: true, data: { items } as unknown as T };
+    }
+
+    if (
+      cleanPath.startsWith('/api/account/orders/') &&
+      cleanPath.endsWith('/request') &&
+      upperMethod === 'POST'
+    ) {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const orderId = decodeURIComponent(
+        cleanPath.slice('/api/account/orders/'.length, -'/request'.length)
+      );
+      const reqType = body.type === 'cancel' ? 'cancel' : body.type === 'return' ? 'return' : null;
+      const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+      if (!reqType) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          error: 'Request type must be "cancel" or "return".',
+        };
+      }
+      if (reason.length < 5 || reason.length > 500) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          error: 'Please provide a reason between 5 and 500 characters.',
+        };
+      }
+      const existing = await firestoreGetDoc<Record<string, unknown>>(
+        'orders',
+        orderId,
+        session.idToken
+      );
+      if (!existing) {
+        return {
+          ok: false,
+          status: 404,
+          code: 'ORDER_NOT_FOUND',
+          error: 'Order not found.',
+        };
+      }
+      if (existing.customer_user_id !== session.uid) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'FORBIDDEN',
+          error: 'You can only submit requests for your own orders.',
+        };
+      }
+      const currentReq = parseJsonOrValue<OrderReturnRequest | null>(
+        existing.return_request ?? existing.return_request_json,
+        null
+      );
+      if (currentReq && currentReq.status === 'pending') {
+        return {
+          ok: false,
+          status: 409,
+          code: 'REQUEST_ALREADY_PENDING',
+          error: 'A cancel/return request is already pending for this order.',
+        };
+      }
+      const now = Date.now();
+      const newReq: OrderReturnRequest = {
+        id: `req_${now.toString(36)}_${randomHex(3)}`,
+        type: reqType,
+        reason,
+        status: 'pending',
+        requestedAt: now,
+        resolvedAt: null,
+        resolutionNote: undefined,
+      };
+      const prevHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
+        existing.status_history ?? existing.status_history_json,
+        []
+      );
+      const nextHistory: OrderStatusHistoryEntry[] = [
+        ...prevHistory,
+        {
+          status: 'return_requested',
+          note: `${reqType === 'cancel' ? 'Cancellation' : 'Return'} requested: ${reason}`,
+          actor: 'customer',
+          at: now,
+        },
+      ];
+      const updated = {
+        ...existing,
+        status: 'return_requested',
+        fulfillment_status: 'return_requested',
+        return_request: newReq,
+        return_request_json: JSON.stringify(newReq),
+        status_history: nextHistory,
+        status_history_json: JSON.stringify(nextHistory),
+        updated_at: now,
+      };
+      await firestoreSetDoc('orders', orderId, updated, session.idToken);
+      return {
+        ok: true,
+        data: { order: serializeClientOrderDoc(updated) } as unknown as T,
+      };
+    }
+
+    if (cleanPath === '/api/account/addresses') {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      if (upperMethod === 'GET') {
+        const docs = await firestoreListDocs<Record<string, unknown>>(
+          `users/${encodeURIComponent(session.uid)}/addresses`,
+          session.idToken
+        );
+        const items = docs
+          .map((d) => serializeClientAddressDoc(d))
+          .sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || b.updatedAt - a.updatedAt);
+        return { ok: true, data: { items } as unknown as T };
+      }
+      if (upperMethod === 'POST') {
+        const fullName = typeof body.fullName === 'string' ? body.fullName.trim() : '';
+        const phone = typeof body.phone === 'string' ? body.phone.trim() : '';
+        const line1 = typeof body.line1 === 'string' ? body.line1.trim() : '';
+        const line2 = typeof body.line2 === 'string' ? body.line2.trim() : '';
+        const city = typeof body.city === 'string' ? body.city.trim() : '';
+        const state = typeof body.state === 'string' ? body.state.trim() : '';
+        const pincode = typeof body.pincode === 'string' ? body.pincode.trim() : '';
+        const landmark = typeof body.landmark === 'string' ? body.landmark.trim() : '';
+        const label = body.label === 'Work' || body.label === 'Other' ? body.label : 'Home';
+        if (
+          fullName.length < 2 ||
+          phone.length < 7 ||
+          line1.length < 5 ||
+          city.length < 2 ||
+          state.length < 2 ||
+          pincode.length < 4
+        ) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'VALIDATION_ERROR',
+            error: 'Please complete recipient name, phone, street address, city, state, and PIN code.',
+          };
+        }
+        const existingDocs = await firestoreListDocs<Record<string, unknown>>(
+          `users/${encodeURIComponent(session.uid)}/addresses`,
+          session.idToken
+        );
+        const id =
+          typeof body.id === 'string' && /^[a-zA-Z0-9_-]{3,80}$/.test(body.id)
+            ? body.id
+            : `addr_${Date.now().toString(36)}_${randomHex(3)}`;
+        const isDefault = Boolean(body.isDefault) || existingDocs.length === 0;
+        const now = Date.now();
+        const prev = existingDocs.find((a) => String(a.id) === id);
+        if (isDefault) {
+          for (const a of existingDocs) {
+            if (String(a.id) !== id && (a.is_default === true || a.is_default === 1)) {
+              await firestoreSetDoc(
+                `users/${encodeURIComponent(session.uid)}/addresses`,
+                String(a.id),
+                {
+                  id: String(a.id),
+                  full_name: String(a.full_name || ''),
+                  phone: String(a.phone || ''),
+                  line1: String(a.line1 || ''),
+                  line2: String(a.line2 || ''),
+                  city: String(a.city || ''),
+                  state: String(a.state || ''),
+                  pincode: String(a.pincode || ''),
+                  landmark: String(a.landmark || ''),
+                  label: a.label === 'Work' || a.label === 'Other' ? a.label : 'Home',
+                  is_default: false,
+                  created_at: Number(a.created_at || now),
+                  updated_at: now,
+                },
+                session.idToken
+              );
+            }
+          }
+        }
+        const record: Record<string, unknown> = {
+          id,
+          full_name: fullName.slice(0, 120),
+          phone: phone.slice(0, 32),
+          line1: line1.slice(0, 240),
+          line2: line2.slice(0, 240),
+          city: city.slice(0, 80),
+          state: state.slice(0, 80),
+          pincode: pincode.slice(0, 16),
+          landmark: landmark.slice(0, 140),
+          label,
+          is_default: isDefault,
+          created_at: Number(prev?.created_at || now),
+          updated_at: now,
+        };
+        await firestoreSetDoc(
+          `users/${encodeURIComponent(session.uid)}/addresses`,
+          id,
+          record,
+          session.idToken
+        );
+        return {
+          ok: true,
+          data: { address: serializeClientAddressDoc(record) } as unknown as T,
+        };
+      }
+    }
+
+    if (cleanPath.startsWith('/api/account/addresses/')) {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const addrId = decodeURIComponent(cleanPath.slice('/api/account/addresses/'.length));
+      if (upperMethod === 'DELETE') {
+        await firestoreDeleteDoc(
+          `users/${encodeURIComponent(session.uid)}/addresses`,
+          addrId,
+          session.idToken
+        );
+        return { ok: true, data: { deletedId: addrId, ok: true } as unknown as T };
+      }
+      if (upperMethod === 'PATCH' || upperMethod === 'PUT') {
+        const existingDocs = await firestoreListDocs<Record<string, unknown>>(
+          `users/${encodeURIComponent(session.uid)}/addresses`,
+          session.idToken
+        );
+        const prev = existingDocs.find((a) => String(a.id) === addrId);
+        const now = Date.now();
+        const isDefault =
+          body.isDefault !== undefined
+            ? Boolean(body.isDefault)
+            : Boolean(prev?.is_default === true || prev?.is_default === 1);
+        if (isDefault) {
+          for (const a of existingDocs) {
+            if (String(a.id) !== addrId && (a.is_default === true || a.is_default === 1)) {
+              await firestoreSetDoc(
+                `users/${encodeURIComponent(session.uid)}/addresses`,
+                String(a.id),
+                {
+                  id: String(a.id),
+                  full_name: String(a.full_name || ''),
+                  phone: String(a.phone || ''),
+                  line1: String(a.line1 || ''),
+                  line2: String(a.line2 || ''),
+                  city: String(a.city || ''),
+                  state: String(a.state || ''),
+                  pincode: String(a.pincode || ''),
+                  landmark: String(a.landmark || ''),
+                  label: a.label === 'Work' || a.label === 'Other' ? a.label : 'Home',
+                  is_default: false,
+                  created_at: Number(a.created_at || now),
+                  updated_at: now,
+                },
+                session.idToken
+              );
+            }
+          }
+        }
+        const record: Record<string, unknown> = {
+          id: addrId,
+          full_name: String(
+            typeof body.fullName === 'string' ? body.fullName.trim() : prev?.full_name || ''
+          ).slice(0, 120),
+          phone: String(
+            typeof body.phone === 'string' ? body.phone.trim() : prev?.phone || ''
+          ).slice(0, 32),
+          line1: String(
+            typeof body.line1 === 'string' ? body.line1.trim() : prev?.line1 || ''
+          ).slice(0, 240),
+          line2: String(
+            typeof body.line2 === 'string' ? body.line2.trim() : prev?.line2 || ''
+          ).slice(0, 240),
+          city: String(
+            typeof body.city === 'string' ? body.city.trim() : prev?.city || ''
+          ).slice(0, 80),
+          state: String(
+            typeof body.state === 'string' ? body.state.trim() : prev?.state || ''
+          ).slice(0, 80),
+          pincode: String(
+            typeof body.pincode === 'string' ? body.pincode.trim() : prev?.pincode || ''
+          ).slice(0, 16),
+          landmark: String(
+            typeof body.landmark === 'string' ? body.landmark.trim() : prev?.landmark || ''
+          ).slice(0, 140),
+          label:
+            body.label === 'Work' || body.label === 'Other'
+              ? body.label
+              : prev?.label === 'Work' || prev?.label === 'Other'
+                ? prev.label
+                : 'Home',
+          is_default: isDefault,
+          created_at: Number(prev?.created_at || now),
+          updated_at: now,
+        };
+        await firestoreSetDoc(
+          `users/${encodeURIComponent(session.uid)}/addresses`,
+          addrId,
+          record,
+          session.idToken
+        );
+        return {
+          ok: true,
+          data: { address: serializeClientAddressDoc(record) } as unknown as T,
+        };
+      }
+    }
+
+    if (cleanPath === '/api/account/wishlist') {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      if (upperMethod === 'GET') {
+        const doc = await firestoreGetDoc<{ product_ids?: string[] }>(
+          `users/${encodeURIComponent(session.uid)}/wishlist`,
+          'items',
+          session.idToken
+        );
+        const productIds = Array.isArray(doc?.product_ids)
+          ? doc.product_ids.filter((id): id is string => typeof id === 'string')
+          : [];
+        return { ok: true, data: { productIds } as unknown as T };
+      }
+      if (upperMethod === 'PUT') {
+        const rawIds = Array.isArray(body.productIds) ? body.productIds : [];
+        const unique = Array.from(
+          new Set(rawIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0))
+        );
+        await firestoreSetDoc(
+          `users/${encodeURIComponent(session.uid)}/wishlist`,
+          'items',
+          { product_ids: unique, updated_at: Date.now() },
+          session.idToken
+        );
+        return { ok: true, data: { productIds: unique } as unknown as T };
+      }
+    }
+
+    if (cleanPath === '/api/account/notifications' && upperMethod === 'GET') {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const docs = await firestoreListDocs<Record<string, unknown>>(
+        `users/${encodeURIComponent(session.uid)}/notifications`,
+        session.idToken
+      );
+      const items = docs
+        .map((d) => serializeClientNotificationDoc(d))
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .slice(0, 60);
+      return {
+        ok: true,
+        data: {
+          items,
+          unreadCount: items.filter((n) => !n.read).length,
+        } as unknown as T,
+      };
+    }
+
+    if (cleanPath === '/api/account/notifications/read-all' && upperMethod === 'POST') {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const docs = await firestoreListDocs<Record<string, unknown>>(
+        `users/${encodeURIComponent(session.uid)}/notifications`,
+        session.idToken
+      );
+      const now = Date.now();
+      for (const n of docs) {
+        const isAlreadyRead = n.is_read === 1 || n.is_read === true || n.read === true;
+        if (!isAlreadyRead && typeof n.id === 'string') {
+          await firestoreSetDoc(
+            `users/${encodeURIComponent(session.uid)}/notifications`,
+            n.id,
+            { ...n, is_read: 1, read: true, read_at: now },
+            session.idToken
+          ).catch(() => undefined);
+        }
+      }
+      return { ok: true, data: { ok: true } as unknown as T };
+    }
+
+    if (
+      cleanPath.startsWith('/api/account/notifications/') &&
+      cleanPath.endsWith('/read') &&
+      upperMethod === 'PATCH'
+    ) {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const notifId = decodeURIComponent(
+        cleanPath.slice('/api/account/notifications/'.length, -'/read'.length)
+      );
+      const existing = await firestoreGetDoc<Record<string, unknown>>(
+        `users/${encodeURIComponent(session.uid)}/notifications`,
+        notifId,
+        session.idToken
+      );
+      if (!existing) {
+        return {
+          ok: false,
+          status: 404,
+          code: 'NOTIFICATION_NOT_FOUND',
+          error: 'Notification not found.',
+        };
+      }
+      await firestoreSetDoc(
+        `users/${encodeURIComponent(session.uid)}/notifications`,
+        notifId,
+        { ...existing, is_read: 1, read: true, read_at: Date.now() },
+        session.idToken
+      );
+      return { ok: true, data: { ok: true, id: notifId } as unknown as T };
+    }
+
+    if (cleanPath === '/api/account/coupons' && upperMethod === 'GET') {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const now = Date.now();
+      const activeNumDocs = await firestoreRunQuery<Record<string, unknown>>(
+        'coupons',
+        [{ field: 'active', value: 1 }],
+        session.idToken
+      );
+      const activeBoolDocs =
+        activeNumDocs.length > 0
+          ? []
+          : await firestoreRunQuery<Record<string, unknown>>(
+              'coupons',
+              [{ field: 'active', value: true }],
+              session.idToken
+            );
+      const merged = [...activeNumDocs, ...activeBoolDocs].map((c) => serializeClientCouponDoc(c));
+      const available = merged.filter(
+        (c) =>
+          c.active &&
+          (!c.startsAt || now >= c.startsAt) &&
+          (!c.expiresAt || now <= c.expiresAt) &&
+          (c.usageLimit === null || c.usedCount < c.usageLimit)
+      );
+      return { ok: true, data: { items: available } as unknown as T };
+    }
+
+    if (cleanPath === '/api/account/rewards' && upperMethod === 'GET') {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const [loyaltyDoc, orderDocs] = await Promise.all([
+        firestoreGetDoc<{ data?: Partial<LoyaltyConfig> }>(
+          'site_documents',
+          'loyalty_config',
+          session.idToken
+        ),
+        firestoreRunQuery<Record<string, unknown>>(
+          'orders',
+          [{ field: 'customer_user_id', value: session.uid }],
+          session.idToken
+        ),
+      ]);
+      const config = mergeLoyaltyConfig(
+        loyaltyDoc?.data ?? (loyaltyDoc as Partial<LoyaltyConfig> | null) ?? DEFAULT_LOYALTY_CONFIG
+      );
+      const serialized = orderDocs.map((d) => serializeClientOrderDoc(d));
+      const qualifying = serialized.filter(
+        (o) =>
+          o.paymentStatus.toLowerCase() === 'paid' &&
+          !['cancelled', 'returned'].includes(o.fulfillmentStatus.toLowerCase())
+      );
+      const lifetimeSpendPaise = qualifying.reduce((sum, o) => sum + o.totalPaise, 0);
+      const deliveredOrdersCount = serialized.filter(
+        (o) => o.fulfillmentStatus.toLowerCase() === 'delivered'
+      ).length;
+      const pointsBalance = config.rewardsEnabled
+        ? Math.floor((lifetimeSpendPaise / 10_000) * Math.max(0, config.pointsPerHundredInr))
+        : 0;
+      const threshold = Math.max(100, config.plusQualificationSpendPaise || 1_000_000);
+      const isPlusMember = config.plusEnabled && lifetimeSpendPaise >= threshold;
+
+      return {
+        ok: true,
+        data: {
+          config,
+          pointsBalance,
+          lifetimeEarnedPoints: pointsBalance,
+          lifetimeSpendPaise,
+          deliveredOrdersCount,
+          isPlusMember,
+          plusStatusLabel: !config.plusEnabled
+            ? 'Program paused'
+            : isPlusMember
+              ? `${config.plusTierName} Active`
+              : `${config.plusTierName} Eligible at ₹${(threshold / 100).toLocaleString('en-IN')}`,
+          plusProgressPaise: Math.min(threshold, lifetimeSpendPaise),
+        } as unknown as T,
+      };
+    }
+
+    if (cleanPath === '/api/account/payment-methods' && upperMethod === 'GET') {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      return {
+        ok: true,
+        data: {
+          enabled: false,
+          provider: 'razorpay',
+          reason:
+            'Sahithi Collections uses PCI-compliant Razorpay Standard Checkout. Saved card tokens require Razorpay Customer Vault configuration; all UPI, Cards, Wallets, and NetBanking options remain available at checkout.',
+          methods: [],
+        } as unknown as T,
+      };
+    }
+
+    if (cleanPath === '/api/coupons/validate' && upperMethod === 'POST') {
+      const subtotalPaise = Math.max(0, Math.round(Number(body.subtotalPaise ?? 0) || 0));
+      const couponCode =
+        typeof body.couponCode === 'string'
+          ? body.couponCode.trim().toUpperCase()
+          : typeof body.code === 'string'
+            ? body.code.trim().toUpperCase()
+            : '';
+      const giftCardCode =
+        typeof body.giftCardCode === 'string' ? body.giftCardCode.trim().toUpperCase() : '';
+      if (!couponCode && !giftCardCode) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          error: 'Enter a coupon or gift card code to apply.',
+        };
+      }
+      const session = await getValidClientSession().catch(() => null);
+      const idToken = session?.idToken;
+      const now = Date.now();
+      let discountPaise = 0;
+      let appliedCoupon: ReturnType<typeof serializeClientCouponDoc> | null = null;
+      if (couponCode) {
+        const cpnDoc = await firestoreGetDoc<Record<string, unknown>>(
+          'coupons',
+          `cpn_${couponCode.toLowerCase()}`,
+          idToken
+        );
+        if (!cpnDoc) {
+          return {
+            ok: false,
+            status: 404,
+            code: 'COUPON_NOT_FOUND',
+            error: `Coupon "${couponCode}" was not found.`,
+          };
+        }
+        const c = serializeClientCouponDoc(cpnDoc);
+        if (!c.active) {
+          return { ok: false, status: 400, code: 'COUPON_INACTIVE', error: `Coupon "${couponCode}" is inactive.` };
+        }
+        if (c.startsAt && now < c.startsAt) {
+          return { ok: false, status: 400, code: 'COUPON_NOT_STARTED', error: `Coupon "${couponCode}" is not active yet.` };
+        }
+        if (c.expiresAt && now > c.expiresAt) {
+          return { ok: false, status: 400, code: 'COUPON_EXPIRED', error: `Coupon "${couponCode}" has expired.` };
+        }
+        if (c.usageLimit !== null && c.usedCount >= c.usageLimit) {
+          return { ok: false, status: 400, code: 'COUPON_LIMIT_REACHED', error: `Coupon "${couponCode}" has reached its redemption limit.` };
+        }
+        if (subtotalPaise < c.minSpendPaise) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'COUPON_MIN_SPEND',
+            error: `Coupon "${couponCode}" requires a minimum order of ₹${(c.minSpendPaise / 100).toLocaleString('en-IN')}.`,
+          };
+        }
+        discountPaise =
+          c.discountType === 'percent'
+            ? Math.round((subtotalPaise * c.discountValue) / 100)
+            : c.discountValue;
+        if (c.maxDiscountPaise !== null && c.maxDiscountPaise > 0) {
+          discountPaise = Math.min(discountPaise, c.maxDiscountPaise);
+        }
+        discountPaise = Math.max(0, Math.min(subtotalPaise, discountPaise));
+        appliedCoupon = c;
+      }
+
+      let giftCardPaise = 0;
+      let appliedGiftCard: ReturnType<typeof serializeClientGiftCardDoc> | null = null;
+      if (giftCardCode) {
+        const gcDoc = await firestoreGetDoc<Record<string, unknown>>(
+          'gift_cards',
+          `gc_${giftCardCode.toLowerCase()}`,
+          idToken
+        );
+        if (!gcDoc) {
+          return { ok: false, status: 404, code: 'GIFT_CARD_NOT_FOUND', error: `Gift card "${giftCardCode}" was not found.` };
+        }
+        const gc = serializeClientGiftCardDoc(gcDoc);
+        if (!gc.active) {
+          return { ok: false, status: 400, code: 'GIFT_CARD_INACTIVE', error: `Gift card "${giftCardCode}" is inactive.` };
+        }
+        if (gc.expiresAt && now > gc.expiresAt) {
+          return { ok: false, status: 400, code: 'GIFT_CARD_EXPIRED', error: `Gift card "${giftCardCode}" has expired.` };
+        }
+        if (gc.balancePaise <= 0) {
+          return { ok: false, status: 400, code: 'GIFT_CARD_EMPTY', error: `Gift card "${giftCardCode}" has ₹0 remaining balance.` };
+        }
+        const afterDiscount = Math.max(0, subtotalPaise - discountPaise);
+        giftCardPaise = Math.min(gc.balancePaise, afterDiscount);
+        appliedGiftCard = gc;
+      }
+
+      const payablePaise = Math.max(0, subtotalPaise - discountPaise - giftCardPaise);
+      return {
+        ok: true,
+        data: {
+          valid: true,
+          subtotalPaise,
+          discountPaise,
+          giftCardPaise,
+          payablePaise,
+          coupon: appliedCoupon,
+          giftCard: appliedGiftCard,
+        } as unknown as T,
+      };
+    }
+
+    if (cleanPath === '/api/gift-cards/check' && upperMethod === 'POST') {
+      const rawCode = typeof body.code === 'string' ? body.code.trim().toUpperCase() : '';
+      if (!rawCode || rawCode.length < 4) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          error: 'Enter a valid Sahithi Gift Card code.',
+        };
+      }
+      const session = await getValidClientSession().catch(() => null);
+      const gcDoc = await firestoreGetDoc<Record<string, unknown>>(
+        'gift_cards',
+        `gc_${rawCode.toLowerCase()}`,
+        session?.idToken
+      );
+      if (!gcDoc) {
+        return {
+          ok: false,
+          status: 404,
+          code: 'GIFT_CARD_NOT_FOUND',
+          error: `Gift card "${rawCode}" was not found.`,
+        };
+      }
+      const gc = serializeClientGiftCardDoc(gcDoc);
+      if (!gc.active) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'GIFT_CARD_INACTIVE',
+          error: `Gift card "${rawCode}" is inactive.`,
+        };
+      }
+      if (gc.expiresAt && Date.now() > gc.expiresAt) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'GIFT_CARD_EXPIRED',
+          error: `Gift card "${rawCode}" has expired.`,
+        };
+      }
+      return { ok: true, data: { giftCard: gc } as unknown as T };
+    }
+
     // 13. Public Storefront & Catalog Endpoints
     if (cleanPath === '/api/storefront' && upperMethod === 'GET') {
       const [siteSettingsDoc, legacySettingsDoc, siteContentDoc, legacyContentDoc, categoriesDocs] =
@@ -3138,6 +4096,9 @@ export async function handleClientlessApiRequest<T>(
       }
 
       const activeSession = await getValidClientSession().catch(() => null);
+      const initialHistory: OrderStatusHistoryEntry[] = [
+        { status: 'pending', note: 'Order placed', actor: 'customer', at: now },
+      ];
       await firestoreSetDoc(
         'orders',
         orderId,
@@ -3150,15 +4111,43 @@ export async function handleClientlessApiRequest<T>(
           customer_phone: customerPhone,
           shipping_address: shippingAddress,
           status: 'pending',
+          payment_status: 'unpaid',
+          fulfillment_status: 'pending',
+          payment_method: 'cod',
+          discount_paise: 0,
+          gift_card_paise: 0,
+          status_history: initialHistory,
           subtotal_paise: subtotalPaise,
           total_paise: subtotalPaise,
           currency: 'INR',
           created_at: now,
+          updated_at: now,
           product_ids: Array.from(productIds),
           items: orderItems,
         },
         activeSession?.idToken
-      ).catch(() => false);
+      );
+
+      if (activeSession?.uid) {
+        await firestoreSetDoc(
+          `users/${encodeURIComponent(activeSession.uid)}/notifications`,
+          `notif_ord_${orderId}`,
+          {
+            id: `notif_ord_${orderId}`,
+            user_id: activeSession.uid,
+            type: 'order_placed',
+            title: `Order ${orderNumber} placed`,
+            message: `We have received your order ${orderNumber} for ₹${(subtotalPaise / 100).toLocaleString('en-IN')}.`,
+            order_id: orderId,
+            order_number: orderNumber,
+            is_read: 0,
+            read: false,
+            read_at: null,
+            created_at: now,
+          },
+          activeSession.idToken
+        ).catch(() => undefined);
+      }
 
       return {
         ok: true,
@@ -3166,16 +4155,26 @@ export async function handleClientlessApiRequest<T>(
           order: {
             id: orderId,
             orderNumber,
+            customerUserId: activeSession ? activeSession.uid : null,
             customerName,
             customerEmail,
             customerPhone,
             shippingAddress,
             status: 'pending',
+            paymentStatus: 'unpaid',
+            fulfillmentStatus: 'pending',
+            paymentMethod: 'cod',
             subtotalPaise,
+            discountPaise: 0,
+            giftCardPaise: 0,
             totalPaise: subtotalPaise,
             currency: 'INR',
+            statusHistory: initialHistory,
             createdAt: now,
+            updatedAt: now,
             items: orderItems.map((it) => ({
+              productId: it.product_id,
+              variantId: it.variant_id,
               productTitle: it.product_title,
               variantLabel: it.variant_label,
               sku: it.sku,
@@ -3317,20 +4316,14 @@ export async function handleClientlessApiRequest<T>(
       }
 
       if (cleanPath === '/api/admin/overview' && upperMethod === 'GET') {
-        const [products, categories, messages, orders, auditLogs] = await Promise.all([
+        const [products, categories, messages, orders, auditLogs, usersDocs] = await Promise.all([
           getMergedProductDocs(idToken),
           firestoreListDocs<{ id: string }>('categories', idToken),
           firestoreListDocs<{ status?: string; created_at?: number }>(
             'contact_messages',
             idToken
           ),
-          firestoreListDocs<
-            ClientOrderDoc & {
-              status?: string;
-              total_paise?: number;
-              created_at?: number;
-            }
-          >('orders', idToken),
+          firestoreListDocs<Record<string, unknown>>('orders', idToken),
           firestoreListDocs<{
             id: string;
             product_id?: string | null;
@@ -3343,9 +4336,11 @@ export async function handleClientlessApiRequest<T>(
             summary: string;
             created_at: number;
           }>('product_audit_logs', idToken),
+          firestoreListDocs<{ id: string; email_verified?: boolean }>('users', idToken).catch(() => []),
         ]);
 
-        const orderCounts = computeProductOrderCounts(orders);
+        const orderCounts = computeProductOrderCounts(orders as unknown as ClientOrderDoc[]);
+        const serializedOrders = orders.map((o) => serializeClientOrderDoc(o));
         const activeCount = products.filter(
           (p) => p.status === 'active' || p.status === 'published'
         ).length;
@@ -3361,18 +4356,18 @@ export async function handleClientlessApiRequest<T>(
           (p) => (p.status === 'active' || p.status === 'published') && Number(p.stock_qty) <= 0
         ).length;
 
-        const paidOrders = orders.filter(
+        const paidOrders = serializedOrders.filter(
           (o) =>
-            o.status === 'paid' ||
-            o.status === 'fulfilled' ||
-            o.status === 'confirmed' ||
-            o.status === 'shipped' ||
-            o.status === 'delivered'
+            o.paymentStatus === 'paid' ||
+            ['paid', 'fulfilled', 'confirmed', 'packed', 'shipped', 'delivered'].includes(o.status)
         );
         const totalRevenuePaise = paidOrders.reduce(
-          (sum, o) => sum + Number(o.total_paise || 0),
+          (sum, o) => sum + Number(o.totalPaise || 0),
           0
         );
+        const openReturnRequests = serializedOrders.filter(
+          (o) => o.returnRequest && o.returnRequest.status === 'pending'
+        ).length;
 
         return {
           ok: true,
@@ -3388,8 +4383,10 @@ export async function handleClientlessApiRequest<T>(
               outOfStockProducts: outOfStockCount,
               outOfStockCount,
               totalCategories: categories.length || INITIAL_SEED_CATEGORIES.length,
-              totalOrders: orders.length,
-              pendingOrders: orders.filter((o) => o.status === 'pending').length,
+              totalOrders: serializedOrders.length,
+              pendingOrders: serializedOrders.filter(
+                (o) => !['delivered', 'cancelled', 'returned'].includes(o.fulfillmentStatus)
+              ).length,
               totalRevenuePaise,
               totalRevenue: Number((totalRevenuePaise / 100).toFixed(2)),
               unreadMessages: messages.filter(
@@ -3397,6 +4394,8 @@ export async function handleClientlessApiRequest<T>(
               ).length,
               totalMessages: messages.length,
               totalAuditEvents: auditLogs.length,
+              totalCustomers: usersDocs.length,
+              openReturnRequests,
             },
             lowStockItems: products
               .filter(
@@ -3406,8 +4405,8 @@ export async function handleClientlessApiRequest<T>(
               )
               .slice(0, 8)
               .map((p) => formatProductDto(p, true, orderCounts.get(p.id) || 0)),
-            recentOrders: [...orders]
-              .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
+            recentOrders: [...serializedOrders]
+              .sort((a, b) => b.createdAt - a.createdAt)
               .slice(0, 8),
             recentMessages: [...messages]
               .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
@@ -3704,85 +4703,17 @@ export async function handleClientlessApiRequest<T>(
       }
 
       if (cleanPath === '/api/admin/orders' && upperMethod === 'GET') {
-        const docs = await firestoreListDocs<{
-          id: string;
-          order_number: string;
-          customer_name: string;
-          customer_phone: string;
-          customer_email: string | null;
-          shipping_address?: string;
-          status: string;
-          subtotal_paise: number;
-          total_paise: number;
-          notes?: string | null;
-          created_at: number;
-          updated_at?: number;
-          items?: Array<{
-            id: string;
-            product_id: string;
-            variant_id: string | null;
-            product_title?: string;
-            title_snapshot?: string;
-            variant_label?: string;
-            sku?: string;
-            sku_snapshot?: string;
-            size_snapshot?: string;
-            color_snapshot?: string;
-            unit_price_paise: number;
-            quantity?: number;
-            qty?: number;
-            line_total_paise?: number;
-          }>;
-        }>('orders', idToken);
+        const docs = await firestoreListDocs<Record<string, unknown>>('orders', idToken);
         const items = docs
-          .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
-          .map((o) => ({
-            id: o.id,
-            orderNumber: o.order_number,
-            customerName: o.customer_name,
-            customerPhone: o.customer_phone,
-            customerEmail: o.customer_email || '',
-            shippingAddress: o.shipping_address || '',
-            status: o.status,
-            subtotalPaise: Number(o.subtotal_paise || 0),
-            totalPaise: Number(o.total_paise || 0),
-            subtotal: Number((Number(o.subtotal_paise || 0) / 100).toFixed(2)),
-            total: Number((Number(o.total_paise || 0) / 100).toFixed(2)),
-            notes: o.notes || '',
-            createdAt: Number(o.created_at || Date.now()),
-            updatedAt: Number(o.updated_at || o.created_at || Date.now()),
-            items: (o.items ?? []).map((it) => {
-              const qty = Number(it.quantity ?? it.qty ?? 1);
-              const unitPaise = Number(it.unit_price_paise || 0);
-              return {
-                id: it.id,
-                productId: it.product_id,
-                variantId: it.variant_id,
-                productTitle: it.product_title || it.title_snapshot || 'Boutique Piece',
-                titleSnapshot: it.title_snapshot || it.product_title || 'Boutique Piece',
-                variantLabel:
-                  it.variant_label ||
-                  [it.size_snapshot, it.color_snapshot].filter(Boolean).join(' / ') ||
-                  'Standard',
-                sku: it.sku || it.sku_snapshot || '',
-                skuSnapshot: it.sku_snapshot || it.sku || '',
-                sizeSnapshot: it.size_snapshot || '',
-                colorSnapshot: it.color_snapshot || '',
-                unitPricePaise: unitPaise,
-                unitPrice: Number((unitPaise / 100).toFixed(2)),
-                quantity: qty,
-                qty,
-                lineTotalPaise: Number(it.line_total_paise ?? unitPaise * qty),
-              };
-            }),
-          }));
+          .map((o) => serializeClientOrderDoc(o))
+          .sort((a, b) => b.createdAt - a.createdAt);
         return {
           ok: true,
           data: {
             items,
             total: items.length,
             page: 1,
-            pageSize: 20,
+            pageSize: 50,
             totalPages: 1,
           } as unknown as T,
         };
@@ -4696,8 +5627,160 @@ export async function handleClientlessApiRequest<T>(
         }
       }
 
+      if (cleanPath === '/api/admin/orders/recover' && upperMethod === 'POST') {
+        const rzOrderId =
+          typeof body.razorpayOrderId === 'string'
+            ? body.razorpayOrderId.trim()
+            : typeof body.razorpay_order_id === 'string'
+              ? body.razorpay_order_id.trim()
+              : '';
+        const rzPaymentId =
+          typeof body.razorpayPaymentId === 'string'
+            ? body.razorpayPaymentId.trim()
+            : typeof body.razorpay_payment_id === 'string'
+              ? body.razorpay_payment_id.trim()
+              : '';
+        if (!rzOrderId) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'VALIDATION_ERROR',
+            error: 'Razorpay Order ID (order_...) is required to recover a captured payment.',
+          };
+        }
+        const statusRes = await fetch('/api/order-status', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({
+            razorpay_order_id: rzOrderId,
+            razorpay_payment_id: rzPaymentId || undefined,
+          }),
+        });
+        const statusBody = (await statusRes.json().catch(() => ({}))) as Record<string, unknown>;
+        if (!statusRes.ok && statusRes.status !== 202) {
+          return {
+            ok: false,
+            status: statusRes.status || 500,
+            code: typeof statusBody.code === 'string' ? statusBody.code : 'RECOVER_FAILED',
+            error:
+              typeof statusBody.error === 'string' && statusBody.error
+                ? statusBody.error
+                : 'Unable to recover Razorpay order from /api/order-status.',
+          };
+        }
+        return {
+          ok: true,
+          data: statusBody as unknown as T,
+        };
+      }
+
       if (cleanPath.startsWith('/api/admin/orders/') && (upperMethod === 'PATCH' || upperMethod === 'POST')) {
         const rawSub = cleanPath.slice('/api/admin/orders/'.length).replace(/\/+$/, '');
+        if (rawSub.endsWith('/resolve-request') && upperMethod === 'POST') {
+          const orderId = decodeURIComponent(rawSub.slice(0, -'/resolve-request'.length));
+          const decision =
+            body.decision === 'approved' || body.decision === 'rejected' ? body.decision : null;
+          if (!decision) {
+            return {
+              ok: false,
+              status: 400,
+              code: 'VALIDATION_ERROR',
+              error: 'Decision must be "approved" or "rejected".',
+            };
+          }
+          const existing = await firestoreGetDoc<Record<string, unknown>>(
+            'orders',
+            orderId,
+            idToken
+          );
+          if (!existing) {
+            return { ok: false, status: 404, code: 'ORDER_NOT_FOUND', error: 'Order not found.' };
+          }
+          const currentReq = parseJsonOrValue<OrderReturnRequest | null>(
+            existing.return_request ?? existing.return_request_json,
+            null
+          );
+          if (!currentReq) {
+            return {
+              ok: false,
+              status: 404,
+              code: 'REQUEST_NOT_FOUND',
+              error: 'No return or cancellation request found on this order.',
+            };
+          }
+          const now = Date.now();
+          const note = typeof body.note === 'string' ? body.note.trim().slice(0, 300) : '';
+          const updatedReq: OrderReturnRequest = {
+            ...currentReq,
+            status: decision,
+            resolvedAt: now,
+            resolutionNote: note || undefined,
+          };
+          const nextStatus =
+            decision === 'approved'
+              ? currentReq.type === 'cancel'
+                ? 'cancelled'
+                : 'returned'
+              : 'confirmed';
+          const prevHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
+            existing.status_history ?? existing.status_history_json,
+            []
+          );
+          const nextHistory: OrderStatusHistoryEntry[] = [
+            ...prevHistory,
+            {
+              status: `${currentReq.type}_${decision}`,
+              note: note || `Request ${decision} by store owner`,
+              actor: 'owner',
+              at: now,
+            },
+          ];
+          const updated = {
+            ...existing,
+            status: nextStatus,
+            fulfillment_status: nextStatus,
+            return_request: updatedReq,
+            return_request_json: JSON.stringify(updatedReq),
+            status_history: nextHistory,
+            status_history_json: JSON.stringify(nextHistory),
+            updated_at: now,
+          };
+          await firestoreSetDoc('orders', orderId, updated, idToken);
+          const customerUid =
+            typeof existing.customer_user_id === 'string' ? existing.customer_user_id : null;
+          if (customerUid) {
+            const notifId = `notif_req_${orderId}_${decision}_${now}`;
+            await firestoreSetDoc(
+              `users/${encodeURIComponent(customerUid)}/notifications`,
+              notifId,
+              {
+                id: notifId,
+                user_id: customerUid,
+                type: 'request_update',
+                title: `${currentReq.type === 'cancel' ? 'Cancellation' : 'Return'} request ${decision}`,
+                message:
+                  note ||
+                  `Your ${currentReq.type} request for order ${String(existing.order_number || orderId)} was ${decision}.`,
+                order_id: orderId,
+                order_number: String(existing.order_number || ''),
+                is_read: 0,
+                read: false,
+                read_at: null,
+                created_at: now,
+              },
+              idToken
+            ).catch(() => undefined);
+          }
+          return {
+            ok: true,
+            data: { order: serializeClientOrderDoc(updated) } as unknown as T,
+          };
+        }
+
         const orderId = decodeURIComponent(
           rawSub.endsWith('/status') ? rawSub.slice(0, -'/status'.length) : rawSub
         );
@@ -4714,14 +5797,451 @@ export async function handleClientlessApiRequest<T>(
             error: 'Order not found.',
           };
         }
+        const allowedStatuses = new Set([
+          'pending',
+          'confirmed',
+          'packed',
+          'shipped',
+          'delivered',
+          'cancelled',
+          'return_requested',
+          'returned',
+        ]);
+        const nextStatus =
+          typeof body.status === 'string' ? body.status.trim().toLowerCase() : String(existing.status || 'pending');
+        if (!allowedStatuses.has(nextStatus)) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'VALIDATION_ERROR',
+            error: 'Invalid fulfillment status.',
+          };
+        }
+        const now = Date.now();
+        const note = typeof body.note === 'string' ? body.note.trim().slice(0, 300) : '';
+        const prevHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
+          existing.status_history ?? existing.status_history_json,
+          []
+        );
+        const nextHistory: OrderStatusHistoryEntry[] = [
+          ...prevHistory,
+          {
+            status: nextStatus,
+            note: note || `Updated to ${nextStatus.replace(/_/g, ' ')}`,
+            actor: 'owner',
+            at: now,
+          },
+        ];
         const updated = {
           ...existing,
-          ...(typeof body.status === 'string' ? { status: body.status } : {}),
+          status: nextStatus,
+          fulfillment_status: nextStatus,
+          status_history: nextHistory,
+          status_history_json: JSON.stringify(nextHistory),
+          updated_at: now,
         };
         await firestoreSetDoc('orders', orderId, updated, idToken);
+        const customerUid =
+          typeof existing.customer_user_id === 'string' ? existing.customer_user_id : null;
+        if (customerUid) {
+          const notifId = `notif_st_${orderId}_${nextStatus}_${now}`;
+          await firestoreSetDoc(
+            `users/${encodeURIComponent(customerUid)}/notifications`,
+            notifId,
+            {
+              id: notifId,
+              user_id: customerUid,
+              type: 'order_status',
+              title: `Order ${String(existing.order_number || orderId)} updated`,
+              message: note || `Order status updated to ${nextStatus.replace(/_/g, ' ')}.`,
+              order_id: orderId,
+              order_number: String(existing.order_number || ''),
+              is_read: 0,
+              read: false,
+              read_at: null,
+              created_at: now,
+            },
+            idToken
+          ).catch(() => undefined);
+        }
+        const serialized = serializeClientOrderDoc(updated);
         return {
           ok: true,
-          data: { order: updated, item: updated } as unknown as T,
+          data: { id: orderId, status: nextStatus, order: serialized, item: serialized } as unknown as T,
+        };
+      }
+
+      if (cleanPath === '/api/admin/coupons') {
+        if (upperMethod === 'GET') {
+          const docs = await firestoreListDocs<Record<string, unknown>>('coupons', idToken);
+          const items = docs
+            .map((c) => serializeClientCouponDoc(c))
+            .sort((a, b) => b.createdAt - a.createdAt);
+          return { ok: true, data: { items } as unknown as T };
+        }
+        if (upperMethod === 'POST') {
+          const code = typeof body.code === 'string' ? body.code.trim().toUpperCase() : '';
+          const title = typeof body.title === 'string' ? body.title.trim() : '';
+          const description = typeof body.description === 'string' ? body.description.trim() : '';
+          const discountType = body.discountType === 'flat_paise' ? 'flat_paise' : 'percent';
+          const discountValue = Math.round(Number(body.discountValue ?? 0));
+          if (!/^[A-Z0-9_-]{3,32}$/.test(code) || !title || !Number.isFinite(discountValue) || discountValue <= 0) {
+            return {
+              ok: false,
+              status: 400,
+              code: 'VALIDATION_ERROR',
+              error: 'Provide a valid alphanumeric coupon code (3–32 chars), title, and discount value.',
+            };
+          }
+          const now = Date.now();
+          const id = `cpn_${code.toLowerCase()}`;
+          const prev = await firestoreGetDoc<Record<string, unknown>>('coupons', id, idToken);
+          const record: Record<string, unknown> = {
+            id,
+            code,
+            title,
+            description,
+            discount_type: discountType,
+            discount_value: discountValue,
+            max_discount_paise:
+              body.maxDiscountPaise !== undefined && body.maxDiscountPaise !== null && body.maxDiscountPaise !== ''
+                ? Math.max(0, Math.round(Number(body.maxDiscountPaise)))
+                : null,
+            min_spend_paise: Math.max(0, Math.round(Number(body.minSpendPaise ?? 0) || 0)),
+            usage_limit:
+              body.usageLimit !== undefined && body.usageLimit !== null && body.usageLimit !== ''
+                ? Math.max(1, Math.round(Number(body.usageLimit)))
+                : null,
+            used_count: Number(prev?.used_count || 0),
+            active: body.active !== undefined ? (body.active ? 1 : 0) : 1,
+            starts_at: body.startsAt ? Number(body.startsAt) : null,
+            expires_at: body.expiresAt ? Number(body.expiresAt) : null,
+            created_at: Number(prev?.created_at || now),
+            updated_at: now,
+          };
+          await firestoreSetDoc('coupons', id, record, idToken);
+          return { ok: true, data: { coupon: serializeClientCouponDoc(record) } as unknown as T };
+        }
+      }
+
+      if (cleanPath.startsWith('/api/admin/coupons/')) {
+        const id = decodeURIComponent(cleanPath.slice('/api/admin/coupons/'.length));
+        if (upperMethod === 'DELETE') {
+          await firestoreDeleteDoc('coupons', id, idToken);
+          return { ok: true, data: { deletedId: id, ok: true } as unknown as T };
+        }
+        if (upperMethod === 'PUT' || upperMethod === 'PATCH') {
+          const prev = await firestoreGetDoc<Record<string, unknown>>('coupons', id, idToken);
+          const now = Date.now();
+          const code =
+            typeof body.code === 'string' && body.code.trim()
+              ? body.code.trim().toUpperCase()
+              : String(prev?.code || '');
+          const record: Record<string, unknown> = {
+            id,
+            code,
+            title: String(typeof body.title === 'string' ? body.title.trim() : prev?.title || ''),
+            description: String(
+              typeof body.description === 'string' ? body.description.trim() : prev?.description || ''
+            ),
+            discount_type:
+              body.discountType === 'flat_paise' || body.discountType === 'percent'
+                ? body.discountType
+                : prev?.discount_type || 'percent',
+            discount_value: Math.round(Number(body.discountValue ?? prev?.discount_value ?? 0)),
+            max_discount_paise:
+              body.maxDiscountPaise !== undefined
+                ? body.maxDiscountPaise === null || body.maxDiscountPaise === ''
+                  ? null
+                  : Math.max(0, Math.round(Number(body.maxDiscountPaise)))
+                : (prev?.max_discount_paise ?? null),
+            min_spend_paise: Math.max(
+              0,
+              Math.round(Number(body.minSpendPaise ?? prev?.min_spend_paise ?? 0) || 0)
+            ),
+            usage_limit:
+              body.usageLimit !== undefined
+                ? body.usageLimit === null || body.usageLimit === ''
+                  ? null
+                  : Math.max(1, Math.round(Number(body.usageLimit)))
+                : (prev?.usage_limit ?? null),
+            used_count: Number(prev?.used_count || 0),
+            active:
+              body.active !== undefined ? (body.active ? 1 : 0) : (prev?.active ?? 1),
+            starts_at: body.startsAt !== undefined ? body.startsAt : (prev?.starts_at ?? null),
+            expires_at: body.expiresAt !== undefined ? body.expiresAt : (prev?.expires_at ?? null),
+            created_at: Number(prev?.created_at || now),
+            updated_at: now,
+          };
+          await firestoreSetDoc('coupons', id, record, idToken);
+          return { ok: true, data: { coupon: serializeClientCouponDoc(record) } as unknown as T };
+        }
+      }
+
+      if (cleanPath === '/api/admin/gift-cards') {
+        if (upperMethod === 'GET') {
+          const docs = await firestoreListDocs<Record<string, unknown>>('gift_cards', idToken);
+          const items = docs
+            .map((g) => serializeClientGiftCardDoc(g))
+            .sort((a, b) => b.createdAt - a.createdAt);
+          return { ok: true, data: { items } as unknown as T };
+        }
+        if (upperMethod === 'POST') {
+          const code = typeof body.code === 'string' ? body.code.trim().toUpperCase() : '';
+          const initialBalancePaise = Math.round(Number(body.initialBalancePaise ?? 0));
+          const balancePaise =
+            body.balancePaise !== undefined ? Math.round(Number(body.balancePaise)) : initialBalancePaise;
+          if (
+            !/^[A-Z0-9_-]{4,36}$/.test(code) ||
+            !Number.isFinite(initialBalancePaise) ||
+            initialBalancePaise < 100 ||
+            !Number.isFinite(balancePaise) ||
+            balancePaise < 0
+          ) {
+            return {
+              ok: false,
+              status: 400,
+              code: 'VALIDATION_ERROR',
+              error: 'Provide a valid gift card code (4–36 chars) and positive INR balance.',
+            };
+          }
+          const now = Date.now();
+          const id = `gc_${code.toLowerCase()}`;
+          const prev = await firestoreGetDoc<Record<string, unknown>>('gift_cards', id, idToken);
+          const record: Record<string, unknown> = {
+            id,
+            code,
+            recipient_email:
+              typeof body.recipientEmail === 'string' ? body.recipientEmail.trim().toLowerCase() : '',
+            note: typeof body.note === 'string' ? body.note.trim().slice(0, 300) : '',
+            initial_balance_paise: initialBalancePaise,
+            balance_paise: balancePaise,
+            active: body.active !== undefined ? (body.active ? 1 : 0) : 1,
+            expires_at: body.expiresAt ? Number(body.expiresAt) : null,
+            last_used_at: prev?.last_used_at ?? null,
+            created_at: Number(prev?.created_at || now),
+            updated_at: now,
+          };
+          await firestoreSetDoc('gift_cards', id, record, idToken);
+          return { ok: true, data: { giftCard: serializeClientGiftCardDoc(record) } as unknown as T };
+        }
+      }
+
+      if (cleanPath.startsWith('/api/admin/gift-cards/')) {
+        const id = decodeURIComponent(cleanPath.slice('/api/admin/gift-cards/'.length));
+        if (upperMethod === 'DELETE') {
+          await firestoreDeleteDoc('gift_cards', id, idToken);
+          return { ok: true, data: { deletedId: id, ok: true } as unknown as T };
+        }
+        if (upperMethod === 'PUT' || upperMethod === 'PATCH') {
+          const prev = await firestoreGetDoc<Record<string, unknown>>('gift_cards', id, idToken);
+          const now = Date.now();
+          const record: Record<string, unknown> = {
+            id,
+            code:
+              typeof body.code === 'string' && body.code.trim()
+                ? body.code.trim().toUpperCase()
+                : String(prev?.code || ''),
+            recipient_email:
+              typeof body.recipientEmail === 'string'
+                ? body.recipientEmail.trim().toLowerCase()
+                : String(prev?.recipient_email || ''),
+            note:
+              typeof body.note === 'string'
+                ? body.note.trim().slice(0, 300)
+                : String(prev?.note || ''),
+            initial_balance_paise: Math.max(
+              0,
+              Math.round(Number(body.initialBalancePaise ?? prev?.initial_balance_paise ?? 0))
+            ),
+            balance_paise: Math.max(
+              0,
+              Math.round(Number(body.balancePaise ?? prev?.balance_paise ?? 0))
+            ),
+            active: body.active !== undefined ? (body.active ? 1 : 0) : (prev?.active ?? 1),
+            expires_at: body.expiresAt !== undefined ? body.expiresAt : (prev?.expires_at ?? null),
+            last_used_at: prev?.last_used_at ?? null,
+            created_at: Number(prev?.created_at || now),
+            updated_at: now,
+          };
+          await firestoreSetDoc('gift_cards', id, record, idToken);
+          return { ok: true, data: { giftCard: serializeClientGiftCardDoc(record) } as unknown as T };
+        }
+      }
+
+      if (cleanPath === '/api/admin/loyalty') {
+        if (upperMethod === 'GET') {
+          const doc = await firestoreGetDoc<{ data?: Partial<LoyaltyConfig> }>(
+            'site_documents',
+            'loyalty_config',
+            idToken
+          );
+          return {
+            ok: true,
+            data: {
+              config: mergeLoyaltyConfig(
+                doc?.data ?? (doc as Partial<LoyaltyConfig> | null) ?? DEFAULT_LOYALTY_CONFIG
+              ),
+            } as unknown as T,
+          };
+        }
+        if (upperMethod === 'PUT' || upperMethod === 'POST') {
+          const payload = (
+            body.config && typeof body.config === 'object' ? body.config : body
+          ) as Partial<LoyaltyConfig>;
+          const normalized = mergeLoyaltyConfig(payload);
+          await firestoreSetDoc(
+            'site_documents',
+            'loyalty_config',
+            {
+              key: 'loyalty_config',
+              data: normalized as unknown as Record<string, unknown>,
+              updated_at: Date.now(),
+            },
+            idToken
+          );
+          return { ok: true, data: { config: normalized } as unknown as T };
+        }
+      }
+
+      if (cleanPath === '/api/admin/activity' && upperMethod === 'GET') {
+        const [usersDocs, orderDocs, msgDocs, cpnDocs, gcDocs] = await Promise.all([
+          firestoreListDocs<{
+            id: string;
+            full_name?: string;
+            email?: string;
+            email_verified?: boolean;
+            created_at?: number;
+          }>('users', idToken).catch(() => []),
+          firestoreListDocs<Record<string, unknown>>('orders', idToken).catch(() => []),
+          firestoreListDocs<{
+            id: string;
+            sender_name?: string;
+            sender_email?: string;
+            subject?: string;
+            message?: string;
+            status?: string;
+            created_at?: number;
+          }>('contact_messages', idToken).catch(() => []),
+          firestoreListDocs<Record<string, unknown>>('coupons', idToken).catch(() => []),
+          firestoreListDocs<Record<string, unknown>>('gift_cards', idToken).catch(() => []),
+        ]);
+
+        const users = usersDocs
+          .map((u) => ({
+            id: u.id,
+            fullName: u.full_name || 'Member',
+            email: u.email || '',
+            emailVerified: Boolean(u.email_verified),
+            createdAt: Number(u.created_at || 0),
+          }))
+          .sort((a, b) => b.createdAt - a.createdAt);
+
+        const orders = orderDocs
+          .map((o) => serializeClientOrderDoc(o))
+          .sort((a, b) => b.createdAt - a.createdAt);
+
+        const events: Array<{
+          id: string;
+          type: 'registration' | 'order' | 'enquiry' | 'return_request' | 'coupon_redemption' | 'gift_card';
+          title: string;
+          detail: string;
+          actorLabel: string;
+          refId?: string;
+          status?: string;
+          createdAt: number;
+        }> = [];
+
+        for (const u of users) {
+          events.push({
+            id: `reg_${u.id}`,
+            type: 'registration',
+            title: 'Customer Registered',
+            detail: `${u.fullName} (${u.email})`,
+            actorLabel: u.email,
+            refId: u.id,
+            status: u.emailVerified ? 'verified' : 'pending',
+            createdAt: u.createdAt,
+          });
+        }
+
+        const returnRequests: Array<{
+          orderId: string;
+          orderNumber: string;
+          customerName: string;
+          customerEmail: string;
+          totalPaise: number;
+          request: OrderReturnRequest;
+        }> = [];
+
+        for (const ord of orders) {
+          events.push({
+            id: `ord_${ord.id}`,
+            type: 'order',
+            title: `Order ${ord.orderNumber}`,
+            detail: `${ord.paymentStatus} · ${ord.fulfillmentStatus} · ₹${(ord.totalPaise / 100).toLocaleString('en-IN')}`,
+            actorLabel: ord.customerEmail,
+            refId: ord.id,
+            status: ord.fulfillmentStatus,
+            createdAt: ord.createdAt,
+          });
+          if (ord.returnRequest) {
+            returnRequests.push({
+              orderId: ord.id,
+              orderNumber: ord.orderNumber,
+              customerName: ord.customerName,
+              customerEmail: ord.customerEmail,
+              totalPaise: ord.totalPaise,
+              request: ord.returnRequest,
+            });
+            events.push({
+              id: `ret_${ord.returnRequest.id || ord.id}`,
+              type: 'return_request',
+              title: `${ord.returnRequest.type === 'cancel' ? 'Cancellation' : 'Return'} Request (${ord.orderNumber})`,
+              detail: ord.returnRequest.reason,
+              actorLabel: ord.customerEmail,
+              refId: ord.id,
+              status: ord.returnRequest.status,
+              createdAt: ord.returnRequest.requestedAt || ord.updatedAt,
+            });
+          }
+          if (ord.couponCode) {
+            events.push({
+              id: `cpn_${ord.id}`,
+              type: 'coupon_redemption',
+              title: `Coupon ${ord.couponCode} Redeemed`,
+              detail: `Saved ₹${((ord.discountPaise || 0) / 100).toLocaleString('en-IN')} on ${ord.orderNumber}`,
+              actorLabel: ord.customerEmail,
+              refId: ord.id,
+              createdAt: ord.createdAt,
+            });
+          }
+        }
+
+        for (const m of msgDocs) {
+          events.push({
+            id: `msg_${m.id}`,
+            type: 'enquiry',
+            title: `Enquiry: ${m.subject || 'Boutique Enquiry'}`,
+            detail: String(m.message || '').slice(0, 140),
+            actorLabel: m.sender_email || m.sender_name || 'Guest',
+            refId: m.id,
+            status: m.status || 'unread',
+            createdAt: Number(m.created_at || 0),
+          });
+        }
+
+        events.sort((a, b) => b.createdAt - a.createdAt);
+
+        return {
+          ok: true,
+          data: {
+            users,
+            returnRequests,
+            events: events.slice(0, 60),
+            coupons: cpnDocs.map((c) => serializeClientCouponDoc(c)),
+            giftCards: gcDocs.map((g) => serializeClientGiftCardDoc(g)),
+          } as unknown as T,
         };
       }
     }

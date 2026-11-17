@@ -30,6 +30,7 @@ import {
   ShieldCheck,
   ShoppingBag,
   SlidersHorizontal,
+  Tag,
   X,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
@@ -47,6 +48,7 @@ import type {
 } from '../../types/boutique';
 import { AdminCategoriesManager } from './AdminCategoriesManager';
 import { AdminContentManager } from './AdminContentManager';
+import { AdminCouponsAndActivity } from './AdminCouponsAndActivity';
 import { AdminMessagesPanel } from './AdminMessagesPanel';
 import { AdminAuditPanel, AdminOrdersPanel, AdminSecurityPanel } from './AdminOrdersAndAudit';
 import { AdminOverviewSection, type OverviewTargetTab } from './AdminOverviewSection';
@@ -81,7 +83,11 @@ const TAB_TITLES: Record<AdminTab, { title: string; subtitle: string }> = {
   },
   orders: {
     title: 'Customer Orders',
-    subtitle: 'Track placed orders and update boutique fulfillment status',
+    subtitle: 'Track placed orders, resolve cancel/return requests, recover captured payments, and update fulfillment',
+  },
+  coupons: {
+    title: 'Promotions, Loyalty & Activity',
+    subtitle: 'Manage coupons, gift cards, Sahithi Rewards & Plus, and live customer activity',
   },
   content: {
     title: 'Storefront Content',
@@ -271,6 +277,7 @@ export function AdminPortal({
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditPage, setAuditPage] = useState(1);
   const [auditTotalPages, setAuditTotalPages] = useState(1);
+  const [activityRefreshTick, setActivityRefreshTick] = useState(0);
 
   const setCategoriesDirty = useCallback((dirty: boolean) => {
     setDirtySections((prev) =>
@@ -463,16 +470,23 @@ export function AdminPortal({
     }
   }, [queryToken, queryMode, confirmAdminActivation]);
 
-  const loadOverview = useCallback(async () => {
-    setOverviewLoading(true);
-    const res = await apiRequest<AdminOverviewResponse>('/api/admin/overview');
-    setOverviewLoading(false);
-    if (res.ok) {
-      setOverviewData(res.data);
-    } else {
-      showToast('err', res.error);
-    }
-  }, [apiRequest, showToast]);
+  const loadOverview = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!options?.silent) {
+        setOverviewLoading(true);
+      }
+      const res = await apiRequest<AdminOverviewResponse>('/api/admin/overview');
+      if (!options?.silent) {
+        setOverviewLoading(false);
+      }
+      if (res.ok) {
+        setOverviewData(res.data);
+      } else if (!options?.silent) {
+        showToast('err', res.error);
+      }
+    },
+    [apiRequest, showToast]
+  );
 
   const loadCategories = useCallback(async () => {
     setCategoriesLoading(true);
@@ -521,21 +535,28 @@ export function AdminPortal({
     }
   }, [apiRequest, catalogPage, statusFilter, categoryFilter, stockFilter, sortBy, searchQuery, showToast]);
 
-  const loadOrders = useCallback(async () => {
-    setOrdersLoading(true);
-    const res = await apiRequest<{
-      items: AdminOrder[];
-      page: number;
-      totalPages: number;
-    }>(`/api/admin/orders?page=${ordersPage}&pageSize=12`);
-    setOrdersLoading(false);
-    if (res.ok) {
-      setOrders(res.data.items);
-      setOrdersTotalPages(res.data.totalPages);
-    } else {
-      showToast('err', res.error);
-    }
-  }, [apiRequest, ordersPage, showToast]);
+  const loadOrders = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!options?.silent) {
+        setOrdersLoading(true);
+      }
+      const res = await apiRequest<{
+        items: AdminOrder[];
+        page: number;
+        totalPages: number;
+      }>(`/api/admin/orders?page=${ordersPage}&pageSize=12`);
+      if (!options?.silent) {
+        setOrdersLoading(false);
+      }
+      if (res.ok) {
+        setOrders(res.data.items);
+        setOrdersTotalPages(res.data.totalPages);
+      } else if (!options?.silent) {
+        showToast('err', res.error);
+      }
+    },
+    [apiRequest, ordersPage, showToast]
+  );
 
   const loadAudit = useCallback(async () => {
     setAuditLoading(true);
@@ -568,7 +589,26 @@ export function AdminPortal({
     if (activeTab === 'orders') void loadOrders();
     if (activeTab === 'account') void loadAudit();
     if (activeTab === 'overview') void loadOverview();
+    if (activeTab === 'coupons') setActivityRefreshTick((t) => t + 1);
   }, [gate, activeTab, loadOrders, loadAudit, loadOverview]);
+
+  // Periodically refresh live customer/order/activity views while owner dashboard is open
+  useEffect(() => {
+    if (gate !== 'authorized') return;
+    if (activeTab !== 'overview' && activeTab !== 'orders' && activeTab !== 'coupons') return;
+
+    const timer = window.setInterval(() => {
+      if (activeTab === 'overview') {
+        void loadOverview({ silent: true });
+      } else if (activeTab === 'orders') {
+        void loadOrders({ silent: true });
+      } else if (activeTab === 'coupons') {
+        setActivityRefreshTick((t) => t + 1);
+      }
+    }, 12000);
+
+    return () => window.clearInterval(timer);
+  }, [gate, activeTab, loadOverview, loadOrders]);
 
   const refreshCatalogAndMetrics = useCallback(async () => {
     await Promise.all([loadOverview(), loadProducts()]);
@@ -936,13 +976,14 @@ export function AdminPortal({
 
   const handleUpdateOrderStatus = async (
     orderId: string,
-    status: string
+    status: string,
+    note?: string
   ): Promise<{ ok: boolean; error?: string }> => {
     const res = await apiRequest<{ id: string; status: string }>(
       `/api/admin/orders/${encodeURIComponent(orderId)}/status`,
       {
         method: 'PATCH',
-        body: JSON.stringify({ status }),
+        body: JSON.stringify(note ? { status, note } : { status }),
       }
     );
     if (!res.ok) {
@@ -950,8 +991,67 @@ export function AdminPortal({
       return { ok: false, error: res.error };
     }
     showToast('ok', `Order marked as ${status}.`);
-    await Promise.all([loadOrders(), loadOverview()]);
+    await Promise.all([loadOrders({ silent: true }), loadOverview({ silent: true })]);
     return { ok: true };
+  };
+
+  const handleResolveReturnRequest = async (
+    orderId: string,
+    decision: 'approved' | 'rejected',
+    note?: string
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const res = await apiRequest<{ order: AdminOrder }>(
+      `/api/admin/orders/${encodeURIComponent(orderId)}/resolve-request`,
+      {
+        method: 'POST',
+        body: JSON.stringify(note ? { decision, note } : { decision }),
+      }
+    );
+    if (!res.ok) {
+      showToast('err', res.error);
+      return { ok: false, error: res.error };
+    }
+    showToast(
+      'ok',
+      decision === 'approved'
+        ? 'Customer request approved and recorded.'
+        : 'Customer request rejected with note.'
+    );
+    await Promise.all([loadOrders({ silent: true }), loadOverview({ silent: true })]);
+    setActivityRefreshTick((t) => t + 1);
+    return { ok: true };
+  };
+
+  const handleRecoverOrder = async (
+    razorpayOrderId: string,
+    razorpayPaymentId?: string
+  ): Promise<{ ok: boolean; message?: string; error?: string }> => {
+    const res = await apiRequest<{
+      confirmed?: boolean;
+      pending_confirmation?: boolean;
+      message?: string;
+      order?: AdminOrder;
+    }>('/api/admin/orders/recover', {
+      method: 'POST',
+      body: JSON.stringify(
+        razorpayPaymentId
+          ? { razorpayOrderId, razorpayPaymentId }
+          : { razorpayOrderId }
+      ),
+    });
+    if (!res.ok) {
+      showToast('err', res.error);
+      return { ok: false, error: res.error };
+    }
+    const msg =
+      res.data.message ||
+      (res.data.order?.orderNumber
+        ? `Recovered and verified order ${res.data.order.orderNumber}.`
+        : `Checked Razorpay payment for ${razorpayOrderId}.`);
+    showToast('ok', msg);
+    await Promise.all([loadOrders({ silent: true }), loadOverview({ silent: true })]);
+    setActivityRefreshTick((t) => t + 1);
+    return { ok: true, message: msg };
   };
 
   const handleLogout = async () => {
@@ -1730,6 +1830,15 @@ export function AdminPortal({
       icon: ShoppingBag,
       count: pendingOrdersCount > 0 ? pendingOrdersCount : undefined,
     },
+    {
+      id: 'coupons',
+      label: 'Coupons & Loyalty',
+      icon: Tag,
+      count:
+        (overviewData?.metrics.openReturnRequests ?? 0) > 0
+          ? overviewData?.metrics.openReturnRequests
+          : undefined,
+    },
     { id: 'content', label: 'Content', icon: Palette },
     {
       id: 'messages',
@@ -2060,6 +2169,16 @@ export function AdminPortal({
               totalPages={ordersTotalPages}
               onPageChange={setOrdersPage}
               onUpdateOrderStatus={handleUpdateOrderStatus}
+              onResolveReturnRequest={handleResolveReturnRequest}
+              onRecoverOrder={handleRecoverOrder}
+            />
+          )}
+
+          {activeTab === 'coupons' && (
+            <AdminCouponsAndActivity
+              refreshSignal={activityRefreshTick}
+              onNotify={showToast}
+              onNavigateOrders={() => requestGuardedAction({ type: 'tab', tab: 'orders' })}
             />
           )}
 

@@ -81,17 +81,59 @@ export interface BagValidationResult {
   hasPriceChanges: boolean;
 }
 
+export type OrderPaymentStatus = 'unpaid' | 'pending' | 'paid' | 'failed' | 'refunded';
+export type OrderFulfillmentStatus =
+  | 'placed'
+  | 'confirmed'
+  | 'packed'
+  | 'shipped'
+  | 'delivered'
+  | 'cancelled'
+  | 'return_requested'
+  | 'returned';
+
+export interface OrderStatusHistoryEntry {
+  status: string;
+  note?: string;
+  actor: 'customer' | 'owner' | 'system';
+  at: number;
+}
+
+export interface OrderReturnRequest {
+  id: string;
+  type: 'cancel' | 'return';
+  reason: string;
+  status: 'pending' | 'approved' | 'rejected';
+  requestedAt: number;
+  resolvedAt?: number | null;
+  resolutionNote?: string;
+}
+
 export interface PlacedOrderReceipt {
   id: string;
   orderNumber: string;
+  customerUserId?: string | null;
+  customerName?: string;
+  customerEmail?: string;
+  customerPhone?: string;
+  shippingAddress?: string;
   status: string;
+  paymentStatus?: OrderPaymentStatus;
+  fulfillmentStatus?: OrderFulfillmentStatus;
+  statusHistory?: OrderStatusHistoryEntry[];
   subtotalPaise: number;
+  discountPaise?: number;
+  giftCardPaise?: number;
   totalPaise: number;
+  couponCode?: string | null;
+  giftCardCode?: string | null;
   currency: string;
   createdAt: number;
+  updatedAt?: number;
   paymentMethod?: 'razorpay' | 'cod';
   razorpayOrderId?: string;
   razorpayPaymentId?: string;
+  returnRequest?: OrderReturnRequest | null;
   items: Array<{
     productId: string;
     variantId: string;
@@ -102,6 +144,113 @@ export interface PlacedOrderReceipt {
     quantity: number;
     lineTotalPaise: number;
   }>;
+}
+
+export interface CustomerAddress {
+  id: string;
+  fullName: string;
+  phone: string;
+  line1: string;
+  line2?: string;
+  city: string;
+  state: string;
+  pincode: string;
+  landmark?: string;
+  label: 'Home' | 'Work' | 'Other';
+  isDefault: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CustomerNotification {
+  id: string;
+  type: 'order_placed' | 'order_status' | 'request_update' | 'account' | 'offer';
+  title: string;
+  message: string;
+  orderId?: string | null;
+  orderNumber?: string | null;
+  read: boolean;
+  readAt?: number | null;
+  createdAt: number;
+}
+
+export interface BoutiqueCoupon {
+  id: string;
+  code: string;
+  title: string;
+  description: string;
+  discountType: 'percent' | 'flat_paise';
+  discountValue: number;
+  maxDiscountPaise?: number | null;
+  minSpendPaise: number;
+  usageLimit?: number | null;
+  usedCount: number;
+  active: boolean;
+  startsAt?: number | null;
+  expiresAt?: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface BoutiqueGiftCard {
+  id: string;
+  code: string;
+  recipientEmail?: string;
+  note?: string;
+  initialBalancePaise: number;
+  balancePaise: number;
+  active: boolean;
+  expiresAt?: number | null;
+  lastUsedAt?: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface LoyaltyConfig {
+  rewardsEnabled: boolean;
+  pointsPerHundredInr: number;
+  rupeeValuePerPointPaise: number;
+  plusEnabled: boolean;
+  plusTierName: string;
+  plusQualificationSpendPaise: number;
+  plusBenefits: string[];
+  giftCardsEnabled: boolean;
+}
+
+export interface CustomerRewardsSummary {
+  config: LoyaltyConfig;
+  pointsBalance: number;
+  lifetimeEarnedPoints: number;
+  lifetimeSpendPaise: number;
+  deliveredOrdersCount: number;
+  isPlusMember: boolean;
+  plusStatusLabel: string;
+  plusProgressPaise: number;
+}
+
+export interface SavedPaymentMethodsSummary {
+  enabled: boolean;
+  provider: 'razorpay';
+  reason: string;
+  methods: Array<{
+    id: string;
+    methodType: 'card' | 'upi' | 'wallet';
+    label: string;
+    last4?: string;
+    network?: string;
+    expiry?: string;
+  }>;
+}
+
+export interface StoreActivityEvent {
+  id: string;
+  type: 'registration' | 'order' | 'enquiry' | 'return_request' | 'coupon_redemption' | 'gift_card';
+  title: string;
+  detail: string;
+  actorLabel: string;
+  refId?: string;
+  status?: string;
+  createdAt: number;
 }
 
 export type AdminProductStatus = 'draft' | 'published' | 'archived';
@@ -139,6 +288,8 @@ export interface AdminOverviewMetrics {
   unreadMessages: number;
   totalMessages: number;
   totalAuditEvents: number;
+  totalCustomers?: number;
+  openReturnRequests?: number;
 }
 
 export interface AdminAuditEntry {
@@ -156,15 +307,28 @@ export interface AdminAuditEntry {
 export interface AdminOrder {
   id: string;
   orderNumber: string;
+  customerUserId?: string | null;
   customerName: string;
   customerEmail: string;
   customerPhone: string;
   shippingAddress: string;
   status: string;
+  paymentStatus?: OrderPaymentStatus;
+  fulfillmentStatus?: OrderFulfillmentStatus;
+  paymentMethod?: 'razorpay' | 'cod';
+  razorpayOrderId?: string | null;
+  razorpayPaymentId?: string | null;
+  couponCode?: string | null;
+  giftCardCode?: string | null;
+  discountPaise?: number;
+  giftCardPaise?: number;
   subtotalPaise: number;
   totalPaise: number;
   currency: string;
+  statusHistory?: OrderStatusHistoryEntry[];
+  returnRequest?: OrderReturnRequest | null;
   createdAt: number;
+  updatedAt?: number;
   items: Array<{
     id: string;
     productId: string;

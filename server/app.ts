@@ -509,7 +509,14 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     next();
   });
 
-  app.use(express.json({ limit: '256kb' }));
+  app.use(
+    express.json({
+      limit: '256kb',
+      verify: (req, _res, buf) => {
+        (req as Request & { rawBody?: string }).rawBody = buf.toString('utf8');
+      },
+    })
+  );
   app.use(cookieParser());
 
   const makeLimiter = (max: number, windowMs: number, message: string) =>
@@ -721,6 +728,8 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     if (
       cleanSubPath === '/create-order' ||
       cleanSubPath === '/verify-payment' ||
+      cleanSubPath === '/razorpay-webhook' ||
+      cleanSubPath === '/order-status' ||
       cleanSubPath === '/whatsapp/stylist' ||
       cleanSubPath === '/whatsapp/webhook'
     ) {

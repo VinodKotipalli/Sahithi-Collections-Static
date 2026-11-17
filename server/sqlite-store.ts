@@ -19,11 +19,19 @@ import {
   type CategoryRow,
   type ContactMessageRow,
   type ContactMessageStatus,
+  type CouponRow,
+  type CustomerAddressRow,
+  type CustomerNotificationRow,
   type EmailTokenRow,
+  type GiftCardRow,
   type LegacyPhoneOnlyAccount,
+  type LoyaltyConfigData,
   type OrderItemRow,
+  type OrderReturnRequestRecord,
   type OrderRow,
+  type OrderStatusHistoryEntry,
   type OrderWithItems,
+  type PendingCheckoutRow,
   type PlaceOrderInput,
   type ProductAuditLogRow,
   type ProductImageRow,
@@ -36,10 +44,12 @@ import {
   type SessionRow,
   type SiteSettingsData,
   type StorefrontContentData,
+  type StoreUserSummary,
   type UserRow,
 } from './store.ts';
 import {
   extractReferencedMediaFilenames,
+  mergeLoyaltyConfig,
   mergeSiteSettings,
   mergeStorefrontContent,
 } from './storefront-defaults.ts';
@@ -485,6 +495,20 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       this.db.prepare(`SELECT COUNT(*) AS cnt FROM product_audit_logs`).get() as { cnt: number }
     ).cnt;
 
+    const totalCustomers = (
+      this.db
+        .prepare(`SELECT COUNT(*) AS cnt FROM users WHERE email_verified = 1`)
+        .get() as { cnt: number }
+    ).cnt;
+
+    const openReturnRequests = (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS cnt FROM orders WHERE return_request_json LIKE '%"status":"pending"%'`
+        )
+        .get() as { cnt: number }
+    ).cnt;
+
     const lowStockItems = this.db
       .prepare(
         `SELECT * FROM products
@@ -526,6 +550,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
         unreadMessages: Number(msgAgg.unreadMessages || 0),
         totalMessages: Number(msgAgg.totalMessages || 0),
         totalAuditEvents: auditCount,
+        totalCustomers,
+        openReturnRequests,
       },
       lowStockItems: lowStockItems.map((row) => this.toAdminProductRecord(row)),
       recentOrders,
@@ -1193,10 +1219,99 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     return map;
   }
 
+  async savePendingCheckout(record: PendingCheckoutRow): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO pending_checkouts (
+          id, customer_user_id, amount_paise, subtotal_paise, discount_paise, gift_card_paise,
+          coupon_code, gift_card_code, currency, receipt, items_json, customer_json, status,
+          razorpay_payment_id, confirmed_order_id, confirmed_order_json, created_at, updated_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          customer_user_id = COALESCE(excluded.customer_user_id, pending_checkouts.customer_user_id),
+          amount_paise = excluded.amount_paise,
+          subtotal_paise = excluded.subtotal_paise,
+          discount_paise = excluded.discount_paise,
+          gift_card_paise = excluded.gift_card_paise,
+          coupon_code = excluded.coupon_code,
+          gift_card_code = excluded.gift_card_code,
+          items_json = excluded.items_json,
+          customer_json = COALESCE(excluded.customer_json, pending_checkouts.customer_json),
+          status = excluded.status,
+          razorpay_payment_id = COALESCE(excluded.razorpay_payment_id, pending_checkouts.razorpay_payment_id),
+          confirmed_order_id = COALESCE(excluded.confirmed_order_id, pending_checkouts.confirmed_order_id),
+          confirmed_order_json = COALESCE(excluded.confirmed_order_json, pending_checkouts.confirmed_order_json),
+          updated_at = excluded.updated_at`
+      )
+      .run(
+        record.id,
+        record.customer_user_id,
+        record.amount_paise,
+        record.subtotal_paise,
+        record.discount_paise,
+        record.gift_card_paise,
+        record.coupon_code,
+        record.gift_card_code,
+        record.currency,
+        record.receipt,
+        record.items_json,
+        record.customer_json,
+        record.status,
+        record.razorpay_payment_id,
+        record.confirmed_order_id,
+        record.confirmed_order_json,
+        record.created_at,
+        record.updated_at,
+        record.expires_at
+      );
+  }
+
+  async getPendingCheckout(razorpayOrderId: string): Promise<PendingCheckoutRow | null> {
+    const row = this.db
+      .prepare(`SELECT * FROM pending_checkouts WHERE id = ? LIMIT 1`)
+      .get(razorpayOrderId) as PendingCheckoutRow | undefined;
+    return row || null;
+  }
+
   async placeOrder(input: PlaceOrderInput): Promise<{ order: OrderRow; items: OrderItemRow[] }> {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
+      // Idempotency guard by explicit order ID or razorpay_order_id
+      if (input.id) {
+        const existingById = this.db
+          .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+          .get(input.id) as OrderRow | undefined;
+        if (existingById) {
+          const items = this.db
+            .prepare(`SELECT * FROM order_items WHERE order_id = ?`)
+            .all(existingById.id) as unknown as OrderItemRow[];
+          this.db.exec('COMMIT;');
+          return { order: existingById, items };
+        }
+      }
+      if (input.razorpayOrderId) {
+        const existingByRzp = this.db
+          .prepare(`SELECT * FROM orders WHERE razorpay_order_id = ? LIMIT 1`)
+          .get(input.razorpayOrderId) as OrderRow | undefined;
+        if (existingByRzp) {
+          const items = this.db
+            .prepare(`SELECT * FROM order_items WHERE order_id = ?`)
+            .all(existingByRzp.id) as unknown as OrderItemRow[];
+          this.db.exec('COMMIT;');
+          return { order: existingByRzp, items };
+        }
+      }
+
+      const fetchProduct = this.db.prepare(`SELECT * FROM products WHERE id = ? LIMIT 1`);
+      const fetchVariantById = this.db.prepare(
+        `SELECT * FROM product_variants WHERE id = ? AND product_id = ? LIMIT 1`
+      );
+      const fetchFirstVariant = this.db.prepare(
+        `SELECT * FROM product_variants WHERE product_id = ? ORDER BY position ASC LIMIT 1`
+      );
+
       let subtotalPaise = 0;
+      const pendingVariantStock = new Map<string, number>();
       const resolvedLines: Array<{
         productId: string;
         variantId: string;
@@ -1209,13 +1324,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
         remainingStock: number;
       }> = [];
 
-      // Track cumulative deduction per variant if duplicate lines reference same variant
-      const pendingVariantStock = new Map<string, number>();
-
       for (const raw of input.items) {
-        const product = this.db
-          .prepare(`SELECT * FROM products WHERE id = ? LIMIT 1`)
-          .get(raw.productId) as ProductRow | undefined;
+        const product = fetchProduct.get(raw.productId) as ProductRow | undefined;
         if (!product || product.status !== 'published') {
           throw new StoreHttpError(
             409,
@@ -1225,12 +1335,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
         }
 
         const variant = raw.variantId
-          ? (this.db
-              .prepare(`SELECT * FROM product_variants WHERE id = ? AND product_id = ? LIMIT 1`)
-              .get(raw.variantId, product.id) as ProductVariantRow | undefined)
-          : (this.db
-              .prepare(`SELECT * FROM product_variants WHERE product_id = ? ORDER BY position ASC LIMIT 1`)
-              .get(product.id) as ProductVariantRow | undefined);
+          ? (fetchVariantById.get(raw.variantId, product.id) as ProductVariantRow | undefined)
+          : (fetchFirstVariant.get(product.id) as ProductVariantRow | undefined);
 
         if (!variant) {
           throw new StoreHttpError(
@@ -1281,18 +1387,62 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       }
 
       const now = Date.now();
-      const orderId = crypto.randomUUID();
-      const orderNumber = `SC-${new Date(now).getUTCFullYear()}-${crypto
-        .randomBytes(3)
-        .toString('hex')
-        .toUpperCase()}`;
+      const orderId = input.id || crypto.randomUUID();
+      const orderNumber =
+        input.orderNumber ||
+        `SC-${new Date(now).getUTCFullYear()}-${crypto
+          .randomBytes(3)
+          .toString('hex')
+          .toUpperCase()}`;
+
+      const discountPaise = Math.max(0, Math.min(subtotalPaise, Math.round(input.discountPaise || 0)));
+      const giftCardPaise = Math.max(
+        0,
+        Math.min(subtotalPaise - discountPaise, Math.round(input.giftCardPaise || 0))
+      );
+      const totalPaise = Math.max(0, subtotalPaise - discountPaise - giftCardPaise);
+
+      if (input.couponCode) {
+        this.db
+          .prepare(
+            `UPDATE coupons SET used_count = used_count + 1, updated_at = ? WHERE UPPER(code) = UPPER(?)`
+          )
+          .run(now, input.couponCode.trim());
+      }
+      if (input.giftCardCode && giftCardPaise > 0) {
+        this.db
+          .prepare(
+            `UPDATE gift_cards SET balance_paise = MAX(0, balance_paise - ?), last_used_at = ?, updated_at = ? WHERE UPPER(code) = UPPER(?)`
+          )
+          .run(giftCardPaise, now, now, input.giftCardCode.trim());
+      }
+
+      const status = input.status || 'pending';
+      const paymentStatus = input.paymentStatus || (input.paymentMethod === 'razorpay' ? 'paid' : 'unpaid');
+      const fulfillmentStatus = input.fulfillmentStatus || (status === 'confirmed' ? 'confirmed' : 'placed');
+      const paymentMethod = input.paymentMethod || 'cod';
+      const statusHistory: OrderStatusHistoryEntry[] =
+        input.statusHistory && input.statusHistory.length > 0
+          ? input.statusHistory
+          : [
+              {
+                status: fulfillmentStatus,
+                note: paymentMethod === 'razorpay' ? 'Payment verified via Razorpay' : 'Order placed',
+                actor: 'system',
+                at: now,
+              },
+            ];
+      const statusHistoryJson = JSON.stringify(statusHistory);
 
       this.db
         .prepare(
           `INSERT INTO orders (
             id, order_number, customer_user_id, customer_name, customer_email,
-            customer_phone, shipping_address, status, subtotal_paise, total_paise, currency, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 'INR', ?)`
+            customer_phone, shipping_address, status, payment_status, fulfillment_status,
+            payment_method, razorpay_order_id, razorpay_payment_id, coupon_code, gift_card_code,
+            discount_paise, gift_card_paise, status_history_json, return_request_json,
+            subtotal_paise, total_paise, currency, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'INR', ?, ?)`
         )
         .run(
           orderId,
@@ -1302,8 +1452,20 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           input.customerEmail,
           input.customerPhone,
           input.shippingAddress,
+          status,
+          paymentStatus,
+          fulfillmentStatus,
+          paymentMethod,
+          input.razorpayOrderId || null,
+          input.razorpayPaymentId || null,
+          input.couponCode || null,
+          input.giftCardCode || null,
+          discountPaise,
+          giftCardPaise,
+          statusHistoryJson,
           subtotalPaise,
-          subtotalPaise,
+          totalPaise,
+          now,
           now
         );
 
@@ -1358,6 +1520,26 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           .run(sumRow.total, now, pid);
       }
 
+      if (input.customerUserId) {
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO customer_notifications (
+              id, user_id, type, title, message, order_id, order_number, is_read, read_at, created_at
+            ) VALUES (?, ?, 'order_placed', ?, ?, ?, ?, 0, NULL, ?)`
+          )
+          .run(
+            `notif_placed_${orderId}`,
+            input.customerUserId,
+            `Order ${orderNumber} placed`,
+            paymentMethod === 'razorpay'
+              ? `Payment verified for order ${orderNumber} (₹${(totalPaise / 100).toLocaleString('en-IN')}).`
+              : `Your boutique order ${orderNumber} has been received.`,
+            orderId,
+            orderNumber,
+            now
+          );
+      }
+
       this.db.exec('COMMIT;');
 
       return {
@@ -1369,11 +1551,23 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           customer_email: input.customerEmail,
           customer_phone: input.customerPhone,
           shipping_address: input.shippingAddress,
-          status: 'pending',
+          status,
+          payment_status: paymentStatus,
+          fulfillment_status: fulfillmentStatus,
+          payment_method: paymentMethod,
+          razorpay_order_id: input.razorpayOrderId || null,
+          razorpay_payment_id: input.razorpayPaymentId || null,
+          coupon_code: input.couponCode || null,
+          gift_card_code: input.giftCardCode || null,
+          discount_paise: discountPaise,
+          gift_card_paise: giftCardPaise,
+          status_history_json: statusHistoryJson,
+          return_request_json: null,
           subtotal_paise: subtotalPaise,
-          total_paise: subtotalPaise,
+          total_paise: totalPaise,
           currency: 'INR',
           created_at: now,
+          updated_at: now,
         },
         items: createdItems,
       };
@@ -1381,6 +1575,28 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       this.db.exec('ROLLBACK;');
       throw err;
     }
+  }
+
+  async getOrderById(orderId: string): Promise<OrderWithItems | null> {
+    const order = this.db
+      .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+      .get(orderId) as OrderRow | undefined;
+    if (!order) return null;
+    const items = this.db
+      .prepare(`SELECT * FROM order_items WHERE order_id = ?`)
+      .all(order.id) as unknown as OrderItemRow[];
+    return { order, items };
+  }
+
+  async listCustomerOrders(userId: string): Promise<OrderWithItems[]> {
+    const orders = this.db
+      .prepare(`SELECT * FROM orders WHERE customer_user_id = ? ORDER BY created_at DESC`)
+      .all(userId) as unknown as OrderRow[];
+    const fetchItems = this.db.prepare(`SELECT * FROM order_items WHERE order_id = ?`);
+    return orders.map((order) => ({
+      order,
+      items: fetchItems.all(order.id) as unknown as OrderItemRow[],
+    }));
   }
 
   async listAdminOrders(page: number, pageSize: number) {
@@ -1404,10 +1620,618 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
   }
 
   async updateOrderStatus(orderId: string, nextStatus: string): Promise<boolean> {
+    const updated = await this.updateOrderStatusWithHistory(orderId, nextStatus, {
+      actor: 'owner',
+      notifyCustomer: true,
+    });
+    return Boolean(updated);
+  }
+
+  async updateOrderStatusWithHistory(
+    orderId: string,
+    nextStatus: string,
+    options?: {
+      actor?: 'owner' | 'system' | 'customer';
+      note?: string;
+      notifyCustomer?: boolean;
+    }
+  ): Promise<OrderWithItems | null> {
+    const existing = this.db
+      .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+      .get(orderId) as OrderRow | undefined;
+    if (!existing) return null;
+
+    const now = Date.now();
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+
+    const changed =
+      existing.status !== nextStatus || existing.fulfillment_status !== nextStatus;
+    if (changed || options?.note) {
+      history.push({
+        status: nextStatus,
+        note: options?.note?.trim() || undefined,
+        actor: options?.actor || 'owner',
+        at: now,
+      });
+    }
+
+    const historyJson = JSON.stringify(history);
+    this.db
+      .prepare(
+        `UPDATE orders SET status = ?, fulfillment_status = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
+      )
+      .run(nextStatus, nextStatus, historyJson, now, orderId);
+
+    if (
+      options?.notifyCustomer !== false &&
+      changed &&
+      existing.customer_user_id
+    ) {
+      const label = nextStatus.replace(/_/g, ' ');
+      const notifId = `notif_status_${orderId}_${nextStatus}_${now}`;
+      this.db
+        .prepare(
+          `INSERT INTO customer_notifications (
+            id, user_id, type, title, message, order_id, order_number, is_read, read_at, created_at
+          ) VALUES (?, ?, 'order_status', ?, ?, ?, ?, 0, NULL, ?)`
+        )
+        .run(
+          notifId,
+          existing.customer_user_id,
+          `Order ${existing.order_number} is now ${label}`,
+          options?.note?.trim()
+            ? `${options.note.trim()} (Order ${existing.order_number})`
+            : `Your order ${existing.order_number} status has been updated to ${label}.`,
+          orderId,
+          existing.order_number,
+          now
+        );
+    }
+
+    return this.getOrderById(orderId);
+  }
+
+  async submitOrderReturnRequest(input: {
+    orderId: string;
+    userId: string;
+    type: 'cancel' | 'return';
+    reason: string;
+  }): Promise<OrderWithItems | null> {
+    const existing = this.db
+      .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+      .get(input.orderId) as OrderRow | undefined;
+    if (!existing) return null;
+    if (existing.customer_user_id !== input.userId) {
+      throw new StoreHttpError(403, 'FORBIDDEN', 'You can only request changes for your own orders.');
+    }
+
+    const now = Date.now();
+    const requestRecord: OrderReturnRequestRecord = {
+      id: `req_${crypto.randomUUID().slice(0, 12)}`,
+      type: input.type,
+      reason: input.reason.trim().slice(0, 500),
+      status: 'pending',
+      requestedAt: now,
+      resolvedAt: null,
+    };
+
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+    history.push({
+      status: input.type === 'cancel' ? 'cancellation_requested' : 'return_requested',
+      note: requestRecord.reason,
+      actor: 'customer',
+      at: now,
+    });
+
+    this.db
+      .prepare(
+        `UPDATE orders SET return_request_json = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
+      )
+      .run(JSON.stringify(requestRecord), JSON.stringify(history), now, input.orderId);
+
+    return this.getOrderById(input.orderId);
+  }
+
+  async resolveOrderReturnRequest(input: {
+    orderId: string;
+    decision: 'approved' | 'rejected';
+    note?: string;
+  }): Promise<OrderWithItems | null> {
+    const existing = this.db
+      .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+      .get(input.orderId) as OrderRow | undefined;
+    if (!existing || !existing.return_request_json) return null;
+
+    let reqRecord: OrderReturnRequestRecord;
+    try {
+      reqRecord = JSON.parse(existing.return_request_json) as OrderReturnRequestRecord;
+    } catch {
+      return null;
+    }
+
+    const now = Date.now();
+    reqRecord.status = input.decision;
+    reqRecord.resolvedAt = now;
+    if (input.note?.trim()) {
+      reqRecord.resolutionNote = input.note.trim().slice(0, 300);
+    }
+
+    const nextFulfillment =
+      input.decision === 'approved'
+        ? reqRecord.type === 'cancel'
+          ? 'cancelled'
+          : 'returned'
+        : existing.fulfillment_status || existing.status;
+    const nextStatus =
+      input.decision === 'approved'
+        ? reqRecord.type === 'cancel'
+          ? 'cancelled'
+          : 'returned'
+        : existing.status;
+
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+    history.push({
+      status: `${reqRecord.type}_${input.decision}`,
+      note: reqRecord.resolutionNote || `Request ${input.decision} by store owner`,
+      actor: 'owner',
+      at: now,
+    });
+
+    this.db
+      .prepare(
+        `UPDATE orders SET status = ?, fulfillment_status = ?, return_request_json = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
+      )
+      .run(
+        nextStatus,
+        nextFulfillment,
+        JSON.stringify(reqRecord),
+        JSON.stringify(history),
+        now,
+        input.orderId
+      );
+
+    if (existing.customer_user_id) {
+      await this.createCustomerNotification({
+        id: `notif_req_${existing.id}_${input.decision}_${now}`,
+        userId: existing.customer_user_id,
+        type: 'request_update',
+        title: `${reqRecord.type === 'cancel' ? 'Cancellation' : 'Return'} request ${input.decision}`,
+        message:
+          reqRecord.resolutionNote ||
+          `Your ${reqRecord.type} request for order ${existing.order_number} was ${input.decision}.`,
+        orderId: existing.id,
+        orderNumber: existing.order_number,
+      });
+    }
+
+    return this.getOrderById(input.orderId);
+  }
+
+  async listCustomerAddresses(userId: string): Promise<CustomerAddressRow[]> {
+    return this.db
+      .prepare(
+        `SELECT * FROM customer_addresses WHERE user_id = ? ORDER BY is_default DESC, updated_at DESC`
+      )
+      .all(userId) as unknown as CustomerAddressRow[];
+  }
+
+  async upsertCustomerAddress(
+    userId: string,
+    input: {
+      id?: string;
+      fullName: string;
+      phone: string;
+      line1: string;
+      line2?: string;
+      city: string;
+      state: string;
+      pincode: string;
+      landmark?: string;
+      label: 'Home' | 'Work' | 'Other';
+      isDefault: boolean;
+    }
+  ): Promise<CustomerAddressRow> {
+    const now = Date.now();
+    const id = input.id && /^[a-zA-Z0-9_-]{3,80}$/.test(input.id) ? input.id : `addr_${crypto.randomUUID().slice(0, 12)}`;
+    const existingList = await this.listCustomerAddresses(userId);
+    const shouldBeDefault = input.isDefault || existingList.length === 0 ? 1 : 0;
+
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (shouldBeDefault) {
+        this.db.prepare(`UPDATE customer_addresses SET is_default = 0 WHERE user_id = ?`).run(userId);
+      }
+      const existing = existingList.find((a) => a.id === id);
+      if (existing) {
+        this.db
+          .prepare(
+            `UPDATE customer_addresses SET
+              full_name = ?, phone = ?, line1 = ?, line2 = ?, city = ?, state = ?,
+              pincode = ?, landmark = ?, label = ?, is_default = ?, updated_at = ?
+             WHERE id = ? AND user_id = ?`
+          )
+          .run(
+            input.fullName.trim(),
+            input.phone.trim(),
+            input.line1.trim(),
+            (input.line2 || '').trim(),
+            input.city.trim(),
+            input.state.trim(),
+            input.pincode.trim(),
+            (input.landmark || '').trim(),
+            input.label,
+            shouldBeDefault,
+            now,
+            id,
+            userId
+          );
+      } else {
+        this.db
+          .prepare(
+            `INSERT INTO customer_addresses (
+              id, user_id, full_name, phone, line1, line2, city, state, pincode,
+              landmark, label, is_default, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            id,
+            userId,
+            input.fullName.trim(),
+            input.phone.trim(),
+            input.line1.trim(),
+            (input.line2 || '').trim(),
+            input.city.trim(),
+            input.state.trim(),
+            input.pincode.trim(),
+            (input.landmark || '').trim(),
+            input.label,
+            shouldBeDefault,
+            now,
+            now
+          );
+      }
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
+
+    return this.db
+      .prepare(`SELECT * FROM customer_addresses WHERE id = ? LIMIT 1`)
+      .get(id) as unknown as CustomerAddressRow;
+  }
+
+  async deleteCustomerAddress(userId: string, addressId: string): Promise<boolean> {
     const res = this.db
-      .prepare(`UPDATE orders SET status = ? WHERE id = ?`)
-      .run(nextStatus, orderId);
+      .prepare(`DELETE FROM customer_addresses WHERE id = ? AND user_id = ?`)
+      .run(addressId, userId);
     return res.changes > 0;
+  }
+
+  async getCustomerWishlist(userId: string): Promise<string[]> {
+    const rows = this.db
+      .prepare(`SELECT product_id FROM customer_wishlists WHERE user_id = ? ORDER BY updated_at DESC`)
+      .all(userId) as Array<{ product_id: string }>;
+    return rows.map((r) => r.product_id);
+  }
+
+  async setCustomerWishlist(userId: string, productIds: string[]): Promise<string[]> {
+    const unique = Array.from(new Set(productIds.filter((id) => typeof id === 'string' && id.trim())));
+    const now = Date.now();
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare(`DELETE FROM customer_wishlists WHERE user_id = ?`).run(userId);
+      const insert = this.db.prepare(
+        `INSERT INTO customer_wishlists (user_id, product_id, updated_at) VALUES (?, ?, ?)`
+      );
+      for (const pid of unique) {
+        insert.run(userId, pid, now);
+      }
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
+    return unique;
+  }
+
+  async listCustomerNotifications(userId: string): Promise<CustomerNotificationRow[]> {
+    return this.db
+      .prepare(`SELECT * FROM customer_notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 60`)
+      .all(userId) as unknown as CustomerNotificationRow[];
+  }
+
+  async createCustomerNotification(input: {
+    id?: string;
+    userId: string;
+    type: CustomerNotificationRow['type'];
+    title: string;
+    message: string;
+    orderId?: string | null;
+    orderNumber?: string | null;
+  }): Promise<CustomerNotificationRow> {
+    const id = input.id || `notif_${crypto.randomUUID().slice(0, 12)}`;
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO customer_notifications (
+          id, user_id, type, title, message, order_id, order_number, is_read, read_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)`
+      )
+      .run(
+        id,
+        input.userId,
+        input.type,
+        input.title.trim().slice(0, 140),
+        input.message.trim().slice(0, 500),
+        input.orderId || null,
+        input.orderNumber || null,
+        now
+      );
+    return this.db
+      .prepare(`SELECT * FROM customer_notifications WHERE id = ? LIMIT 1`)
+      .get(id) as unknown as CustomerNotificationRow;
+  }
+
+  async markCustomerNotificationRead(userId: string, notificationId: string): Promise<boolean> {
+    const now = Date.now();
+    const res = this.db
+      .prepare(
+        `UPDATE customer_notifications SET is_read = 1, read_at = ? WHERE id = ? AND user_id = ?`
+      )
+      .run(now, notificationId, userId);
+    return res.changes > 0;
+  }
+
+  async markAllCustomerNotificationsRead(userId: string): Promise<void> {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `UPDATE customer_notifications SET is_read = 1, read_at = ? WHERE user_id = ? AND is_read = 0`
+      )
+      .run(now, userId);
+  }
+
+  async listCoupons(activeOnly = false): Promise<CouponRow[]> {
+    const rows = this.db
+      .prepare(
+        activeOnly
+          ? `SELECT * FROM coupons WHERE active = 1 ORDER BY created_at DESC`
+          : `SELECT * FROM coupons ORDER BY created_at DESC`
+      )
+      .all() as unknown as CouponRow[];
+    return rows;
+  }
+
+  async getCouponByCode(code: string): Promise<CouponRow | null> {
+    const row = this.db
+      .prepare(`SELECT * FROM coupons WHERE UPPER(code) = UPPER(?) LIMIT 1`)
+      .get(code.trim()) as CouponRow | undefined;
+    return row || null;
+  }
+
+  async upsertCoupon(input: {
+    id?: string;
+    code: string;
+    title: string;
+    description: string;
+    discountType: 'percent' | 'flat_paise';
+    discountValue: number;
+    maxDiscountPaise?: number | null;
+    minSpendPaise: number;
+    usageLimit?: number | null;
+    active: boolean;
+    startsAt?: number | null;
+    expiresAt?: number | null;
+  }): Promise<CouponRow> {
+    const now = Date.now();
+    const cleanCode = input.code.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+    const id = input.id || `cpn_${cleanCode.toLowerCase()}`;
+    const existing = this.db
+      .prepare(`SELECT * FROM coupons WHERE id = ? LIMIT 1`)
+      .get(id) as CouponRow | undefined;
+
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE coupons SET
+            code = ?, title = ?, description = ?, discount_type = ?, discount_value = ?,
+            max_discount_paise = ?, min_spend_paise = ?, usage_limit = ?, active = ?,
+            starts_at = ?, expires_at = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          cleanCode,
+          input.title.trim(),
+          input.description.trim(),
+          input.discountType,
+          Math.round(input.discountValue),
+          input.maxDiscountPaise ?? null,
+          Math.max(0, Math.round(input.minSpendPaise)),
+          input.usageLimit ?? null,
+          input.active ? 1 : 0,
+          input.startsAt ?? null,
+          input.expiresAt ?? null,
+          now,
+          id
+        );
+    } else {
+      this.db
+        .prepare(
+          `INSERT INTO coupons (
+            id, code, title, description, discount_type, discount_value, max_discount_paise,
+            min_spend_paise, usage_limit, used_count, active, starts_at, expires_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          id,
+          cleanCode,
+          input.title.trim(),
+          input.description.trim(),
+          input.discountType,
+          Math.round(input.discountValue),
+          input.maxDiscountPaise ?? null,
+          Math.max(0, Math.round(input.minSpendPaise)),
+          input.usageLimit ?? null,
+          input.active ? 1 : 0,
+          input.startsAt ?? null,
+          input.expiresAt ?? null,
+          now,
+          now
+        );
+    }
+    return this.db
+      .prepare(`SELECT * FROM coupons WHERE id = ? LIMIT 1`)
+      .get(id) as unknown as CouponRow;
+  }
+
+  async deleteCoupon(id: string): Promise<boolean> {
+    const res = this.db.prepare(`DELETE FROM coupons WHERE id = ?`).run(id);
+    return res.changes > 0;
+  }
+
+  async listGiftCards(): Promise<GiftCardRow[]> {
+    return this.db
+      .prepare(`SELECT * FROM gift_cards ORDER BY created_at DESC`)
+      .all() as unknown as GiftCardRow[];
+  }
+
+  async getGiftCardByCode(code: string): Promise<GiftCardRow | null> {
+    const row = this.db
+      .prepare(`SELECT * FROM gift_cards WHERE UPPER(code) = UPPER(?) LIMIT 1`)
+      .get(code.trim()) as GiftCardRow | undefined;
+    return row || null;
+  }
+
+  async upsertGiftCard(input: {
+    id?: string;
+    code: string;
+    recipientEmail?: string;
+    note?: string;
+    initialBalancePaise: number;
+    balancePaise: number;
+    active: boolean;
+    expiresAt?: number | null;
+  }): Promise<GiftCardRow> {
+    const now = Date.now();
+    const cleanCode = input.code.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+    const id = input.id || `gc_${cleanCode.toLowerCase()}`;
+    const existing = this.db
+      .prepare(`SELECT * FROM gift_cards WHERE id = ? LIMIT 1`)
+      .get(id) as GiftCardRow | undefined;
+
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE gift_cards SET
+            code = ?, recipient_email = ?, note = ?, initial_balance_paise = ?, balance_paise = ?,
+            active = ?, expires_at = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          cleanCode,
+          (input.recipientEmail || '').trim().toLowerCase(),
+          (input.note || '').trim(),
+          Math.max(0, Math.round(input.initialBalancePaise)),
+          Math.max(0, Math.round(input.balancePaise)),
+          input.active ? 1 : 0,
+          input.expiresAt ?? null,
+          now,
+          id
+        );
+    } else {
+      this.db
+        .prepare(
+          `INSERT INTO gift_cards (
+            id, code, recipient_email, note, initial_balance_paise, balance_paise,
+            active, expires_at, last_used_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+        )
+        .run(
+          id,
+          cleanCode,
+          (input.recipientEmail || '').trim().toLowerCase(),
+          (input.note || '').trim(),
+          Math.max(0, Math.round(input.initialBalancePaise)),
+          Math.max(0, Math.round(input.balancePaise)),
+          input.active ? 1 : 0,
+          input.expiresAt ?? null,
+          now,
+          now
+        );
+    }
+
+    return this.db
+      .prepare(`SELECT * FROM gift_cards WHERE id = ? LIMIT 1`)
+      .get(id) as unknown as GiftCardRow;
+  }
+
+  async deleteGiftCard(id: string): Promise<boolean> {
+    const res = this.db.prepare(`DELETE FROM gift_cards WHERE id = ?`).run(id);
+    return res.changes > 0;
+  }
+
+  async getLoyaltyConfig(): Promise<LoyaltyConfigData> {
+    const row = this.db
+      .prepare(`SELECT data_json FROM site_documents WHERE key = 'loyalty_config' LIMIT 1`)
+      .get() as { data_json: string } | undefined;
+    if (!row) return mergeLoyaltyConfig(null);
+    try {
+      return mergeLoyaltyConfig(JSON.parse(row.data_json) as Partial<LoyaltyConfigData>);
+    } catch {
+      return mergeLoyaltyConfig(null);
+    }
+  }
+
+  async saveLoyaltyConfig(config: LoyaltyConfigData): Promise<LoyaltyConfigData> {
+    const normalized = mergeLoyaltyConfig(config);
+    this.db
+      .prepare(
+        `INSERT INTO site_documents (key, data_json, updated_at)
+         VALUES ('loyalty_config', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at`
+      )
+      .run(JSON.stringify(normalized), Date.now());
+    return normalized;
+  }
+
+  async listUsersSummary(): Promise<StoreUserSummary[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT id, full_name, email, email_verified, created_at FROM users WHERE email_verified = 1 ORDER BY created_at DESC LIMIT 100`
+      )
+      .all() as Array<{
+      id: string;
+      full_name: string;
+      email: string | null;
+      email_verified: number;
+      created_at: number;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      fullName: r.full_name,
+      email: r.email || '',
+      emailVerified: Boolean(r.email_verified),
+      createdAt: r.created_at,
+    }));
   }
 
   async listAuditLogs(params: { productId?: string; page: number; pageSize: number }) {

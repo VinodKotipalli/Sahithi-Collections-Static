@@ -150,10 +150,22 @@ export interface OrderRow {
   customer_phone: string;
   shipping_address: string;
   status: string;
+  payment_status?: string;
+  fulfillment_status?: string;
+  payment_method?: string;
+  razorpay_order_id?: string | null;
+  razorpay_payment_id?: string | null;
+  coupon_code?: string | null;
+  gift_card_code?: string | null;
+  discount_paise?: number;
+  gift_card_paise?: number;
+  status_history_json?: string;
+  return_request_json?: string | null;
   subtotal_paise: number;
   total_paise: number;
   currency: string;
   created_at: number;
+  updated_at?: number;
 }
 
 export interface OrderItemRow {
@@ -167,6 +179,90 @@ export interface OrderItemRow {
   unit_price_paise: number;
   quantity: number;
   line_total_paise: number;
+}
+
+export interface PendingCheckoutRow {
+  id: string;
+  customer_user_id: string | null;
+  amount_paise: number;
+  subtotal_paise: number;
+  discount_paise: number;
+  gift_card_paise: number;
+  coupon_code: string | null;
+  gift_card_code: string | null;
+  currency: string;
+  receipt: string;
+  items_json: string;
+  customer_json: string | null;
+  status: string;
+  razorpay_payment_id: string | null;
+  confirmed_order_id: string | null;
+  confirmed_order_json: string | null;
+  created_at: number;
+  updated_at: number;
+  expires_at: number;
+}
+
+export interface CustomerAddressRow {
+  id: string;
+  user_id: string;
+  full_name: string;
+  phone: string;
+  line1: string;
+  line2: string;
+  city: string;
+  state: string;
+  pincode: string;
+  landmark: string;
+  label: 'Home' | 'Work' | 'Other';
+  is_default: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CustomerNotificationRow {
+  id: string;
+  user_id: string;
+  type: 'order_placed' | 'order_status' | 'request_update' | 'account' | 'offer';
+  title: string;
+  message: string;
+  order_id: string | null;
+  order_number: string | null;
+  is_read: number;
+  read_at: number | null;
+  created_at: number;
+}
+
+export interface CouponRow {
+  id: string;
+  code: string;
+  title: string;
+  description: string;
+  discount_type: 'percent' | 'flat_paise';
+  discount_value: number;
+  max_discount_paise: number | null;
+  min_spend_paise: number;
+  usage_limit: number | null;
+  used_count: number;
+  active: number;
+  starts_at: number | null;
+  expires_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface GiftCardRow {
+  id: string;
+  code: string;
+  recipient_email: string;
+  note: string;
+  initial_balance_paise: number;
+  balance_paise: number;
+  active: number;
+  expires_at: number | null;
+  last_used_at: number | null;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface InitDatabaseOptions {
@@ -311,10 +407,22 @@ export function initAuthDatabase(
       customer_phone TEXT NOT NULL,
       shipping_address TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
+      payment_status TEXT NOT NULL DEFAULT 'unpaid',
+      fulfillment_status TEXT NOT NULL DEFAULT 'placed',
+      payment_method TEXT NOT NULL DEFAULT 'cod',
+      razorpay_order_id TEXT,
+      razorpay_payment_id TEXT,
+      coupon_code TEXT,
+      gift_card_code TEXT,
+      discount_paise INTEGER NOT NULL DEFAULT 0,
+      gift_card_paise INTEGER NOT NULL DEFAULT 0,
+      status_history_json TEXT NOT NULL DEFAULT '[]',
+      return_request_json TEXT,
       subtotal_paise INTEGER NOT NULL CHECK (subtotal_paise >= 0),
       total_paise INTEGER NOT NULL CHECK (total_paise >= 0),
       currency TEXT NOT NULL DEFAULT 'INR',
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS order_items (
@@ -361,6 +469,97 @@ export function initAuthDatabase(
       updated_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS pending_checkouts (
+      id TEXT PRIMARY KEY,
+      customer_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+      amount_paise INTEGER NOT NULL,
+      subtotal_paise INTEGER NOT NULL DEFAULT 0,
+      discount_paise INTEGER NOT NULL DEFAULT 0,
+      gift_card_paise INTEGER NOT NULL DEFAULT 0,
+      coupon_code TEXT,
+      gift_card_code TEXT,
+      currency TEXT NOT NULL DEFAULT 'INR',
+      receipt TEXT NOT NULL DEFAULT '',
+      items_json TEXT NOT NULL DEFAULT '[]',
+      customer_json TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      razorpay_payment_id TEXT,
+      confirmed_order_id TEXT,
+      confirmed_order_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS customer_addresses (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      full_name TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      line1 TEXT NOT NULL,
+      line2 TEXT NOT NULL DEFAULT '',
+      city TEXT NOT NULL,
+      state TEXT NOT NULL,
+      pincode TEXT NOT NULL,
+      landmark TEXT NOT NULL DEFAULT '',
+      label TEXT NOT NULL DEFAULT 'Home',
+      is_default INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS customer_wishlists (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      product_id TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, product_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS customer_notifications (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      order_id TEXT,
+      order_number TEXT,
+      is_read INTEGER NOT NULL DEFAULT 0,
+      read_at INTEGER,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS coupons (
+      id TEXT PRIMARY KEY,
+      code TEXT NOT NULL UNIQUE,
+      title TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      discount_type TEXT NOT NULL CHECK (discount_type IN ('percent', 'flat_paise')),
+      discount_value INTEGER NOT NULL,
+      max_discount_paise INTEGER,
+      min_spend_paise INTEGER NOT NULL DEFAULT 0,
+      usage_limit INTEGER,
+      used_count INTEGER NOT NULL DEFAULT 0,
+      active INTEGER NOT NULL DEFAULT 1,
+      starts_at INTEGER,
+      expires_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS gift_cards (
+      id TEXT PRIMARY KEY,
+      code TEXT NOT NULL UNIQUE,
+      recipient_email TEXT NOT NULL DEFAULT '',
+      note TEXT NOT NULL DEFAULT '',
+      initial_balance_paise INTEGER NOT NULL,
+      balance_paise INTEGER NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      expires_at INTEGER,
+      last_used_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_email_tokens_user_purpose ON email_tokens(user_id, purpose);
     CREATE INDEX IF NOT EXISTS idx_products_status_category ON products(status, category);
@@ -368,8 +567,36 @@ export function initAuthDatabase(
     CREATE INDEX IF NOT EXISTS idx_images_product_id ON product_images(product_id);
     CREATE INDEX IF NOT EXISTS idx_audit_created_at ON product_audit_logs(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_order_items_product_id ON order_items(product_id);
+    CREATE INDEX IF NOT EXISTS idx_orders_customer_user_id ON orders(customer_user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_customer_addresses_user ON customer_addresses(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_customer_notif_user ON customer_notifications(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_categories_position ON categories(position ASC, created_at ASC);
     CREATE INDEX IF NOT EXISTS idx_contact_messages_status_created ON contact_messages(status, created_at DESC);
+  `);
+
+  const orderCols = (
+    db.prepare(`PRAGMA table_info(orders)`).all() as Array<{ name: string }>
+  ).map((c) => c.name);
+  const ensureOrderCol = (name: string, ddl: string) => {
+    if (!orderCols.includes(name)) {
+      db.exec(`ALTER TABLE orders ADD COLUMN ${ddl};`);
+    }
+  };
+  ensureOrderCol('payment_status', `payment_status TEXT NOT NULL DEFAULT 'unpaid'`);
+  ensureOrderCol('fulfillment_status', `fulfillment_status TEXT NOT NULL DEFAULT 'placed'`);
+  ensureOrderCol('payment_method', `payment_method TEXT NOT NULL DEFAULT 'cod'`);
+  ensureOrderCol('razorpay_order_id', `razorpay_order_id TEXT`);
+  ensureOrderCol('razorpay_payment_id', `razorpay_payment_id TEXT`);
+  ensureOrderCol('coupon_code', `coupon_code TEXT`);
+  ensureOrderCol('gift_card_code', `gift_card_code TEXT`);
+  ensureOrderCol('discount_paise', `discount_paise INTEGER NOT NULL DEFAULT 0`);
+  ensureOrderCol('gift_card_paise', `gift_card_paise INTEGER NOT NULL DEFAULT 0`);
+  ensureOrderCol('status_history_json', `status_history_json TEXT NOT NULL DEFAULT '[]'`);
+  ensureOrderCol('return_request_json', `return_request_json TEXT`);
+  ensureOrderCol('updated_at', `updated_at INTEGER`);
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_orders_razorpay_order_id ON orders(razorpay_order_id);
   `);
 
   seedStorefrontCategoriesIfEmpty(db);

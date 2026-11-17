@@ -87,7 +87,7 @@ const DEFAULT_NORMALIZED_PRODUCTS = normalizeStaticProducts(PRODUCTS);
 
 function BoutiqueShell() {
   const prefersReducedMotion = usePrefersReducedMotion();
-  const { user, isLoadingSession, refreshSession } = useAuth();
+  const { user, isLoadingSession, refreshSession, apiRequest } = useAuth();
   const { settings, refreshStorefront } = useStorefront();
   const {
     route,
@@ -213,7 +213,7 @@ function BoutiqueShell() {
     removeFromWishlist,
     clearWishlist,
     isWishlisted,
-  } = useWishlist();
+  } = useWishlist({ user, isLoadingSession, apiRequest });
 
   const {
     bagItems,
@@ -375,6 +375,10 @@ function BoutiqueShell() {
         ) : user ? (
           <AccountDashboard
             wishlistCount={wishlistCount}
+            wishlistProducts={wishlistProducts}
+            onRemoveWishlistItem={removeFromWishlist}
+            onAddToBag={addToBag}
+            onOpenBag={() => setBagOpen(true)}
             onOpenWishlist={() => setWishlistOpen(true)}
             onNavigate={navigate}
           />

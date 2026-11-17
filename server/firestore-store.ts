@@ -24,11 +24,19 @@ import {
   type CategoryRow,
   type ContactMessageRow,
   type ContactMessageStatus,
+  type CouponRow,
+  type CustomerAddressRow,
+  type CustomerNotificationRow,
   type EmailTokenRow,
+  type GiftCardRow,
   type LegacyPhoneOnlyAccount,
+  type LoyaltyConfigData,
   type OrderItemRow,
+  type OrderReturnRequestRecord,
   type OrderRow,
+  type OrderStatusHistoryEntry,
   type OrderWithItems,
+  type PendingCheckoutRow,
   type PlaceOrderInput,
   type ProductAuditLogRow,
   type ProductImageRow,
@@ -41,10 +49,12 @@ import {
   type SessionRow,
   type SiteSettingsData,
   type StorefrontContentData,
+  type StoreUserSummary,
   type UserRow,
 } from './store.ts';
 import {
   extractReferencedMediaFilenames,
+  mergeLoyaltyConfig,
   mergeSiteSettings,
   mergeStorefrontContent,
 } from './storefront-defaults.ts';
@@ -97,12 +107,55 @@ interface FirestoreOrderDoc {
   customer_phone: string;
   shipping_address: string;
   status: string;
+  payment_status?: string;
+  fulfillment_status?: string;
+  payment_method?: string;
+  razorpay_order_id?: string | null;
+  razorpay_payment_id?: string | null;
+  coupon_code?: string | null;
+  gift_card_code?: string | null;
+  discount_paise?: number;
+  gift_card_paise?: number;
+  status_history_json?: string;
+  return_request_json?: string | null;
   subtotal_paise: number;
   total_paise: number;
   currency: string;
   created_at: number;
+  updated_at?: number;
   product_ids: string[];
   items: OrderItemRow[];
+}
+
+function normalizeFirestoreOrderRow(doc: FirestoreOrderDoc): OrderRow {
+  return {
+    id: doc.id,
+    order_number: doc.order_number,
+    customer_user_id: doc.customer_user_id ?? null,
+    customer_name: doc.customer_name,
+    customer_email: doc.customer_email,
+    customer_phone: doc.customer_phone,
+    shipping_address: doc.shipping_address,
+    status: doc.status,
+    payment_status:
+      doc.payment_status ?? (doc.razorpay_payment_id ? 'paid' : 'unpaid'),
+    fulfillment_status: doc.fulfillment_status ?? doc.status ?? 'placed',
+    payment_method:
+      doc.payment_method ?? (doc.razorpay_order_id || doc.razorpay_payment_id ? 'razorpay' : 'cod'),
+    razorpay_order_id: doc.razorpay_order_id ?? null,
+    razorpay_payment_id: doc.razorpay_payment_id ?? null,
+    coupon_code: doc.coupon_code ?? null,
+    gift_card_code: doc.gift_card_code ?? null,
+    discount_paise: Number(doc.discount_paise || 0),
+    gift_card_paise: Number(doc.gift_card_paise || 0),
+    status_history_json: doc.status_history_json || '[]',
+    return_request_json: doc.return_request_json ?? null,
+    subtotal_paise: Number(doc.subtotal_paise || 0),
+    total_paise: Number(doc.total_paise || 0),
+    currency: doc.currency || 'INR',
+    created_at: Number(doc.created_at || 0),
+    updated_at: Number(doc.updated_at || doc.created_at || 0),
+  };
 }
 
 function parseServiceAccountFromEnv(rawValue: string): ServiceAccount {
@@ -319,6 +372,30 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
 
   private messagesCol() {
     return this.envDoc().collection('contact_messages');
+  }
+
+  private pendingCheckoutsCol() {
+    return this.envDoc().collection('pending_checkouts');
+  }
+
+  private couponsCol() {
+    return this.envDoc().collection('coupons');
+  }
+
+  private giftCardsCol() {
+    return this.envDoc().collection('gift_cards');
+  }
+
+  private addressesCol(userId: string) {
+    return this.usersCol().doc(userId).collection('addresses');
+  }
+
+  private wishlistDoc(userId: string) {
+    return this.usersCol().doc(userId).collection('wishlist').doc('items');
+  }
+
+  private notificationsCol(userId: string) {
+    return this.usersCol().doc(userId).collection('notifications');
   }
 
   async verifyConnectivity(): Promise<void> {
@@ -852,16 +929,18 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
   }
 
   async getAdminOverview(): Promise<AdminOverviewData> {
-    const [prodSnap, catList, ordersSnap, auditSnap, msgSnap] = await Promise.all([
+    const [prodSnap, catList, ordersSnap, auditSnap, msgSnap, usersSnap] = await Promise.all([
       this.productsCol().get(),
       this.listCategories(),
       this.ordersCol().get(),
       this.auditCol().get(),
       this.messagesCol().get(),
+      this.usersCol().get(),
     ]);
 
     const orderCounts = new Map<string, number>();
     let pendingOrders = 0;
+    let openReturnRequests = 0;
     let totalRevenuePaise = 0;
     const allOrders: OrderWithItems[] = [];
 
@@ -871,13 +950,24 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
       if (orderDoc.status !== 'cancelled') {
         totalRevenuePaise += Number(orderDoc.total_paise || 0);
       }
+      if (orderDoc.return_request_json) {
+        try {
+          const parsedReq = JSON.parse(orderDoc.return_request_json) as { status?: string };
+          if (parsedReq?.status === 'pending') openReturnRequests += 1;
+        } catch {
+          // ignore
+        }
+      }
       for (const item of orderDoc.items || []) {
         orderCounts.set(item.product_id, (orderCounts.get(item.product_id) || 0) + 1);
       }
-      const { product_ids: _p, items: lineItems, ...orderRow } = orderDoc;
-      allOrders.push({ order: orderRow, items: lineItems || [] });
+      allOrders.push({
+        order: normalizeFirestoreOrderRow(orderDoc),
+        items: orderDoc.items || [],
+      });
     }
     allOrders.sort((a, b) => b.order.created_at - a.order.created_at);
+    const totalCustomers = usersSnap.docs.filter((d) => Boolean(d.data()?.email_verified)).length;
 
     const allMessages = msgSnap.docs
       .map((d) => d.data() as ContactMessageRow)
@@ -931,6 +1021,8 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
         unreadMessages,
         totalMessages: allMessages.length,
         totalAuditEvents: auditSnap.size,
+        totalCustomers,
+        openReturnRequests,
       },
       lowStockItems: lowStockList.slice(0, 6).map((item) => ({
         ...item,
@@ -1580,10 +1672,37 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     return map;
   }
 
+  async savePendingCheckout(record: PendingCheckoutRow): Promise<void> {
+    await this.pendingCheckoutsCol().doc(record.id).set(record, { merge: true });
+  }
+
+  async getPendingCheckout(razorpayOrderId: string): Promise<PendingCheckoutRow | null> {
+    const snap = await this.pendingCheckoutsCol().doc(razorpayOrderId).get();
+    if (!snap.exists) return null;
+    return snap.data() as PendingCheckoutRow;
+  }
+
   async placeOrder(input: PlaceOrderInput): Promise<{ order: OrderRow; items: OrderItemRow[] }> {
     const uniqueProductIds = Array.from(new Set(input.items.map((i) => i.productId)));
 
     return this.firestore.runTransaction(async (tx) => {
+      if (input.id) {
+        const existingSnap = await tx.get(this.ordersCol().doc(input.id));
+        if (existingSnap.exists) {
+          const doc = existingSnap.data() as FirestoreOrderDoc;
+          return { order: normalizeFirestoreOrderRow(doc), items: doc.items || [] };
+        }
+      }
+      if (input.razorpayOrderId) {
+        const existingByRzp = await tx.get(
+          this.ordersCol().where('razorpay_order_id', '==', input.razorpayOrderId).limit(1)
+        );
+        if (!existingByRzp.empty) {
+          const doc = existingByRzp.docs[0].data() as FirestoreOrderDoc;
+          return { order: normalizeFirestoreOrderRow(doc), items: doc.items || [] };
+        }
+      }
+
       // Firestore requires all reads before writes inside a transaction
       const productSnaps = new Map<string, FirestoreProductDoc>();
       for (const pid of uniqueProductIds) {
@@ -1593,13 +1712,37 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
         }
       }
 
+      const cleanCouponCode = input.couponCode?.trim().toUpperCase() || null;
+      const cleanGiftCardCode = input.giftCardCode?.trim().toUpperCase() || null;
+      let couponDocSnap: { ref: FirebaseFirestore.DocumentReference; data: CouponRow } | null = null;
+      let giftCardDocSnap: { ref: FirebaseFirestore.DocumentReference; data: GiftCardRow } | null = null;
+
+      if (cleanCouponCode) {
+        const cSnap = await tx.get(
+          this.couponsCol().where('code', '==', cleanCouponCode).limit(1)
+        );
+        if (!cSnap.empty) {
+          couponDocSnap = { ref: cSnap.docs[0].ref, data: cSnap.docs[0].data() as CouponRow };
+        }
+      }
+      if (cleanGiftCardCode) {
+        const gcSnap = await tx.get(
+          this.giftCardsCol().where('code', '==', cleanGiftCardCode).limit(1)
+        );
+        if (!gcSnap.empty) {
+          giftCardDocSnap = { ref: gcSnap.docs[0].ref, data: gcSnap.docs[0].data() as GiftCardRow };
+        }
+      }
+
       let subtotalPaise = 0;
       const now = Date.now();
-      const orderId = crypto.randomUUID();
-      const orderNumber = `SC-${new Date(now).getUTCFullYear()}-${crypto
-        .randomBytes(3)
-        .toString('hex')
-        .toUpperCase()}`;
+      const orderId = input.id || crypto.randomUUID();
+      const orderNumber =
+        input.orderNumber ||
+        `SC-${new Date(now).getUTCFullYear()}-${crypto
+          .randomBytes(3)
+          .toString('hex')
+          .toUpperCase()}`;
 
       const createdItems: OrderItemRow[] = [];
       const touchedDocs = new Map<string, FirestoreProductDoc>();
@@ -1675,9 +1818,46 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
         });
       }
 
+      const discountPaise = Math.max(0, Math.min(subtotalPaise, Math.round(input.discountPaise || 0)));
+      const giftCardPaise = Math.max(
+        0,
+        Math.min(subtotalPaise - discountPaise, Math.round(input.giftCardPaise || 0))
+      );
+      const totalPaise = Math.max(0, subtotalPaise - discountPaise - giftCardPaise);
+
       for (const [pid, updatedDoc] of touchedDocs.entries()) {
         tx.set(this.productsCol().doc(pid), updatedDoc);
       }
+      if (couponDocSnap) {
+        tx.update(couponDocSnap.ref, {
+          used_count: Number(couponDocSnap.data.used_count || 0) + 1,
+          updated_at: now,
+        });
+      }
+      if (giftCardDocSnap && giftCardPaise > 0) {
+        tx.update(giftCardDocSnap.ref, {
+          balance_paise: Math.max(0, Number(giftCardDocSnap.data.balance_paise || 0) - giftCardPaise),
+          last_used_at: now,
+          updated_at: now,
+        });
+      }
+
+      const status = input.status || 'pending';
+      const paymentStatus = input.paymentStatus || (input.paymentMethod === 'razorpay' ? 'paid' : 'unpaid');
+      const fulfillmentStatus = input.fulfillmentStatus || (status === 'confirmed' ? 'confirmed' : 'placed');
+      const paymentMethod = input.paymentMethod || 'cod';
+      const statusHistory: OrderStatusHistoryEntry[] =
+        input.statusHistory && input.statusHistory.length > 0
+          ? input.statusHistory
+          : [
+              {
+                status: fulfillmentStatus,
+                note: paymentMethod === 'razorpay' ? 'Payment verified via Razorpay' : 'Order placed',
+                actor: 'system',
+                at: now,
+              },
+            ];
+      const statusHistoryJson = JSON.stringify(statusHistory);
 
       const orderDoc: FirestoreOrderDoc = {
         id: orderId,
@@ -1687,20 +1867,66 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
         customer_email: input.customerEmail,
         customer_phone: input.customerPhone,
         shipping_address: input.shippingAddress,
-        status: 'pending',
+        status,
+        payment_status: paymentStatus,
+        fulfillment_status: fulfillmentStatus,
+        payment_method: paymentMethod,
+        razorpay_order_id: input.razorpayOrderId || null,
+        razorpay_payment_id: input.razorpayPaymentId || null,
+        coupon_code: cleanCouponCode,
+        gift_card_code: cleanGiftCardCode,
+        discount_paise: discountPaise,
+        gift_card_paise: giftCardPaise,
+        status_history_json: statusHistoryJson,
+        return_request_json: null,
         subtotal_paise: subtotalPaise,
-        total_paise: subtotalPaise,
+        total_paise: totalPaise,
         currency: 'INR',
         created_at: now,
+        updated_at: now,
         product_ids: Array.from(new Set(createdItems.map((it) => it.product_id))),
         items: createdItems,
       };
 
       tx.set(this.ordersCol().doc(orderId), orderDoc);
 
-      const { product_ids: _pIds, items: _items, ...orderRow } = orderDoc;
-      return { order: orderRow, items: createdItems };
+      if (input.customerUserId) {
+        const notifId = `notif_placed_${orderId}`;
+        const notifDoc: CustomerNotificationRow = {
+          id: notifId,
+          user_id: input.customerUserId,
+          type: 'order_placed',
+          title: `Order ${orderNumber} placed`,
+          message:
+            paymentMethod === 'razorpay'
+              ? `Payment verified for order ${orderNumber} (₹${(totalPaise / 100).toLocaleString('en-IN')}).`
+              : `Your boutique order ${orderNumber} has been received.`,
+          order_id: orderId,
+          order_number: orderNumber,
+          is_read: 0,
+          read_at: null,
+          created_at: now,
+        };
+        tx.set(this.notificationsCol(input.customerUserId).doc(notifId), notifDoc);
+      }
+
+      return { order: normalizeFirestoreOrderRow(orderDoc), items: createdItems };
     });
+  }
+
+  async getOrderById(orderId: string): Promise<OrderWithItems | null> {
+    const snap = await this.ordersCol().doc(orderId).get();
+    if (!snap.exists) return null;
+    const doc = snap.data() as FirestoreOrderDoc;
+    return { order: normalizeFirestoreOrderRow(doc), items: doc.items || [] };
+  }
+
+  async listCustomerOrders(userId: string): Promise<OrderWithItems[]> {
+    const snap = await this.ordersCol().where('customer_user_id', '==', userId).get();
+    return snap.docs
+      .map((d) => d.data() as FirestoreOrderDoc)
+      .sort((a, b) => Number(b.created_at) - Number(a.created_at))
+      .map((doc) => ({ order: normalizeFirestoreOrderRow(doc), items: doc.items || [] }));
   }
 
   async listAdminOrders(page: number, pageSize: number) {
@@ -1714,20 +1940,507 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     const safePage = Math.min(page, totalPages);
     const slice = all.slice((safePage - 1) * pageSize, safePage * pageSize);
 
-    const items: OrderWithItems[] = slice.map((doc) => {
-      const { product_ids: _p, items: lineItems, ...orderRow } = doc;
-      return { order: orderRow, items: lineItems || [] };
-    });
+    const items: OrderWithItems[] = slice.map((doc) => ({
+      order: normalizeFirestoreOrderRow(doc),
+      items: doc.items || [],
+    }));
 
     return { items, total, page: safePage, pageSize, totalPages };
   }
 
   async updateOrderStatus(orderId: string, nextStatus: string): Promise<boolean> {
+    const updated = await this.updateOrderStatusWithHistory(orderId, nextStatus, {
+      actor: 'owner',
+      notifyCustomer: true,
+    });
+    return Boolean(updated);
+  }
+
+  async updateOrderStatusWithHistory(
+    orderId: string,
+    nextStatus: string,
+    options?: {
+      actor?: 'owner' | 'system' | 'customer';
+      note?: string;
+      notifyCustomer?: boolean;
+    }
+  ): Promise<OrderWithItems | null> {
     const ref = this.ordersCol().doc(orderId);
     const snap = await ref.get();
+    if (!snap.exists) return null;
+
+    const existing = snap.data() as FirestoreOrderDoc;
+    const now = Date.now();
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+
+    const changed = existing.status !== nextStatus || existing.fulfillment_status !== nextStatus;
+    if (changed || options?.note) {
+      history.push({
+        status: nextStatus,
+        note: options?.note?.trim() || undefined,
+        actor: options?.actor || 'owner',
+        at: now,
+      });
+    }
+
+    const patch = {
+      status: nextStatus,
+      fulfillment_status: nextStatus,
+      status_history_json: JSON.stringify(history),
+      updated_at: now,
+    };
+    await ref.update(patch);
+
+    if (options?.notifyCustomer !== false && changed && existing.customer_user_id) {
+      const label = nextStatus.replace(/_/g, ' ');
+      const notifId = `notif_status_${orderId}_${nextStatus}_${now}`;
+      await this.createCustomerNotification({
+        id: notifId,
+        userId: existing.customer_user_id,
+        type: 'order_status',
+        title: `Order ${existing.order_number} is now ${label}`,
+        message: options?.note?.trim()
+          ? `${options.note.trim()} (Order ${existing.order_number})`
+          : `Your order ${existing.order_number} status has been updated to ${label}.`,
+        orderId,
+        orderNumber: existing.order_number,
+      });
+    }
+
+    const updatedDoc: FirestoreOrderDoc = { ...existing, ...patch };
+    return { order: normalizeFirestoreOrderRow(updatedDoc), items: updatedDoc.items || [] };
+  }
+
+  async submitOrderReturnRequest(input: {
+    orderId: string;
+    userId: string;
+    type: 'cancel' | 'return';
+    reason: string;
+  }): Promise<OrderWithItems | null> {
+    const ref = this.ordersCol().doc(input.orderId);
+    const snap = await ref.get();
+    if (!snap.exists) return null;
+
+    const existing = snap.data() as FirestoreOrderDoc;
+    if (existing.customer_user_id !== input.userId) {
+      throw new StoreHttpError(403, 'FORBIDDEN', 'You can only request changes for your own orders.');
+    }
+
+    const now = Date.now();
+    const requestRecord: OrderReturnRequestRecord = {
+      id: `req_${crypto.randomUUID().slice(0, 12)}`,
+      type: input.type,
+      reason: input.reason.trim().slice(0, 500),
+      status: 'pending',
+      requestedAt: now,
+      resolvedAt: null,
+    };
+
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+    history.push({
+      status: input.type === 'cancel' ? 'cancellation_requested' : 'return_requested',
+      note: requestRecord.reason,
+      actor: 'customer',
+      at: now,
+    });
+
+    const patch = {
+      return_request_json: JSON.stringify(requestRecord),
+      status_history_json: JSON.stringify(history),
+      updated_at: now,
+    };
+    await ref.update(patch);
+
+    const updatedDoc: FirestoreOrderDoc = { ...existing, ...patch };
+    return { order: normalizeFirestoreOrderRow(updatedDoc), items: updatedDoc.items || [] };
+  }
+
+  async resolveOrderReturnRequest(input: {
+    orderId: string;
+    decision: 'approved' | 'rejected';
+    note?: string;
+  }): Promise<OrderWithItems | null> {
+    const ref = this.ordersCol().doc(input.orderId);
+    const snap = await ref.get();
+    if (!snap.exists) return null;
+
+    const existing = snap.data() as FirestoreOrderDoc;
+    if (!existing.return_request_json) return null;
+
+    let reqRecord: OrderReturnRequestRecord;
+    try {
+      reqRecord = JSON.parse(existing.return_request_json) as OrderReturnRequestRecord;
+    } catch {
+      return null;
+    }
+
+    const now = Date.now();
+    reqRecord.status = input.decision;
+    reqRecord.resolvedAt = now;
+    if (input.note?.trim()) {
+      reqRecord.resolutionNote = input.note.trim().slice(0, 300);
+    }
+
+    const nextFulfillment =
+      input.decision === 'approved'
+        ? reqRecord.type === 'cancel'
+          ? 'cancelled'
+          : 'returned'
+        : existing.fulfillment_status || existing.status;
+    const nextStatus =
+      input.decision === 'approved'
+        ? reqRecord.type === 'cancel'
+          ? 'cancelled'
+          : 'returned'
+        : existing.status;
+
+    let history: OrderStatusHistoryEntry[] = [];
+    try {
+      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
+      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
+    } catch {
+      history = [];
+    }
+    history.push({
+      status: `${reqRecord.type}_${input.decision}`,
+      note: reqRecord.resolutionNote || `Request ${input.decision} by store owner`,
+      actor: 'owner',
+      at: now,
+    });
+
+    const patch = {
+      status: nextStatus,
+      fulfillment_status: nextFulfillment,
+      return_request_json: JSON.stringify(reqRecord),
+      status_history_json: JSON.stringify(history),
+      updated_at: now,
+    };
+    await ref.update(patch);
+
+    if (existing.customer_user_id) {
+      await this.createCustomerNotification({
+        id: `notif_req_${existing.id}_${input.decision}_${now}`,
+        userId: existing.customer_user_id,
+        type: 'request_update',
+        title: `${reqRecord.type === 'cancel' ? 'Cancellation' : 'Return'} request ${input.decision}`,
+        message:
+          reqRecord.resolutionNote ||
+          `Your ${reqRecord.type} request for order ${existing.order_number} was ${input.decision}.`,
+        orderId: existing.id,
+        orderNumber: existing.order_number,
+      });
+    }
+
+    const updatedDoc: FirestoreOrderDoc = { ...existing, ...patch };
+    return { order: normalizeFirestoreOrderRow(updatedDoc), items: updatedDoc.items || [] };
+  }
+
+  async listCustomerAddresses(userId: string): Promise<CustomerAddressRow[]> {
+    const snap = await this.addressesCol(userId).get();
+    return snap.docs
+      .map((d) => d.data() as CustomerAddressRow)
+      .sort((a, b) => Number(b.is_default) - Number(a.is_default) || b.updated_at - a.updated_at);
+  }
+
+  async upsertCustomerAddress(
+    userId: string,
+    input: {
+      id?: string;
+      fullName: string;
+      phone: string;
+      line1: string;
+      line2?: string;
+      city: string;
+      state: string;
+      pincode: string;
+      landmark?: string;
+      label: 'Home' | 'Work' | 'Other';
+      isDefault: boolean;
+    }
+  ): Promise<CustomerAddressRow> {
+    const now = Date.now();
+    const id = input.id && /^[a-zA-Z0-9_-]{3,80}$/.test(input.id) ? input.id : `addr_${crypto.randomUUID().slice(0, 12)}`;
+    const existingList = await this.listCustomerAddresses(userId);
+    const shouldBeDefault = input.isDefault || existingList.length === 0 ? 1 : 0;
+    const prev = existingList.find((a) => a.id === id);
+
+    const row: CustomerAddressRow = {
+      id,
+      user_id: userId,
+      full_name: input.fullName.trim(),
+      phone: input.phone.trim(),
+      line1: input.line1.trim(),
+      line2: (input.line2 || '').trim(),
+      city: input.city.trim(),
+      state: input.state.trim(),
+      pincode: input.pincode.trim(),
+      landmark: (input.landmark || '').trim(),
+      label: input.label,
+      is_default: shouldBeDefault,
+      created_at: prev?.created_at || now,
+      updated_at: now,
+    };
+
+    const batch = this.firestore.batch();
+    if (shouldBeDefault) {
+      for (const addr of existingList) {
+        if (addr.id !== id && addr.is_default) {
+          batch.update(this.addressesCol(userId).doc(addr.id), { is_default: 0 });
+        }
+      }
+    }
+    batch.set(this.addressesCol(userId).doc(id), row);
+    await batch.commit();
+    return row;
+  }
+
+  async deleteCustomerAddress(userId: string, addressId: string): Promise<boolean> {
+    const ref = this.addressesCol(userId).doc(addressId);
+    const snap = await ref.get();
     if (!snap.exists) return false;
-    await ref.update({ status: nextStatus });
+    await ref.delete();
     return true;
+  }
+
+  async getCustomerWishlist(userId: string): Promise<string[]> {
+    const snap = await this.wishlistDoc(userId).get();
+    if (!snap.exists) return [];
+    const data = snap.data() as { product_ids?: unknown };
+    return Array.isArray(data.product_ids)
+      ? data.product_ids.filter((id): id is string => typeof id === 'string')
+      : [];
+  }
+
+  async setCustomerWishlist(userId: string, productIds: string[]): Promise<string[]> {
+    const unique = Array.from(new Set(productIds.filter((id) => typeof id === 'string' && id.trim())));
+    await this.wishlistDoc(userId).set({
+      product_ids: unique,
+      updated_at: Date.now(),
+    });
+    return unique;
+  }
+
+  async listCustomerNotifications(userId: string): Promise<CustomerNotificationRow[]> {
+    const snap = await this.notificationsCol(userId).get();
+    return snap.docs
+      .map((d) => d.data() as CustomerNotificationRow)
+      .sort((a, b) => b.created_at - a.created_at)
+      .slice(0, 60);
+  }
+
+  async createCustomerNotification(input: {
+    id?: string;
+    userId: string;
+    type: CustomerNotificationRow['type'];
+    title: string;
+    message: string;
+    orderId?: string | null;
+    orderNumber?: string | null;
+  }): Promise<CustomerNotificationRow> {
+    const id = input.id || `notif_${crypto.randomUUID().slice(0, 12)}`;
+    const ref = this.notificationsCol(input.userId).doc(id);
+    const existing = await ref.get();
+    if (existing.exists) {
+      return existing.data() as CustomerNotificationRow;
+    }
+    const row: CustomerNotificationRow = {
+      id,
+      user_id: input.userId,
+      type: input.type,
+      title: input.title.trim().slice(0, 140),
+      message: input.message.trim().slice(0, 500),
+      order_id: input.orderId || null,
+      order_number: input.orderNumber || null,
+      is_read: 0,
+      read_at: null,
+      created_at: Date.now(),
+    };
+    await ref.set(row);
+    return row;
+  }
+
+  async markCustomerNotificationRead(userId: string, notificationId: string): Promise<boolean> {
+    const ref = this.notificationsCol(userId).doc(notificationId);
+    const snap = await ref.get();
+    if (!snap.exists) return false;
+    await ref.update({ is_read: 1, read_at: Date.now() });
+    return true;
+  }
+
+  async markAllCustomerNotificationsRead(userId: string): Promise<void> {
+    const snap = await this.notificationsCol(userId).where('is_read', '==', 0).get();
+    if (snap.empty) return;
+    const now = Date.now();
+    const batch = this.firestore.batch();
+    for (const d of snap.docs) {
+      batch.update(d.ref, { is_read: 1, read_at: now });
+    }
+    await batch.commit();
+  }
+
+  async listCoupons(activeOnly = false): Promise<CouponRow[]> {
+    const snap = activeOnly
+      ? await this.couponsCol().where('active', '==', 1).get()
+      : await this.couponsCol().get();
+    return snap.docs
+      .map((d) => d.data() as CouponRow)
+      .sort((a, b) => b.created_at - a.created_at);
+  }
+
+  async getCouponByCode(code: string): Promise<CouponRow | null> {
+    const clean = code.trim().toUpperCase();
+    const snap = await this.couponsCol().where('code', '==', clean).limit(1).get();
+    if (snap.empty) return null;
+    return snap.docs[0].data() as CouponRow;
+  }
+
+  async upsertCoupon(input: {
+    id?: string;
+    code: string;
+    title: string;
+    description: string;
+    discountType: 'percent' | 'flat_paise';
+    discountValue: number;
+    maxDiscountPaise?: number | null;
+    minSpendPaise: number;
+    usageLimit?: number | null;
+    active: boolean;
+    startsAt?: number | null;
+    expiresAt?: number | null;
+  }): Promise<CouponRow> {
+    const now = Date.now();
+    const cleanCode = input.code.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+    const id = input.id || `cpn_${cleanCode.toLowerCase()}`;
+    const ref = this.couponsCol().doc(id);
+    const snap = await ref.get();
+    const prev = snap.exists ? (snap.data() as CouponRow) : null;
+    const row: CouponRow = {
+      id,
+      code: cleanCode,
+      title: input.title.trim(),
+      description: input.description.trim(),
+      discount_type: input.discountType,
+      discount_value: Math.round(input.discountValue),
+      max_discount_paise: input.maxDiscountPaise ?? null,
+      min_spend_paise: Math.max(0, Math.round(input.minSpendPaise)),
+      usage_limit: input.usageLimit ?? null,
+      used_count: prev ? Number(prev.used_count || 0) : 0,
+      active: input.active ? 1 : 0,
+      starts_at: input.startsAt ?? null,
+      expires_at: input.expiresAt ?? null,
+      created_at: prev?.created_at || now,
+      updated_at: now,
+    };
+    await ref.set(row);
+    return row;
+  }
+
+  async deleteCoupon(id: string): Promise<boolean> {
+    const ref = this.couponsCol().doc(id);
+    const snap = await ref.get();
+    if (!snap.exists) return false;
+    await ref.delete();
+    return true;
+  }
+
+  async listGiftCards(): Promise<GiftCardRow[]> {
+    const snap = await this.giftCardsCol().get();
+    return snap.docs
+      .map((d) => d.data() as GiftCardRow)
+      .sort((a, b) => b.created_at - a.created_at);
+  }
+
+  async getGiftCardByCode(code: string): Promise<GiftCardRow | null> {
+    const clean = code.trim().toUpperCase();
+    const snap = await this.giftCardsCol().where('code', '==', clean).limit(1).get();
+    if (snap.empty) return null;
+    return snap.docs[0].data() as GiftCardRow;
+  }
+
+  async upsertGiftCard(input: {
+    id?: string;
+    code: string;
+    recipientEmail?: string;
+    note?: string;
+    initialBalancePaise: number;
+    balancePaise: number;
+    active: boolean;
+    expiresAt?: number | null;
+  }): Promise<GiftCardRow> {
+    const now = Date.now();
+    const cleanCode = input.code.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+    const id = input.id || `gc_${cleanCode.toLowerCase()}`;
+    const ref = this.giftCardsCol().doc(id);
+    const snap = await ref.get();
+    const prev = snap.exists ? (snap.data() as GiftCardRow) : null;
+    const row: GiftCardRow = {
+      id,
+      code: cleanCode,
+      recipient_email: (input.recipientEmail || '').trim().toLowerCase(),
+      note: (input.note || '').trim(),
+      initial_balance_paise: Math.max(0, Math.round(input.initialBalancePaise)),
+      balance_paise: Math.max(0, Math.round(input.balancePaise)),
+      active: input.active ? 1 : 0,
+      expires_at: input.expiresAt ?? null,
+      last_used_at: prev?.last_used_at ?? null,
+      created_at: prev?.created_at || now,
+      updated_at: now,
+    };
+    await ref.set(row);
+    return row;
+  }
+
+  async deleteGiftCard(id: string): Promise<boolean> {
+    const ref = this.giftCardsCol().doc(id);
+    const snap = await ref.get();
+    if (!snap.exists) return false;
+    await ref.delete();
+    return true;
+  }
+
+  async getLoyaltyConfig(): Promise<LoyaltyConfigData> {
+    const snap = await this.siteDocsCol().doc('loyalty_config').get();
+    if (!snap.exists) return mergeLoyaltyConfig(null);
+    const raw = snap.data() as { data?: Partial<LoyaltyConfigData> };
+    return mergeLoyaltyConfig(raw?.data || (raw as unknown as Partial<LoyaltyConfigData>));
+  }
+
+  async saveLoyaltyConfig(config: LoyaltyConfigData): Promise<LoyaltyConfigData> {
+    const normalized = mergeLoyaltyConfig(config);
+    await this.siteDocsCol().doc('loyalty_config').set({
+      key: 'loyalty_config',
+      data: normalized,
+      updated_at: Date.now(),
+    });
+    return normalized;
+  }
+
+  async listUsersSummary(): Promise<StoreUserSummary[]> {
+    const snap = await this.usersCol().get();
+    return snap.docs
+      .map((d) => toUserRow(d.data() as Record<string, unknown>))
+      .filter((u) => Boolean(u.email_verified))
+      .sort((a, b) => b.created_at - a.created_at)
+      .slice(0, 100)
+      .map((u) => ({
+        id: u.id,
+        fullName: u.full_name,
+        email: u.email || '',
+        emailVerified: Boolean(u.email_verified),
+        createdAt: u.created_at,
+      }));
   }
 
   async listAuditLogs(params: { productId?: string; page: number; pageSize: number }) {

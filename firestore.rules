@@ -103,7 +103,11 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'id', 'order_number', 'customer_user_id', 'customer_name',
           'customer_email', 'customer_phone', 'shipping_address', 'status',
-          'subtotal_paise', 'total_paise', 'currency', 'created_at', 'product_ids', 'items'
+          'payment_status', 'fulfillment_status', 'payment_method',
+          'status_history', 'status_history_json',
+          'subtotal_paise', 'discount_paise', 'gift_card_paise', 'total_paise',
+          'coupon_code', 'gift_card_code', 'currency', 'created_at', 'updated_at',
+          'product_ids', 'items', 'return_request', 'return_request_json'
         ])
         && data.id == orderId
         && data.order_number is string && data.order_number.size() >= 4 && data.order_number.size() <= 64
@@ -113,8 +117,9 @@ service cloud.firestore {
         && data.customer_phone is string && data.customer_phone.size() >= 5 && data.customer_phone.size() <= 32
         && data.shipping_address is string && data.shipping_address.size() >= 5 && data.shipping_address.size() <= 600
         && data.status == 'pending'
+        && (!('payment_status' in data) || data.payment_status in ['unpaid', 'pending'])
         && data.subtotal_paise is number && data.subtotal_paise >= 100 && data.subtotal_paise <= 500000000
-        && data.total_paise is number && data.total_paise == data.subtotal_paise
+        && data.total_paise is number && data.total_paise >= 0 && data.total_paise <= data.subtotal_paise
         && data.currency == 'INR'
         && data.created_at is number && data.created_at > 0
         && data.product_ids is list && data.product_ids.size() >= 1 && data.product_ids.size() <= 50
@@ -131,6 +136,21 @@ service cloud.firestore {
         && data.created_at is number && data.updated_at is number;
     }
 
+    function isValidCustomerAddress(data, addressId) {
+      return data.keys().hasAll(['id', 'full_name', 'phone', 'line1', 'city', 'state', 'pincode', 'label', 'is_default', 'created_at', 'updated_at'])
+        && data.keys().hasOnly(['id', 'full_name', 'phone', 'line1', 'line2', 'city', 'state', 'pincode', 'landmark', 'label', 'is_default', 'created_at', 'updated_at'])
+        && data.id == addressId
+        && data.full_name is string && data.full_name.size() >= 2 && data.full_name.size() <= 120
+        && data.phone is string && data.phone.size() >= 6 && data.phone.size() <= 32
+        && data.line1 is string && data.line1.size() >= 3 && data.line1.size() <= 240
+        && data.city is string && data.city.size() >= 2 && data.city.size() <= 80
+        && data.state is string && data.state.size() >= 2 && data.state.size() <= 80
+        && data.pincode is string && data.pincode.size() >= 4 && data.pincode.size() <= 16
+        && data.label in ['Home', 'Work', 'Other']
+        && data.is_default is bool
+        && data.created_at is number && data.updated_at is number;
+    }
+
     match /environments/{envKey} {
       match /categories/{categoryId} {
         allow list: if isValidEnv(envKey);
@@ -140,11 +160,11 @@ service cloud.firestore {
       }
 
       match /site_documents/{docKey} {
-        allow get: if isValidEnv(envKey) && (docKey in ['settings', 'content'] || isOwner());
+        allow get: if isValidEnv(envKey) && (docKey in ['settings', 'content', 'loyalty_config'] || isOwner());
         allow list: if isValidEnv(envKey) && isOwner();
         allow create, update: if isValidEnv(envKey)
           && isOwner()
-          && docKey in ['settings', 'content', 'owner_meta']
+          && docKey in ['settings', 'content', 'loyalty_config', 'owner_meta']
           && request.resource.data.key == docKey
           && request.resource.data.updated_at is number;
         allow delete: if false;
@@ -184,16 +204,56 @@ service cloud.firestore {
         allow delete: if isValidEnv(envKey) && isOwner() && isValidId(messageId);
       }
 
+      match /pending_checkouts/{checkoutId} {
+        allow get, list: if isValidEnv(envKey) && isOwner();
+        allow write: if false;
+      }
+
       match /orders/{orderId} {
         allow create: if isValidEnv(envKey) && isValidId(orderId) && isValidPublicOrder(request.resource.data, orderId);
         allow get: if isValidEnv(envKey) && isValidId(orderId) && (isOwner() || (isSignedIn() && resource.data.customer_user_id == request.auth.uid));
         allow list: if isValidEnv(envKey) && (isOwner() || (isSignedIn() && resource.data.customer_user_id == request.auth.uid));
         allow update: if isValidEnv(envKey)
-          && isOwner()
           && isValidId(orderId)
-          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
-          && request.resource.data.status in ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled'];
+          && (
+            (
+              isOwner()
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'fulfillment_status', 'payment_status', 'status_history', 'status_history_json', 'return_request', 'return_request_json', 'updated_at'])
+              && request.resource.data.status in ['pending', 'confirmed', 'packed', 'shipped', 'delivered', 'cancelled', 'return_requested', 'returned']
+            )
+            || (
+              isSignedIn()
+              && resource.data.customer_user_id == request.auth.uid
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['return_request', 'return_request_json', 'status', 'fulfillment_status', 'status_history', 'status_history_json', 'updated_at'])
+              && request.resource.data.return_request.status == 'pending'
+              && request.resource.data.status == 'return_requested'
+              && request.resource.data.fulfillment_status == 'return_requested'
+            )
+          );
         allow delete: if false;
+      }
+
+      match /coupons/{couponId} {
+        allow get: if isValidEnv(envKey) && isValidId(couponId) && (isOwner() || resource.data.active == true || resource.data.active == 1);
+        allow list: if isValidEnv(envKey) && (isOwner() || (isSignedIn() && (resource.data.active == true || resource.data.active == 1)));
+        allow create, update, delete: if isValidEnv(envKey) && isOwner() && isValidId(couponId);
+      }
+
+      match /gift_cards/{cardId} {
+        allow get: if isValidEnv(envKey) && isValidId(cardId) && (isOwner() || isSignedIn() || resource.data.active == true || resource.data.active == 1);
+        allow list: if isValidEnv(envKey) && isOwner();
+        allow create, update, delete: if isValidEnv(envKey) && isOwner() && isValidId(cardId);
+      }
+
+      match /order_requests/{reqId} {
+        allow create: if isValidEnv(envKey)
+          && isValidId(reqId)
+          && isSignedIn()
+          && request.resource.data.customer_user_id == request.auth.uid
+          && request.resource.data.status == 'pending';
+        allow get: if isValidEnv(envKey) && isValidId(reqId) && (isOwner() || (isSignedIn() && resource.data.customer_user_id == request.auth.uid));
+        allow list: if isValidEnv(envKey) && (isOwner() || (isSignedIn() && resource.data.customer_user_id == request.auth.uid));
+        allow update, delete: if isValidEnv(envKey) && isOwner() && isValidId(reqId);
       }
 
       match /product_audit_logs/{auditId} {
@@ -217,6 +277,32 @@ service cloud.firestore {
           && (request.auth.uid == userId || isOwner())
           && isValidEnvironmentUser(request.resource.data, userId);
         allow delete: if isValidEnv(envKey) && isOwner() && isValidId(userId);
+
+        match /addresses/{addressId} {
+          allow get, list: if isValidEnv(envKey) && isSignedIn() && request.auth.uid == userId;
+          allow create, update: if isValidEnv(envKey) && isSignedIn() && request.auth.uid == userId && isValidId(addressId) && isValidCustomerAddress(request.resource.data, addressId);
+          allow delete: if isValidEnv(envKey) && isSignedIn() && request.auth.uid == userId && isValidId(addressId);
+        }
+
+        match /wishlist/{itemId} {
+          allow get, list: if isValidEnv(envKey) && isSignedIn() && request.auth.uid == userId;
+          allow create, update, delete: if isValidEnv(envKey) && isSignedIn() && request.auth.uid == userId && isValidId(itemId);
+        }
+
+        match /notifications/{notifId} {
+          allow get, list: if isValidEnv(envKey) && (isOwner() || (isSignedIn() && request.auth.uid == userId));
+          allow create: if isValidEnv(envKey) && isValidId(notifId) && (isOwner() || (isSignedIn() && request.auth.uid == userId));
+          allow update: if isValidEnv(envKey) && isValidId(notifId) && (
+            isOwner()
+            || (isSignedIn() && request.auth.uid == userId && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'is_read', 'read_at']))
+          );
+          allow delete: if isValidEnv(envKey) && isValidId(notifId) && (isOwner() || (isSignedIn() && request.auth.uid == userId));
+        }
+
+        match /loyalty/{docId} {
+          allow get, list: if isValidEnv(envKey) && (isOwner() || (isSignedIn() && request.auth.uid == userId));
+          allow create, update, delete: if isValidEnv(envKey) && isOwner();
+        }
       }
 
       match /admin_bindings/{bindingId} {

@@ -2,8 +2,11 @@ import 'dotenv/config';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   handleCreateOrderRequest,
+  verifyBearerFirebaseTokenFromHeader,
+  type IdTokenVerifierFn,
   type RazorpayClientFactory,
 } from '../server/razorpay-checkout.ts';
+import type { BoutiqueStore } from '../server/store.ts';
 
 export interface VercelNodeRequest extends IncomingMessage {
   body?: unknown;
@@ -62,6 +65,9 @@ function sendJson(res: VercelNodeResponse, statusCode: number, payload: Record<s
 
 export function createCreateOrderHandler(options?: {
   razorpayClientFactory?: RazorpayClientFactory;
+  verifyIdToken?: IdTokenVerifierFn;
+  store?: BoutiqueStore | null;
+  requireDurablePersistence?: boolean;
 }) {
   return async function handler(req: VercelNodeRequest, res: VercelNodeResponse) {
     const method = (req.method || 'GET').toUpperCase();
@@ -80,6 +86,19 @@ export function createCreateOrderHandler(options?: {
       return;
     }
 
+    const authResult = await verifyBearerFirebaseTokenFromHeader(
+      req.headers.authorization,
+      options?.verifyIdToken
+    );
+    if (!authResult.ok) {
+      sendJson(res, authResult.status, {
+        status: authResult.status,
+        code: authResult.code,
+        error: authResult.error,
+      });
+      return;
+    }
+
     let body: Record<string, unknown>;
     try {
       body = await readJsonBody(req);
@@ -94,7 +113,11 @@ export function createCreateOrderHandler(options?: {
 
     const result = await handleCreateOrderRequest({
       body,
+      store: options?.store ?? null,
+      customerUserId: authResult.uid,
+      customerIdToken: authResult.rawToken,
       razorpayClientFactory: options?.razorpayClientFactory,
+      requireDurablePersistence: options?.requireDurablePersistence,
     });
     sendJson(res, result.status, result.body);
   };
