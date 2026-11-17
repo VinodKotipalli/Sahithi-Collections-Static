@@ -1,5 +1,5 @@
-import { Product } from '../types/boutique';
-import { BOUTIQUE_MEDIA } from './media';
+import type { Product } from '../types/boutique.ts';
+import { BOUTIQUE_MEDIA } from './media.ts';
 
 /**
  * DEMO CATALOG DATA
