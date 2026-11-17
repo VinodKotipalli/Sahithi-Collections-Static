@@ -8,6 +8,12 @@ import {
   type RazorpayClientFactory,
 } from './razorpay-checkout.ts';
 import {
+  handleWhatsAppStylistRequest,
+  handleWhatsAppWebhookGet,
+  handleWhatsAppWebhookPost,
+  type GeminiClientFactory,
+} from './whatsapp-ai.ts';
+import {
   StoreHttpError,
   type AdminProductRecord,
   type BoutiqueStore,
@@ -832,6 +838,8 @@ export function registerCatalogAndAdminRoutes(params: {
     isOwner?: boolean
   ) => Record<string, unknown>;
   razorpayClientFactory?: RazorpayClientFactory;
+  aiClientFactory?: GeminiClientFactory;
+  whatsappFetchImpl?: typeof fetch;
 }) {
   const {
     app,
@@ -843,6 +851,8 @@ export function registerCatalogAndAdminRoutes(params: {
     verifyPassword,
     serializePublicUser,
     razorpayClientFactory,
+    aiClientFactory,
+    whatsappFetchImpl,
   } = params;
 
   const upload = multer({
@@ -1376,6 +1386,69 @@ export function registerCatalogAndAdminRoutes(params: {
           store,
           customerUserId: req.authUser?.id || null,
           razorpayClientFactory,
+        });
+        return res.status(result.status).json(result.body);
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Automated WhatsApp AI Stylist & Cloud API Webhook Endpoints
+  // -------------------------------------------------------------------------
+
+  app.post(
+    '/api/whatsapp/stylist',
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const result = await handleWhatsAppStylistRequest({
+          body: (req.body && typeof req.body === 'object' ? req.body : {}) as Record<
+            string,
+            unknown
+          >,
+          store,
+          aiClientFactory,
+        });
+        return res.status(result.status).json(result.body);
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.get('/api/whatsapp/webhook', (req: Request, res: Response) => {
+    const query: Record<string, string | string[] | undefined> = {};
+    for (const [key, val] of Object.entries(req.query)) {
+      if (typeof val === 'string') {
+        query[key] = val;
+      } else if (Array.isArray(val)) {
+        query[key] = val.filter((item): item is string => typeof item === 'string');
+      }
+    }
+    const result = handleWhatsAppWebhookGet({ query });
+    if (result.rawText !== undefined) {
+      return res.status(result.status).type('text/plain').send(result.rawText);
+    }
+    return res.status(result.status).json(result.body);
+  });
+
+  app.post(
+    '/api/whatsapp/webhook',
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const sigHeader = req.get('x-hub-signature-256');
+        const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<
+          string,
+          unknown
+        >;
+        const result = await handleWhatsAppWebhookPost({
+          body,
+          rawBody: JSON.stringify(body),
+          signatureHeader: sigHeader,
+          store,
+          aiClientFactory,
+          fetchImpl: whatsappFetchImpl,
         });
         return res.status(result.status).json(result.body);
       } catch (err) {

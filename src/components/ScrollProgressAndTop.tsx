@@ -1,9 +1,13 @@
 import { useEffect, useState } from 'react';
-import { ArrowUp } from 'lucide-react';
+import { ArrowUp, MessageCircle } from 'lucide-react';
 import { AnimatePresence, motion, useScroll, useSpring } from 'motion/react';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 
-export function ScrollProgressAndTop() {
+interface ScrollProgressAndTopProps {
+  onOpenStylist?: () => void;
+}
+
+export function ScrollProgressAndTop({ onOpenStylist }: ScrollProgressAndTopProps) {
   const prefersReducedMotion = usePrefersReducedMotion();
   const { scrollYProgress } = useScroll();
   const scaleX = useSpring(scrollYProgress, {
@@ -38,22 +42,36 @@ export function ScrollProgressAndTop() {
         style={{ scaleX: prefersReducedMotion ? scrollYProgress : scaleX }}
       />
 
-      <AnimatePresence>
-        {showTop && (
-          <motion.button
+      <div className="fixed bottom-5 right-5 z-40 flex flex-col items-end gap-2.5">
+        <AnimatePresence>
+          {showTop && (
+            <motion.button
+              type="button"
+              onClick={scrollToTop}
+              aria-label="Back to top"
+              initial={prefersReducedMotion ? { opacity: 1 } : { opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: 12 }}
+              transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+              className="flex h-11 w-11 items-center justify-center rounded-full border border-[#49243E]/15 bg-[#FFF9F5] text-[#49243E] shadow-md transition-colors duration-200 hover:bg-[#49243E] hover:text-[#FFF9F5] active:scale-95"
+            >
+              <ArrowUp className="h-4 w-4" aria-hidden="true" />
+            </motion.button>
+          )}
+        </AnimatePresence>
+
+        {onOpenStylist && (
+          <button
             type="button"
-            onClick={scrollToTop}
-            aria-label="Back to top"
-            initial={prefersReducedMotion ? { opacity: 1 } : { opacity: 0, y: 12 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: 12 }}
-            transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-            className="fixed bottom-5 right-5 z-40 flex h-11 w-11 items-center justify-center rounded-full border border-[#49243E]/15 bg-[#FFF9F5] text-[#49243E] shadow-md transition-colors duration-200 hover:bg-[#49243E] hover:text-[#FFF9F5] active:scale-95"
+            onClick={onOpenStylist}
+            aria-label="Open WhatsApp AI Stylist"
+            className="inline-flex h-11 items-center gap-2 rounded-full border border-[#49243E]/15 bg-[#49243E] px-4 text-xs font-medium text-[#FFF9F5] shadow-md transition-colors duration-200 hover:bg-[#3A1B31] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#49243E] focus-visible:ring-offset-2 whitespace-nowrap"
           >
-            <ArrowUp className="h-4 w-4" aria-hidden="true" />
-          </motion.button>
+            <MessageCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
+            <span>WhatsApp Stylist</span>
+          </button>
         )}
-      </AnimatePresence>
+      </div>
     </>
   );
 }

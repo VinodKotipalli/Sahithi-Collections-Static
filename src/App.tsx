@@ -17,7 +17,9 @@ import { ProductShowcase, type SortOption } from './components/ProductShowcase';
 import { QuickViewModal } from './components/QuickViewModal';
 import { ScrollProgressAndTop } from './components/ScrollProgressAndTop';
 import { SpotlightEditSection } from './components/SpotlightEditSection';
+import { WhatsAppStylistDrawer } from './components/WhatsAppStylistDrawer';
 import { WishlistDrawer } from './components/WishlistDrawer';
+import type { WhatsAppStylistProductContext } from './services/whatsappStylist';
 import { PRODUCTS } from './config/products';
 import { AuthProvider, useAuth, type AuthUser } from './context/AuthContext';
 import { StorefrontProvider, useStorefront } from './context/StorefrontContext';
@@ -108,6 +110,9 @@ function BoutiqueShell() {
   const [quickViewProduct, setQuickViewProduct] = useState<Product | null>(null);
   const [wishlistOpen, setWishlistOpen] = useState(false);
   const [bagOpen, setBagOpen] = useState(false);
+  const [stylistOpen, setStylistOpen] = useState(false);
+  const [stylistProductContext, setStylistProductContext] =
+    useState<WhatsAppStylistProductContext | null>(null);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
 
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -468,9 +473,18 @@ function BoutiqueShell() {
           <ContactAndFooter
             onNavigateAuth={() => navigate(user ? '/account' : '/login')}
             accountLabel={user ? 'My Account' : 'Login / Sign Up'}
+            onOpenStylist={() => {
+              setStylistProductContext(null);
+              setStylistOpen(true);
+            }}
           />
 
-          <ScrollProgressAndTop />
+          <ScrollProgressAndTop
+            onOpenStylist={() => {
+              setStylistProductContext(null);
+              setStylistOpen(true);
+            }}
+          />
 
           <LookbookLightbox
             activeIndex={lightboxIndex}
@@ -492,6 +506,21 @@ function BoutiqueShell() {
             window.history.replaceState(null, '', '/');
           }
           setBagOpen(true);
+        }}
+        onAskStylist={(product, selectedSize, selectedColor) => {
+          setQuickViewProduct(null);
+          if (typeof window !== 'undefined' && window.location.pathname.startsWith('/products/')) {
+            window.history.replaceState(null, '', '/');
+          }
+          setStylistProductContext({
+            id: product.id,
+            name: product.name,
+            category: product.category,
+            pricePaise: product.pricePaise ?? Math.round(product.price * 100),
+            selectedSize,
+            selectedColor,
+          });
+          setStylistOpen(true);
         }}
         relatedProducts={
           quickViewProduct
@@ -539,6 +568,20 @@ function BoutiqueShell() {
         onAcceptPriceUpdates={acceptPriceUpdates}
         onClearBag={clearBag}
         onOrderCompleted={() => void fetchPublicCatalog()}
+      />
+
+      <WhatsAppStylistDrawer
+        isOpen={stylistOpen}
+        onClose={() => setStylistOpen(false)}
+        products={products}
+        productContext={stylistProductContext}
+        onSelectProduct={(product) => {
+          setQuickViewProduct(product);
+          if (typeof window !== 'undefined') {
+            const slugOrId = product.slug || product.id;
+            window.history.replaceState(null, '', `/products/${encodeURIComponent(slugOrId)}`);
+          }
+        }}
       />
     </div>
   );

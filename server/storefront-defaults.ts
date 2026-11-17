@@ -224,9 +224,9 @@ export const DEFAULT_SITE_SETTINGS: SiteSettingsData = {
   tagline: 'Style That Celebrates You.',
   logoUrl: '',
   contact: {
-    whatsappNumber: '',
+    whatsappNumber: '918520899337',
     instagramHandle: '',
-    email: '',
+    email: 'saivinodkotipalli2003@gmail.com',
     storeAddress: '',
     hoursNote: 'Mon – Sat · 10:30 AM – 8:00 PM IST',
   },

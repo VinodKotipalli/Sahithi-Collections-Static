@@ -510,6 +510,18 @@ test('Razorpay credential sanitization strips quotes/newlines, rejects malformed
       assert.equal(capturedKeyId, 'rzp_test_CleanKey1234');
       assert.equal(capturedKeySecret, 'SecretClean999');
 
+      // 1b. Literal backslash-newline, zero-width space, and accidental KEY= prefix are stripped cleanly
+      process.env.RAZORPAY_KEY_ID = 'RAZORPAY_KEY_ID=rzp_live_PrefixedKey88\\n';
+      process.env.RAZORPAY_KEY_SECRET = '\u200BRAZORPAY_KEY_SECRET="PrefixedSecret77"\\r\\n';
+      const prefixedRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+      });
+      assert.equal(prefixedRes.status, 200);
+      assert.equal(capturedKeyId, 'rzp_live_PrefixedKey88');
+      assert.equal(capturedKeySecret, 'PrefixedSecret77');
+
       // 2. Malformed key ID returns 401 RAZORPAY_AUTH_FAILED
       process.env.RAZORPAY_KEY_ID = 'invalid_key_prefix';
       process.env.RAZORPAY_KEY_SECRET = 'SecretClean999';
@@ -535,6 +547,19 @@ test('Razorpay credential sanitization strips quotes/newlines, rejects malformed
       const swappedBody = (await swappedRes.json()) as { code?: string; error?: string };
       assert.equal(swappedBody.code, 'RAZORPAY_AUTH_FAILED');
       assert.match(swappedBody.error || '', /RAZORPAY_KEY_SECRET/);
+
+      // 2c. Masked asterisks copied from Razorpay Dashboard return actionable 401 guidance
+      process.env.RAZORPAY_KEY_ID = 'rzp_live_SampleLiveKey1';
+      process.env.RAZORPAY_KEY_SECRET = '*************************';
+      const maskedRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+      });
+      assert.equal(maskedRes.status, 401);
+      const maskedBody = (await maskedRes.json()) as { code?: string; error?: string };
+      assert.equal(maskedBody.code, 'RAZORPAY_AUTH_FAILED');
+      assert.match(maskedBody.error || '', /Regenerate Key/i);
     } finally {
       await new Promise<void>((resolve) => srv.close(() => resolve()));
     }

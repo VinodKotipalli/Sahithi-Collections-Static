@@ -23,6 +23,7 @@ import {
   createDefaultEmailSender,
   type EmailSender,
 } from './providers.ts';
+import type { GeminiClientFactory } from './whatsapp-ai.ts';
 import { registerCatalogAndAdminRoutes } from './catalog.ts';
 import {
   extractOobCode,
@@ -70,6 +71,8 @@ export interface CreateAuthAppOptions {
   appBaseUrl?: string;
   seedCatalog?: boolean;
   razorpayClientFactory?: RazorpayClientFactory;
+  aiClientFactory?: GeminiClientFactory;
+  whatsappFetchImpl?: typeof fetch;
 }
 
 interface AuthedRequest extends Request {
@@ -715,7 +718,12 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
       return next();
     }
     const cleanSubPath = req.path.replace(/\/+$/, '');
-    if (cleanSubPath === '/create-order' || cleanSubPath === '/verify-payment') {
+    if (
+      cleanSubPath === '/create-order' ||
+      cleanSubPath === '/verify-payment' ||
+      cleanSubPath === '/whatsapp/stylist' ||
+      cleanSubPath === '/whatsapp/webhook'
+    ) {
       return next();
     }
 
@@ -2690,6 +2698,8 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     verifyPassword,
     serializePublicUser,
     razorpayClientFactory: options.razorpayClientFactory,
+    aiClientFactory: options.aiClientFactory,
+    whatsappFetchImpl: options.whatsappFetchImpl,
   });
 
   const postOnlyMutationPaths = [

@@ -9,10 +9,11 @@ import {
   Send,
 } from 'lucide-react';
 import {
+  formatWhatsAppDisplay,
   isAddressConfigured,
-  isEmailConfigured,
   isInstagramConfigured,
-  isWhatsAppConfigured,
+  resolveBoutiqueEmail,
+  resolveWhatsAppDigits,
 } from '../config/site';
 import { useAuth } from '../context/AuthContext';
 import { useStorefront } from '../context/StorefrontContext';
@@ -21,24 +22,26 @@ import { RevealSection } from './RevealSection';
 interface ContactAndFooterProps {
   onNavigateAuth?: () => void;
   accountLabel?: string;
+  onOpenStylist?: () => void;
 }
 
 export function ContactAndFooter({
   onNavigateAuth,
   accountLabel = 'Account / Login',
+  onOpenStylist,
 }: ContactAndFooterProps) {
   const { apiRequest } = useAuth();
   const { settings } = useStorefront();
   const { contact, socialLinks, brandName, tagline, logoUrl } = settings;
 
-  const hasWhatsApp = isWhatsAppConfigured(contact);
   const hasInstagram = isInstagramConfigured(contact);
-  const hasEmail = isEmailConfigured(contact);
   const hasAddress = isAddressConfigured(contact);
   const currentYear = new Date().getFullYear();
 
   const cleanInstagramHandle = contact.instagramHandle.replace(/^@/, '').trim();
-  const cleanWhatsApp = contact.whatsappNumber.replace(/\D/g, '');
+  const cleanWhatsApp = resolveWhatsAppDigits(contact);
+  const displayWhatsApp = formatWhatsAppDisplay(cleanWhatsApp);
+  const boutiqueEmail = resolveBoutiqueEmail(contact);
   const instagramLink =
     socialLinks.instagramUrl ||
     (hasInstagram ? `https://instagram.com/${cleanInstagramHandle}` : '');
@@ -122,34 +125,37 @@ export function ContactAndFooter({
                   <h3 className="mt-4 font-serif text-xl font-semibold text-[#49243E]">
                     WhatsApp Styling
                   </h3>
-                  {hasWhatsApp ? (
-                    <p className="mt-2 text-sm text-[#242124]/80 tabular-nums">
-                      +{cleanWhatsApp}
-                    </p>
-                  ) : (
-                    <p className="mt-2 text-sm text-[#242124]/65">
-                      Personal styling consultations and bespoke sizing advice via our enquiry desk.
-                    </p>
-                  )}
+                  <p className="mt-2 text-sm text-[#242124]/80 tabular-nums">
+                    {displayWhatsApp}
+                  </p>
+                  <p className="mt-1 text-xs text-[#242124]/65">
+                    24/7 automated AI styling recommendations &amp; direct WhatsApp concierge.
+                  </p>
                 </div>
 
-                {hasWhatsApp ? (
+                <div className="mt-5 flex flex-col gap-2">
+                  {onOpenStylist && (
+                    <button
+                      type="button"
+                      onClick={onOpenStylist}
+                      className="inline-flex min-h-[42px] items-center justify-center rounded-xl bg-[#49243E] px-4 py-2 text-xs font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31]"
+                    >
+                      Ask AI Stylist
+                    </button>
+                  )}
                   <a
                     href={`https://wa.me/${cleanWhatsApp}`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="mt-5 inline-flex min-h-[42px] items-center justify-center rounded-xl bg-[#49243E] px-4 py-2 text-xs font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31]"
+                    className={`inline-flex min-h-[42px] items-center justify-center rounded-xl px-4 py-2 text-xs font-medium transition-colors ${
+                      onOpenStylist
+                        ? 'border border-[#49243E]/25 text-[#49243E] hover:bg-[#F3D5DF]/35'
+                        : 'bg-[#49243E] text-[#FFF9F5] hover:bg-[#3A1B31]'
+                    }`}
                   >
                     Message on WhatsApp
                   </a>
-                ) : (
-                  <a
-                    href="#boutique-enquiry-form"
-                    className="mt-5 inline-flex min-h-[42px] items-center justify-center rounded-xl border border-[#49243E]/20 px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/35"
-                  >
-                    Send an Enquiry
-                  </a>
-                )}
+                </div>
               </div>
             </RevealSection>
 
@@ -202,30 +208,15 @@ export function ContactAndFooter({
                   <h3 className="mt-4 font-serif text-xl font-semibold text-[#49243E]">
                     Boutique Email
                   </h3>
-                  {hasEmail ? (
-                    <p className="mt-2 break-all text-sm text-[#242124]/80">{contact.email}</p>
-                  ) : (
-                    <p className="mt-2 text-sm text-[#242124]/65">
-                      Direct concierge inbox for order updates, custom measurements, and gifting.
-                    </p>
-                  )}
+                  <p className="mt-2 break-all text-sm text-[#242124]/80">{boutiqueEmail}</p>
                 </div>
 
-                {hasEmail ? (
-                  <a
-                    href={`mailto:${contact.email}`}
-                    className="mt-5 inline-flex min-h-[42px] items-center justify-center rounded-xl border border-[#49243E]/25 px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#49243E] hover:text-[#FFF9F5]"
-                  >
-                    Send an Email
-                  </a>
-                ) : (
-                  <a
-                    href="#boutique-enquiry-form"
-                    className="mt-5 inline-flex min-h-[42px] items-center justify-center rounded-xl border border-[#49243E]/20 px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/35"
-                  >
-                    Write to Us
-                  </a>
-                )}
+                <a
+                  href={`mailto:${boutiqueEmail}`}
+                  className="mt-5 inline-flex min-h-[42px] items-center justify-center rounded-xl border border-[#49243E]/25 px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#49243E] hover:text-[#FFF9F5]"
+                >
+                  Send an Email
+                </a>
               </div>
             </RevealSection>
 
@@ -484,8 +475,8 @@ export function ContactAndFooter({
             <p>
               &copy; {currentYear} {brandName}. All rights reserved.
             </p>
-            <p>
-              Crafted boutique apparel &amp; accessories · Live INR catalog.
+            <p className="tabular-nums">
+              WhatsApp: <a href={`https://wa.me/${cleanWhatsApp}`} target="_blank" rel="noopener noreferrer" className="text-[#F3D5DF] hover:underline">{displayWhatsApp}</a> · <a href={`mailto:${boutiqueEmail}`} className="text-[#F3D5DF] hover:underline">{boutiqueEmail}</a>
             </p>
           </div>
         </div>

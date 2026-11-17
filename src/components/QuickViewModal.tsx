@@ -10,9 +10,9 @@ import {
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import {
-  buildWhatsAppEnquiryMessage,
   buildWhatsAppEnquiryUrl,
-  isWhatsAppConfigured,
+  formatWhatsAppDisplay,
+  resolveWhatsAppDigits,
 } from '../config/site';
 import { useStorefront } from '../context/StorefrontContext';
 import { useFocusTrap } from '../hooks/useFocusTrap';
@@ -27,6 +27,7 @@ interface QuickViewModalProps {
   onToggleWishlist: (id: string) => void;
   onAddToBag?: (item: Omit<BagItem, 'quantity'> & { quantity?: number }) => void;
   onBuyNow?: (item: Omit<BagItem, 'quantity'> & { quantity?: number }) => void;
+  onAskStylist?: (product: Product, selectedSize: string, selectedColor: string) => void;
   relatedProducts?: Product[];
   onSelectProduct?: (product: Product) => void;
   onClose: () => void;
@@ -38,6 +39,7 @@ export function QuickViewModal({
   onToggleWishlist,
   onAddToBag,
   onBuyNow,
+  onAskStylist,
   relatedProducts = [],
   onSelectProduct,
   onClose,
@@ -96,7 +98,8 @@ export function QuickViewModal({
     (product?.compareAtPrice ? Math.round(product.compareAtPrice * 100) : null);
   const availableStock = activeVariant?.stockQty ?? product?.stockQty ?? 1;
 
-  const whatsAppReady = isWhatsAppConfigured(settings.contact);
+  const whatsappDigits = resolveWhatsAppDigits(settings.contact);
+  const whatsappDisplay = formatWhatsAppDisplay(whatsappDigits);
   const enquiryUrl = product
     ? buildWhatsAppEnquiryUrl({
         productName: product.name,
@@ -104,14 +107,6 @@ export function QuickViewModal({
         selectedColor,
         brandName: settings.brandName,
         contact: settings.contact,
-      })
-    : null;
-  const enquiryPreview = product
-    ? buildWhatsAppEnquiryMessage({
-        productName: product.name,
-        selectedSize,
-        selectedColor,
-        brandName: settings.brandName,
       })
     : '';
 
@@ -427,21 +422,29 @@ export function QuickViewModal({
                       </button>
                     </div>
 
-                    {whatsAppReady && enquiryUrl ? (
-                      <a
-                        href={enquiryUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="flex min-h-[42px] w-full items-center justify-center gap-2 rounded-xl border border-[#49243E]/20 bg-white px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/25"
-                      >
-                        <MessageCircle className="h-4 w-4" aria-hidden="true" />
-                        <span>Enquire via WhatsApp ({selectedSize}, {selectedColor})</span>
-                      </a>
-                    ) : (
-                      <p className="text-[11px] leading-relaxed text-[#242124]/60">
-                        Direct styling draft: “{enquiryPreview}”
-                      </p>
-                    )}
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      {onAskStylist && (
+                        <button
+                          type="button"
+                          onClick={() => onAskStylist(product, selectedSize, selectedColor)}
+                          className="flex min-h-[42px] flex-1 items-center justify-center gap-2 rounded-xl border border-[#49243E]/25 bg-white px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/35"
+                        >
+                          <MessageCircle className="h-4 w-4" aria-hidden="true" />
+                          <span>Ask AI Stylist</span>
+                        </button>
+                      )}
+                      {enquiryUrl && (
+                        <a
+                          href={enquiryUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex min-h-[42px] flex-1 items-center justify-center gap-2 rounded-xl border border-[#49243E]/20 bg-white px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/25 tabular-nums"
+                        >
+                          <MessageCircle className="h-4 w-4" aria-hidden="true" />
+                          <span>WhatsApp ({whatsappDisplay})</span>
+                        </a>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>

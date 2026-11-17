@@ -440,7 +440,7 @@ function fromFsFields(fields?: Record<string, FsFieldValue>): Record<string, unk
   return out;
 }
 
-interface CatalogVariantInfo {
+export interface CatalogVariantInfo {
   id: string;
   sku: string;
   size: string;
@@ -449,12 +449,15 @@ interface CatalogVariantInfo {
   stock_qty: number;
 }
 
-interface CatalogProductInfo {
+export interface CatalogProductInfo {
   id: string;
   slug: string;
   title: string;
   sku: string;
   status: string;
+  category?: string;
+  description?: string;
+  fabric_note?: string;
   price_paise: number;
   stock_qty: number;
   variants: CatalogVariantInfo[];
@@ -503,6 +506,9 @@ function buildSeedCatalogProducts(): CatalogProductInfo[] {
       title: item.name,
       sku,
       status: 'published',
+      category: item.category,
+      description: item.description,
+      fabric_note: item.fabricNote,
       price_paise: pricePaise,
       stock_qty: totalStock,
       variants,
@@ -532,7 +538,7 @@ function getFirestoreContext(): {
   };
 }
 
-async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, CatalogProductInfo>> {
+export async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, CatalogProductInfo>> {
   const ctx = getFirestoreContext();
   const byId = new Map<string, CatalogProductInfo>();
 
@@ -639,6 +645,9 @@ async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, Catalog
           title: typeof raw.title === 'string' ? raw.title : 'Sahithi Piece',
           sku: typeof raw.sku === 'string' ? raw.sku : docId,
           status: typeof raw.status === 'string' ? raw.status : 'published',
+          category: typeof raw.category === 'string' ? raw.category : undefined,
+          description: typeof raw.description === 'string' ? raw.description : undefined,
+          fabric_note: typeof raw.fabric_note === 'string' ? raw.fabric_note : undefined,
           price_paise: Math.round(Number(raw.price_paise ?? 0)),
           stock_qty: Math.round(Number(raw.stock_qty ?? 0)),
           variants,
@@ -1197,16 +1206,36 @@ function parseCustomerDetails(raw: unknown): OrderCustomerDetails | null {
   return null;
 }
 
-function sanitizeEnvCredential(raw: string | undefined): string {
+function sanitizeEnvCredential(raw: string | undefined, knownPrefixes: string[] = []): string {
   if (!raw) return '';
-  let val = raw.trim();
+  let val = raw
+    .replace(/[\u200B-\u200D\uFEFF\u00A0]/g, '')
+    .replace(/\\r|\\n/gi, '')
+    .replace(/[\r\n]+/g, '')
+    .trim();
+
   if (
     (val.startsWith('"') && val.endsWith('"')) ||
     (val.startsWith("'") && val.endsWith("'"))
   ) {
     val = val.slice(1, -1).trim();
   }
-  return val.replace(/[\r\n]+/g, '').trim();
+
+  for (const prefix of knownPrefixes) {
+    const eqPrefix = `${prefix}=`;
+    if (val.toLowerCase().startsWith(eqPrefix.toLowerCase())) {
+      val = val.slice(eqPrefix.length).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1).trim();
+      }
+      break;
+    }
+  }
+
+  return val.replace(/\s+/g, '');
 }
 
 function maskRazorpayKeyId(keyId: string): string {
@@ -1217,9 +1246,15 @@ function maskRazorpayKeyId(keyId: string): string {
 export function resolveRazorpayCredentials():
   | { ok: true; keyId: string; keySecret: string; mode: 'test' | 'live' }
   | { ok: false; code: string; error: string } {
-  const keyId = sanitizeEnvCredential(process.env.RAZORPAY_KEY_ID);
+  const keyId = sanitizeEnvCredential(process.env.RAZORPAY_KEY_ID, [
+    'RAZORPAY_KEY_ID',
+    'VITE_RAZORPAY_KEY_ID',
+    'NEXT_PUBLIC_RAZORPAY_KEY_ID',
+    'key_id',
+  ]);
   const keySecret = sanitizeEnvCredential(
-    process.env.RAZORPAY_KEY_SECRET || process.env.RAZORPAY_SECRET
+    process.env.RAZORPAY_KEY_SECRET || process.env.RAZORPAY_SECRET,
+    ['RAZORPAY_KEY_SECRET', 'RAZORPAY_SECRET', 'key_secret']
   );
 
   if (!keyId || !keySecret) {
@@ -1228,6 +1263,15 @@ export function resolveRazorpayCredentials():
       code: 'RAZORPAY_AUTH_FAILED',
       error:
         'Razorpay API credentials (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET) are not configured on the server.',
+    };
+  }
+
+  if (/\*{3,}|•{3,}/.test(keySecret)) {
+    return {
+      ok: false,
+      code: 'RAZORPAY_AUTH_FAILED',
+      error:
+        'RAZORPAY_KEY_SECRET contains masked asterisks (***) instead of the actual secret. Razorpay only reveals the Key Secret once at creation — click Regenerate Key in Razorpay Dashboard → Account & Settings → API Keys, save both the new Key ID and Secret in Vercel Environment Variables, and redeploy.',
     };
   }
 

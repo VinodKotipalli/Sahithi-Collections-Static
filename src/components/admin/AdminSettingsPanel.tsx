@@ -399,7 +399,7 @@ export function AdminSettingsPanel({
                   p ? { ...p, contact: { ...p.contact, whatsappNumber: e.target.value } } : p
                 );
               }}
-              placeholder="919876543210"
+              placeholder="918520899337"
               aria-invalid={Boolean(fieldErrors['contact.whatsappNumber'])}
               className={`mt-1 h-11 w-full rounded-xl border bg-[#FFF9F5]/60 px-3.5 text-sm tabular-nums focus:bg-white focus:outline-none ${
                 fieldErrors['contact.whatsappNumber']
@@ -447,7 +447,7 @@ export function AdminSettingsPanel({
                   p ? { ...p, contact: { ...p.contact, email: e.target.value } } : p
                 );
               }}
-              placeholder="hello@sahithicollections.com"
+              placeholder="saivinodkotipalli2003@gmail.com"
               aria-invalid={Boolean(fieldErrors['contact.email'])}
               className={`mt-1 h-11 w-full rounded-xl border bg-[#FFF9F5]/60 px-3.5 text-sm focus:bg-white focus:outline-none ${
                 fieldErrors['contact.email']
