@@ -2699,6 +2699,11 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     '/api/admin/resend-verification',
     '/api/admin/forgot-password',
     '/api/admin/password-reset/confirm',
+    '/api/admin/products/:id/publish',
+    '/api/admin/products/:id/unpublish',
+    '/api/admin/products/:id/archive',
+    '/api/admin/products/:id/restore',
+    '/api/admin/products/:id/duplicate',
   ];
 
   app.get(postOnlyMutationPaths, (req: AuthedRequest, res: Response) => {
@@ -2708,7 +2713,7 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
       return res.status(409).json({
         status: 409,
         code: 'METHOD_REDIRECTED_RETRY',
-        error: 'Authentication request was redirected by proxy; retrying POST.',
+        error: 'Request was redirected by proxy; retrying POST.',
         requestId,
       });
     }

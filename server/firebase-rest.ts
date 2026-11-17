@@ -1776,9 +1776,16 @@ export class FirestoreRestStore implements BoutiqueStore {
     }
     const meta = await this.getCatalogVisibilityMeta();
     if (meta.deletedIds.has(id)) return null;
-    const seedIdx = INITIAL_SEED_PRODUCTS.findIndex((p) => p.id === id);
+    const seedIdx = INITIAL_SEED_PRODUCTS.findIndex(
+      (p) => p.id === id || p.id.toLowerCase() === id.toLowerCase() || p.slug === id
+    );
     if (seedIdx < 0) return null;
-    const doc = buildSeedStarterProductDoc(INITIAL_SEED_PRODUCTS[seedIdx], seedIdx, Date.now());
+    const seedProduct = INITIAL_SEED_PRODUCTS[seedIdx];
+    if (meta.deletedIds.has(seedProduct.id)) return null;
+    const doc = buildSeedStarterProductDoc(seedProduct, seedIdx, Date.now());
+    if (meta.hiddenIds.has(doc.id) && doc.status === 'published') {
+      doc.status = 'draft';
+    }
     return {
       data: doc,
       isStarterFallback: true,
@@ -2455,21 +2462,55 @@ export class FirestoreRestStore implements BoutiqueStore {
     }
 
     const now = Date.now();
+    const canonicalId = String(current.id || input.productId);
     const updated: FirestoreProductDoc = {
-      ...current,
+      id: canonicalId,
+      slug: String(current.slug || canonicalId),
+      title: String(current.title || 'Boutique Piece'),
+      description: String(current.description || ''),
+      fabric_note: String(current.fabric_note || ''),
+      category: String(current.category || 'Kurtis'),
+      sku: String(current.sku || canonicalId.toUpperCase()),
+      price_paise: Math.max(100, Math.round(Number(current.price_paise) || 100)),
+      compare_at_paise:
+        current.compare_at_paise !== null &&
+        current.compare_at_paise !== undefined &&
+        Number(current.compare_at_paise) >= 100
+          ? Math.round(Number(current.compare_at_paise))
+          : null,
+      stock_qty: Math.max(0, Math.round(Number(current.stock_qty) || 0)),
+      low_stock_threshold: Math.max(0, Math.round(Number(current.low_stock_threshold) ?? 5)),
+      featured: Boolean(current.featured),
       status: input.targetStatus,
-      version: current.version + 1,
+      colors_json:
+        typeof current.colors_json === 'string' && current.colors_json
+          ? current.colors_json
+          : '[]',
+      sizes_json:
+        typeof current.sizes_json === 'string' && current.sizes_json
+          ? current.sizes_json
+          : '["S","M","L","XL"]',
+      version: Math.max(1, Math.round(Number(current.version) || 1)) + 1,
       published_at:
         input.targetStatus === 'published'
           ? current.published_at ?? now
-          : current.published_at,
+          : current.published_at ?? null,
       archived_at: input.targetStatus === 'archived' ? now : null,
+      created_at: Math.max(1, Math.round(Number(current.created_at) || now)),
       updated_at: now,
+      variants: Array.isArray(current.variants) ? current.variants : [],
+      images: Array.isArray(current.images) ? current.images : [],
+      variant_skus: Array.isArray(current.variant_skus)
+        ? current.variant_skus
+        : (current.variants || []).map((v) => v.sku),
+      image_urls: Array.isArray(current.image_urls)
+        ? current.image_urls
+        : (current.images || []).map((i) => i.url),
     };
 
     try {
       await this.setDoc(
-        `products/${input.productId}`,
+        `products/${canonicalId}`,
         updated as unknown as Record<string, unknown>,
         existingDoc.updateTime ? { updateTime: existingDoc.updateTime } : undefined
       );

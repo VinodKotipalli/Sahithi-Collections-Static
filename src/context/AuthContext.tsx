@@ -203,6 +203,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const csrfTokenRef = useRef<string>('');
   const sessionTokenRef = useRef<string>(readStoredApiSessionToken());
   const isLoggingOutRef = useRef<boolean>(false);
+  const sessionEpochRef = useRef<number>(0);
 
   const captureSessionHeader = useCallback((res: Response) => {
     const headerToken = res.headers.get('X-Sahithi-Session-Token');
@@ -230,6 +231,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const syncSessionAndCapabilities = useCallback(async () => {
+    const syncEpoch = sessionEpochRef.current;
     try {
       const [sessionRes, capRes] = await Promise.all([
         fetchApi(normalizeApiPath('/api/auth/session'), {
@@ -256,7 +258,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (typeof sessionData.csrfToken === 'string' && sessionData.csrfToken) {
           csrfTokenRef.current = sessionData.csrfToken;
         }
-        if (!isLoggingOutRef.current) {
+        if (syncEpoch === sessionEpochRef.current && !isLoggingOutRef.current) {
           setUser(sessionData.authenticated ? (sessionData.user ?? null) : null);
         }
       } else if (
@@ -269,7 +271,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           csrfToken?: string;
           user?: AuthUser | null;
         }>('/api/auth/session', 'GET');
-        if (fallbackSession.ok && !isLoggingOutRef.current) {
+        if (
+          fallbackSession.ok &&
+          syncEpoch === sessionEpochRef.current &&
+          !isLoggingOutRef.current
+        ) {
           if (fallbackSession.data.csrfToken) {
             csrfTokenRef.current = fallbackSession.data.csrfToken;
           }
@@ -295,7 +301,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         csrfToken?: string;
         user?: AuthUser | null;
       }>('/api/auth/session', 'GET').catch(() => null);
-      if (fallbackSession && fallbackSession.ok && !isLoggingOutRef.current) {
+      if (
+        fallbackSession &&
+        fallbackSession.ok &&
+        syncEpoch === sessionEpochRef.current &&
+        !isLoggingOutRef.current
+      ) {
         setUser(fallbackSession.data.authenticated ? (fallbackSession.data.user ?? null) : null);
       }
     } finally {
@@ -348,6 +359,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!forceRefresh && csrfTokenRef.current) {
         return csrfTokenRef.current;
       }
+      const csrfEpoch = sessionEpochRef.current;
       try {
         const res = await fetchApi(normalizeApiPath('/api/auth/session'), {
           credentials: 'include',
@@ -365,7 +377,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           if (typeof data.csrfToken === 'string' && data.csrfToken) {
             csrfTokenRef.current = data.csrfToken;
           }
-          if (!isLoggingOutRef.current) {
+          if (csrfEpoch === sessionEpochRef.current && !isLoggingOutRef.current) {
             setUser(data.authenticated ? (data.user ?? null) : null);
           }
         } else if (res.status === 404 || res.status === 405 || !isJson) {
@@ -458,6 +470,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             options.body
           );
           if (!clientlessResult.ok && clientlessResult.status === 401) {
+            sessionEpochRef.current += 1;
             setUser(null);
           }
           return clientlessResult;
@@ -480,6 +493,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           }
 
           if (effectiveStatus === 401) {
+            sessionEpochRef.current += 1;
             setUser(null);
           }
           const serverError = typeof payload.error === 'string' ? payload.error : null;
@@ -523,6 +537,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           options.body
         );
         if (clientlessResult.ok || clientlessResult.status !== 404) {
+          if (!clientlessResult.ok && clientlessResult.status === 401) {
+            sessionEpochRef.current += 1;
+            setUser(null);
+          }
           return clientlessResult;
         }
         return {
@@ -541,7 +559,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         method: 'POST',
         body: JSON.stringify({ email, password }),
       });
-      if (res.ok) setUser(res.data.user);
+      if (res.ok) {
+        sessionEpochRef.current += 1;
+        setUser(res.data.user);
+      }
       return res;
     },
     [requestApi]
@@ -588,6 +609,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         body: JSON.stringify({ token }),
       });
       if (res.ok && res.data.user) {
+        sessionEpochRef.current += 1;
         setUser(res.data.user);
       }
       return res;
@@ -610,7 +632,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         method: 'POST',
         body: JSON.stringify({ token, password }),
       });
-      if (res.ok) setUser(null);
+      if (res.ok) {
+        sessionEpochRef.current += 1;
+        setUser(null);
+      }
       return res;
     },
     [requestApi]
@@ -622,7 +647,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         method: 'PATCH',
         body: JSON.stringify({ fullName }),
       });
-      if (res.ok) setUser(res.data.user);
+      if (res.ok) {
+        sessionEpochRef.current += 1;
+        setUser(res.data.user);
+      }
       return res;
     },
     [requestApi]
@@ -637,7 +665,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           body: JSON.stringify({ password }),
         }
       );
-      if (res.ok) setUser(res.data.user);
+      if (res.ok) {
+        sessionEpochRef.current += 1;
+        setUser(res.data.user);
+      }
       return res;
     },
     [requestApi]
@@ -652,7 +683,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           body: JSON.stringify({ newPassword }),
         }
       );
-      if (res.ok) setUser(res.data.user);
+      if (res.ok) {
+        sessionEpochRef.current += 1;
+        setUser(res.data.user);
+      }
       return res;
     },
     [requestApi]
@@ -676,7 +710,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         method: 'POST',
         body: JSON.stringify({ email, password }),
       });
-      if (res.ok) setUser(res.data.user);
+      if (res.ok) {
+        sessionEpochRef.current += 1;
+        setUser(res.data.user);
+      }
       return res;
     },
     [requestApi]
@@ -742,6 +779,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const logout = useCallback(async (): Promise<ApiResult<{ message: string }>> => {
+    sessionEpochRef.current += 1;
     isLoggingOutRef.current = true;
     try {
       const res = await requestApi<{ message: string; csrfToken?: string }>('/api/auth/logout', {

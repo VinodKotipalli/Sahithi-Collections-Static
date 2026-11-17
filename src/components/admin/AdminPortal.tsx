@@ -36,6 +36,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { useAuth, type AuthUser } from '../../context/AuthContext';
 import { useStorefront } from '../../context/StorefrontContext';
 import { usePrefersReducedMotion } from '../../hooks/usePrefersReducedMotion';
+import { handleClientlessApiRequest } from '../../services/firebaseClientApi';
 import type {
   AdminAuditEntry,
   AdminOrder,
@@ -398,6 +399,7 @@ export function AdminPortal({
   }, [apiRequest, clearPrivateAdminState]);
 
   useEffect(() => {
+    if (isLoadingSession) return;
     void checkAdminSession();
     const handlePageShow = (event: PageTransitionEvent) => {
       if (event.persisted) {
@@ -406,7 +408,7 @@ export function AdminPortal({
     };
     window.addEventListener('pageshow', handlePageShow);
     return () => window.removeEventListener('pageshow', handlePageShow);
-  }, [checkAdminSession]);
+  }, [isLoadingSession, checkAdminSession]);
 
   // If global AuthContext session clears externally (e.g. 401 on an API call or sign-out), drop admin access
   const prevAuthUserRef = useRef<AuthUser | null>(authUser);
@@ -419,14 +421,15 @@ export function AdminPortal({
     }
   }, [authUser, isLoadingSession, gate, clearPrivateAdminState]);
 
-  // Synchronize URL between /admin/login and /admin/dashboard once auth resolves
+  // Synchronize URL between /admin/login and /admin/dashboard once auth and role checks finish
   useEffect(() => {
+    if (isLoadingSession || gate === 'checking') return;
     if (gate === 'unauthenticated' && adminSubPath !== '/login') {
       onNavigate('/admin/login', { replace: true });
     } else if (gate === 'authorized' && adminSubPath !== '/dashboard') {
       onNavigate('/admin/dashboard', { replace: true });
     }
-  }, [gate, adminSubPath, onNavigate]);
+  }, [isLoadingSession, gate, adminSubPath, onNavigate]);
 
   // Handle Firebase email action callbacks (?mode=verifyEmail|resetPassword&oobCode=...) at /admin/login
   useEffect(() => {
@@ -504,9 +507,15 @@ export function AdminPortal({
     setCatalogLoading(false);
 
     if (res.ok) {
-      setProducts(res.data.items);
-      setCatalogTotal(res.data.total);
-      setCatalogTotalPages(res.data.totalPages);
+      const items = Array.isArray(res.data.items) ? res.data.items : [];
+      const total = typeof res.data.total === 'number' ? res.data.total : items.length;
+      const totalPages =
+        typeof res.data.totalPages === 'number'
+          ? res.data.totalPages
+          : Math.max(1, Math.ceil(total / 10));
+      setProducts(items);
+      setCatalogTotal(total);
+      setCatalogTotalPages(totalPages);
     } else {
       showToast('err', res.error);
     }
@@ -766,11 +775,18 @@ export function AdminPortal({
 
   const handleDuplicate = async (product: AdminProduct) => {
     setBusyProductId(product.id);
+    const endpoint = `/api/admin/products/${encodeURIComponent(product.id)}/duplicate`;
     try {
-      const res = await apiRequest<{ product: AdminProduct }>(
-        `/api/admin/products/${product.id}/duplicate`,
-        { method: 'POST', body: JSON.stringify({}) }
-      );
+      let res = await apiRequest<{ product: AdminProduct }>(endpoint, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      if (
+        !res.ok &&
+        (res.status === 404 || res.status === 405 || res.code === 'API_ROUTE_NOT_FOUND')
+      ) {
+        res = await handleClientlessApiRequest<{ product: AdminProduct }>(endpoint, 'POST', {});
+      }
       if (!res.ok) {
         showToast('err', res.error);
         return;
@@ -784,22 +800,41 @@ export function AdminPortal({
 
   const handleTogglePublish = async (product: AdminProduct) => {
     setBusyProductId(product.id);
-    const endpoint =
-      product.status === 'published'
-        ? `/api/admin/products/${product.id}/unpublish`
-        : `/api/admin/products/${product.id}/publish`;
+    const nextStatus = product.status === 'published' ? 'draft' : 'published';
+    const actionSegment = product.status === 'published' ? 'unpublish' : 'publish';
+    const endpoint = `/api/admin/products/${encodeURIComponent(product.id)}/${actionSegment}`;
+    const payload = { expectedVersion: product.version };
     try {
-      const res = await apiRequest<{ product: AdminProduct }>(endpoint, {
+      let res = await apiRequest<{ product: AdminProduct }>(endpoint, {
         method: 'POST',
-        body: JSON.stringify({ expectedVersion: product.version }),
+        body: JSON.stringify(payload),
       });
+      if (
+        !res.ok &&
+        (res.status === 404 || res.status === 405 || res.code === 'API_ROUTE_NOT_FOUND')
+      ) {
+        res = await handleClientlessApiRequest<{ product: AdminProduct }>(
+          endpoint,
+          'POST',
+          payload
+        );
+      }
       if (!res.ok) {
         showToast('err', res.error);
         return;
       }
+      const updatedProduct = res.data.product;
+      if (updatedProduct) {
+        setProducts((prev) => {
+          if (statusFilter !== 'all' && statusFilter !== updatedProduct.status) {
+            return prev.filter((p) => p.id !== product.id);
+          }
+          return prev.map((p) => (p.id === product.id ? updatedProduct : p));
+        });
+      }
       showToast(
         'ok',
-        product.status === 'published'
+        nextStatus === 'draft'
           ? `Unpublished "${product.name}" to draft.`
           : `Published "${product.name}" live on the storefront.`
       );
@@ -811,22 +846,41 @@ export function AdminPortal({
 
   const handleArchiveToggle = async (product: AdminProduct) => {
     setBusyProductId(product.id);
-    const endpoint =
-      product.status === 'archived'
-        ? `/api/admin/products/${product.id}/restore`
-        : `/api/admin/products/${product.id}/archive`;
+    const nextStatus = product.status === 'archived' ? 'draft' : 'archived';
+    const actionSegment = product.status === 'archived' ? 'restore' : 'archive';
+    const endpoint = `/api/admin/products/${encodeURIComponent(product.id)}/${actionSegment}`;
+    const payload = { expectedVersion: product.version };
     try {
-      const res = await apiRequest<{ product: AdminProduct }>(endpoint, {
+      let res = await apiRequest<{ product: AdminProduct }>(endpoint, {
         method: 'POST',
-        body: JSON.stringify({ expectedVersion: product.version }),
+        body: JSON.stringify(payload),
       });
+      if (
+        !res.ok &&
+        (res.status === 404 || res.status === 405 || res.code === 'API_ROUTE_NOT_FOUND')
+      ) {
+        res = await handleClientlessApiRequest<{ product: AdminProduct }>(
+          endpoint,
+          'POST',
+          payload
+        );
+      }
       if (!res.ok) {
         showToast('err', res.error);
         return;
       }
+      const updatedProduct = res.data.product;
+      if (updatedProduct) {
+        setProducts((prev) => {
+          if (statusFilter !== 'all' && statusFilter !== updatedProduct.status) {
+            return prev.filter((p) => p.id !== product.id);
+          }
+          return prev.map((p) => (p.id === product.id ? updatedProduct : p));
+        });
+      }
       showToast(
         'ok',
-        product.status === 'archived'
+        nextStatus === 'draft'
           ? `Restored "${product.name}" to draft.`
           : `Archived "${product.name}" from the storefront.`
       );
@@ -846,14 +900,16 @@ export function AdminPortal({
         message?: string;
         deleted?: boolean;
         archivedInsteadOfDeleted?: boolean;
-      }>(`/api/admin/products/${target.id}`, {
+      }>(`/api/admin/products/${encodeURIComponent(target.id)}`, {
         method: 'DELETE',
       });
       if (!res.ok) {
         showToast('err', res.error);
         return;
       }
-      setProducts((prev) => prev.filter((p) => p.id !== target.id));
+      if (!res.data.archivedInsteadOfDeleted || statusFilter !== 'archived') {
+        setProducts((prev) => prev.filter((p) => p.id !== target.id));
+      }
       const outcomeMsg =
         res.data.message ||
         (res.data.archivedInsteadOfDeleted
@@ -867,7 +923,9 @@ export function AdminPortal({
   };
 
   const handleReloadEditingProduct = async (productId: string) => {
-    const res = await apiRequest<{ product: AdminProduct }>(`/api/admin/products/${productId}`);
+    const res = await apiRequest<{ product: AdminProduct }>(
+      `/api/admin/products/${encodeURIComponent(productId)}`
+    );
     if (res.ok) {
       setEditingProduct(res.data.product);
       showToast('ok', 'Reloaded latest product state.');
@@ -881,7 +939,7 @@ export function AdminPortal({
     status: string
   ): Promise<{ ok: boolean; error?: string }> => {
     const res = await apiRequest<{ id: string; status: string }>(
-      `/api/admin/orders/${orderId}/status`,
+      `/api/admin/orders/${encodeURIComponent(orderId)}/status`,
       {
         method: 'PATCH',
         body: JSON.stringify({ status }),
@@ -949,7 +1007,7 @@ export function AdminPortal({
     executeNavAction(action);
   };
 
-  if (gate === 'checking') {
+  if (isLoadingSession || gate === 'checking') {
     return (
       <div className="flex min-h-screen items-center justify-center bg-[#FFF9F5] p-6">
         <div className="flex items-center gap-3 rounded-2xl border border-[#49243E]/12 bg-white px-6 py-4 text-sm font-medium text-[#49243E] shadow-sm">

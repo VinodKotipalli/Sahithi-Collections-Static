@@ -1806,4 +1806,42 @@ test('Edit Product and Delete Product: preserves existing URL on title edit, syn
   );
   assert.equal(orderDeletedRes.res.status, 409);
   assert.equal(orderDeletedRes.json.code, 'PRODUCT_UNAVAILABLE');
+
+  // Verify unpublishing and re-publishing starter product sc-101 (Floral Cotton Kurti)
+  const unpubSc101 = await jsonReq(
+    ownerJar,
+    'POST',
+    '/api/admin/products/sc-101/unpublish',
+    { expectedVersion: 999 }, // Even with stale expectedVersion, single-click transition succeeds
+    ownerCsrf
+  );
+  assert.equal(unpubSc101.res.status, 200);
+  const unpubProd = unpubSc101.json.product as { id: string; status: string; sku: string };
+  assert.equal(unpubProd.id, 'sc-101');
+  assert.equal(unpubProd.status, 'draft');
+
+  // Verify sc-101 is hidden from public storefront while unpublished
+  const pubAfterUnpub = (await (await fetch(`${baseUrl}/api/products`)).json()) as {
+    items: Array<{ id: string }>;
+  };
+  assert.ok(!pubAfterUnpub.items.some((p) => p.id === 'sc-101'));
+
+  // Re-publish sc-101
+  const repubSc101 = await jsonReq(
+    ownerJar,
+    'POST',
+    '/api/admin/products/sc-101/publish',
+    {},
+    ownerCsrf
+  );
+  assert.equal(repubSc101.res.status, 200);
+  const repubProd = repubSc101.json.product as { id: string; status: string };
+  assert.equal(repubProd.id, 'sc-101');
+  assert.equal(repubProd.status, 'published');
+
+  // Verify sc-101 is visible again on public storefront
+  const pubAfterRepub = (await (await fetch(`${baseUrl}/api/products`)).json()) as {
+    items: Array<{ id: string }>;
+  };
+  assert.ok(pubAfterRepub.items.some((p) => p.id === 'sc-101'));
 });

@@ -19,6 +19,8 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const CLIENT_SESSION_STORAGE_KEY = 'sahithi_fb_client_session_v1';
 const CLIENT_PENDING_VERIFY_KEY = 'sahithi_fb_pending_verify_v1';
 
+const SESSION_LOOKUP_TTL_MS = 15 * 1000;
+
 interface ClientFirebaseSession {
   idToken: string;
   refreshToken: string;
@@ -29,6 +31,7 @@ interface ClientFirebaseSession {
   lastReauthAt: number;
   issuedAt: number;
   expiresAtMs: number;
+  lastVerifiedAt?: number;
   csrfToken: string;
 }
 
@@ -94,6 +97,7 @@ function randomHex(bytes = 16): string {
 }
 
 let memorySession: ClientFirebaseSession | null = null;
+let inFlightSessionPromise: Promise<ClientFirebaseSession | null> | null = null;
 const memoryPendingVerify = new Map<string, PendingVerifyRecord>();
 
 function loadStoredSession(): ClientFirebaseSession | null {
@@ -122,6 +126,7 @@ function loadStoredSession(): ClientFirebaseSession | null {
         lastReauthAt: Number(parsed.lastReauthAt || Date.now()),
         issuedAt: Number(parsed.issuedAt || Date.now()),
         expiresAtMs: Number(parsed.expiresAtMs || Date.now() + 3600_000),
+        lastVerifiedAt: Number(parsed.lastVerifiedAt || 0) || undefined,
         csrfToken: parsed.csrfToken || randomHex(16),
       };
       return memorySession;
@@ -134,6 +139,7 @@ function loadStoredSession(): ClientFirebaseSession | null {
 
 function saveStoredSession(session: ClientFirebaseSession | null): void {
   memorySession = session;
+  inFlightSessionPromise = null;
   if (typeof window === 'undefined') return;
   try {
     if (!session) {
@@ -151,6 +157,12 @@ function saveStoredSession(session: ClientFirebaseSession | null): void {
 
 export function clearClientFirebaseSession(): void {
   saveStoredSession(null);
+}
+
+export function invalidateClientSessionVerificationCache(): void {
+  if (memorySession) {
+    memorySession = { ...memorySession, lastVerifiedAt: 0 };
+  }
 }
 
 function getPendingVerify(email: string): PendingVerifyRecord | null {
@@ -277,11 +289,18 @@ export function extractOobCodeClient(input: string): string {
 class ClientFirebaseError extends Error {
   readonly httpStatus: number;
   readonly code: string;
+  readonly fieldErrors?: Record<string, string>;
 
-  constructor(httpStatus: number, code: string, message: string) {
+  constructor(
+    httpStatus: number,
+    code: string,
+    message: string,
+    fieldErrors?: Record<string, string>
+  ) {
     super(message);
     this.httpStatus = httpStatus;
     this.code = code;
+    this.fieldErrors = fieldErrors;
   }
 }
 
@@ -409,6 +428,90 @@ async function sendOobEmailWithFallback(params: {
   await callIdentityToolkit('accounts:sendOobCode', basePayload);
 }
 
+type AccountLookupResult =
+  | {
+      status: 'ok';
+      account: {
+        uid: string;
+        email: string;
+        emailVerified: boolean;
+        displayName: string;
+        expiresAtMs: number;
+      };
+    }
+  | { status: 'invalid' }
+  | { status: 'transient_error' };
+
+type TokenRefreshResult =
+  | {
+      status: 'ok';
+      tokens: {
+        idToken: string;
+        refreshToken: string;
+        expiresAtMs: number;
+      };
+    }
+  | { status: 'invalid' }
+  | { status: 'transient_error' };
+
+async function lookupFirebaseAccountDetailed(idToken: string): Promise<AccountLookupResult> {
+  try {
+    const url = `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(
+      FIREBASE_CONFIG.apiKey
+    )}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken }),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      error?: { message?: string };
+      users?: Array<{
+        localId?: string;
+        email?: string;
+        emailVerified?: boolean;
+        displayName?: string;
+      }>;
+    };
+
+    if (!res.ok || data.error) {
+      const errCode = (data.error?.message || '').split(' : ')[0].trim();
+      if (
+        errCode === 'INVALID_ID_TOKEN' ||
+        errCode === 'TOKEN_EXPIRED' ||
+        errCode === 'USER_NOT_FOUND' ||
+        errCode === 'USER_DISABLED'
+      ) {
+        return { status: 'invalid' };
+      }
+      if (res.status === 429 || res.status >= 500) {
+        return { status: 'transient_error' };
+      }
+      if (res.status === 400 || res.status === 401 || res.status === 403) {
+        return { status: 'invalid' };
+      }
+      return { status: 'transient_error' };
+    }
+
+    const account = data.users?.[0];
+    if (!account || !account.localId) return { status: 'invalid' };
+    const jwt = decodeJwtPayload(idToken);
+    const expSec = Number(jwt?.exp || 0);
+    return {
+      status: 'ok',
+      account: {
+        uid: account.localId,
+        email: (account.email || '').toLowerCase(),
+        emailVerified: Boolean(account.emailVerified),
+        displayName: account.displayName || '',
+        expiresAtMs: expSec > 0 ? expSec * 1000 : Date.now() + 3600_000,
+      },
+    };
+  } catch {
+    return { status: 'transient_error' };
+  }
+}
+
 async function lookupFirebaseAccount(idToken: string): Promise<{
   uid: string;
   email: string;
@@ -416,36 +519,11 @@ async function lookupFirebaseAccount(idToken: string): Promise<{
   displayName: string;
   expiresAtMs: number;
 } | null> {
-  try {
-    const data = await callIdentityToolkit<{
-      users?: Array<{
-        localId?: string;
-        email?: string;
-        emailVerified?: boolean;
-        displayName?: string;
-      }>;
-    }>('accounts:lookup', { idToken });
-    const account = data.users?.[0];
-    if (!account || !account.localId) return null;
-    const jwt = decodeJwtPayload(idToken);
-    const expSec = Number(jwt?.exp || 0);
-    return {
-      uid: account.localId,
-      email: (account.email || '').toLowerCase(),
-      emailVerified: Boolean(account.emailVerified),
-      displayName: account.displayName || '',
-      expiresAtMs: expSec > 0 ? expSec * 1000 : Date.now() + 3600_000,
-    };
-  } catch {
-    return null;
-  }
+  const result = await lookupFirebaseAccountDetailed(idToken);
+  return result.status === 'ok' ? result.account : null;
 }
 
-async function refreshClientIdToken(refreshToken: string): Promise<{
-  idToken: string;
-  refreshToken: string;
-  expiresAtMs: number;
-} | null> {
+async function refreshClientIdTokenDetailed(refreshToken: string): Promise<TokenRefreshResult> {
   try {
     const url = `https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(
       FIREBASE_CONFIG.apiKey
@@ -458,58 +536,118 @@ async function refreshClientIdToken(refreshToken: string): Promise<{
         refresh_token: refreshToken,
       }).toString(),
     });
-    if (!res.ok) return null;
-    const data = (await res.json()) as {
+    const data = (await res.json().catch(() => ({}))) as {
+      error?: { message?: string };
       id_token?: string;
       refresh_token?: string;
       expires_in?: string;
     };
-    if (!data.id_token) return null;
+    if (!res.ok) {
+      const errMsg = String(data.error?.message || '').toUpperCase();
+      if (
+        errMsg.includes('INVALID_REFRESH_TOKEN') ||
+        errMsg.includes('TOKEN_EXPIRED') ||
+        errMsg.includes('USER_DISABLED') ||
+        errMsg.includes('USER_NOT_FOUND') ||
+        res.status === 400 ||
+        res.status === 401 ||
+        res.status === 403
+      ) {
+        return { status: 'invalid' };
+      }
+      return { status: 'transient_error' };
+    }
+    if (!data.id_token) return { status: 'invalid' };
+    const jwt = decodeJwtPayload(data.id_token);
+    const expSec = Number(jwt?.exp || 0);
     return {
-      idToken: data.id_token,
-      refreshToken: data.refresh_token || refreshToken,
-      expiresAtMs: Date.now() + Number(data.expires_in || 3600) * 1000,
+      status: 'ok',
+      tokens: {
+        idToken: data.id_token,
+        refreshToken: data.refresh_token || refreshToken,
+        expiresAtMs:
+          expSec > 0 ? expSec * 1000 : Date.now() + Number(data.expires_in || 3600) * 1000,
+      },
     };
   } catch {
-    return null;
+    return { status: 'transient_error' };
   }
 }
 
-async function getValidClientSession(): Promise<ClientFirebaseSession | null> {
+async function resolveValidClientSession(): Promise<ClientFirebaseSession | null> {
   const session = loadStoredSession();
   if (!session) return null;
 
   let active = session;
-  if (Date.now() > active.expiresAtMs - 60_000) {
-    const refreshed = await refreshClientIdToken(active.refreshToken);
-    if (!refreshed) {
+  const now = Date.now();
+  let forceLookup = false;
+
+  if (now > active.expiresAtMs - 60_000) {
+    const refreshed = await refreshClientIdTokenDetailed(active.refreshToken);
+    if (refreshed.status === 'invalid') {
       clearClientFirebaseSession();
       return null;
     }
+    if (refreshed.status === 'transient_error') {
+      return active.emailVerified && now < active.expiresAtMs - 5_000 ? active : null;
+    }
     active = {
       ...active,
-      idToken: refreshed.idToken,
-      refreshToken: refreshed.refreshToken,
-      expiresAtMs: refreshed.expiresAtMs,
+      idToken: refreshed.tokens.idToken,
+      refreshToken: refreshed.tokens.refreshToken,
+      expiresAtMs: refreshed.tokens.expiresAtMs,
+      lastVerifiedAt: undefined,
     };
     saveStoredSession(active);
+    forceLookup = true;
   }
 
-  const verified = await lookupFirebaseAccount(active.idToken);
-  if (!verified || !verified.emailVerified) {
+  if (
+    !forceLookup &&
+    active.emailVerified &&
+    active.lastVerifiedAt &&
+    now - active.lastVerifiedAt < SESSION_LOOKUP_TTL_MS &&
+    now < active.expiresAtMs - 60_000
+  ) {
+    return active;
+  }
+
+  const lookup = await lookupFirebaseAccountDetailed(active.idToken);
+  if (lookup.status === 'invalid') {
+    clearClientFirebaseSession();
+    return null;
+  }
+  if (lookup.status === 'transient_error') {
+    return active.emailVerified && now < active.expiresAtMs - 5_000 ? active : null;
+  }
+  if (!lookup.account.emailVerified) {
     clearClientFirebaseSession();
     return null;
   }
 
   active = {
     ...active,
-    email: verified.email,
-    emailVerified: verified.emailVerified,
-    fullName: verified.displayName || active.fullName,
-    expiresAtMs: verified.expiresAtMs,
+    email: lookup.account.email,
+    emailVerified: lookup.account.emailVerified,
+    fullName: lookup.account.displayName || active.fullName,
+    expiresAtMs: lookup.account.expiresAtMs,
+    lastVerifiedAt: Date.now(),
   };
   saveStoredSession(active);
   return active;
+}
+
+async function getValidClientSession(): Promise<ClientFirebaseSession | null> {
+  if (inFlightSessionPromise) {
+    return inFlightSessionPromise;
+  }
+  const promise = resolveValidClientSession().finally(() => {
+    if (inFlightSessionPromise === promise) {
+      inFlightSessionPromise = null;
+    }
+  });
+  inFlightSessionPromise = promise;
+  return promise;
 }
 
 function buildPublicAuthUser(session: ClientFirebaseSession): AuthUser {
@@ -556,12 +694,48 @@ async function firestoreGetDoc<T>(
   return docToRecord<T>(doc);
 }
 
+async function parseFirestoreHttpError(
+  res: Response,
+  fallbackMessage: string
+): Promise<ClientFirebaseError> {
+  const payload = (await res.json().catch(() => ({}))) as {
+    error?: { code?: number; message?: string; status?: string };
+  };
+  const fsStatus = String(payload.error?.status || '').toUpperCase();
+  const fsMessage = payload.error?.message || fallbackMessage;
+  if (res.status === 401 || fsStatus === 'UNAUTHENTICATED') {
+    return new ClientFirebaseError(
+      401,
+      'ADMIN_AUTH_REQUIRED',
+      'Your authentication session expired. Please sign in again.'
+    );
+  }
+  if (res.status === 403 || fsStatus === 'PERMISSION_DENIED') {
+    return new ClientFirebaseError(
+      403,
+      'FIRESTORE_PERMISSION_DENIED',
+      `Permission denied while writing to Firestore: ${fsMessage}`
+    );
+  }
+  if (res.status === 400 || fsStatus === 'INVALID_ARGUMENT') {
+    return new ClientFirebaseError(
+      400,
+      'VALIDATION_ERROR',
+      `Invalid Firestore payload: ${fsMessage}`
+    );
+  }
+  if (res.status === 409 || fsStatus === 'ABORTED' || fsStatus === 'FAILED_PRECONDITION') {
+    return new ClientFirebaseError(409, 'FIRESTORE_CONFLICT', fsMessage);
+  }
+  return new ClientFirebaseError(res.status || 502, fsStatus || 'FIRESTORE_ERROR', fsMessage);
+}
+
 async function firestoreSetDoc(
   collectionName: string,
   docId: string,
   data: Record<string, unknown>,
   idToken?: string
-): Promise<boolean> {
+): Promise<void> {
   const url = `${firestoreBaseUrl()}/${collectionName}/${encodeURIComponent(docId)}`;
   const fields: Record<string, FirestoreFieldValue> = {};
   for (const [k, v] of Object.entries(data)) {
@@ -574,19 +748,29 @@ async function firestoreSetDoc(
     headers,
     body: JSON.stringify({ fields }),
   });
-  return res.ok;
+  if (!res.ok) {
+    throw await parseFirestoreHttpError(
+      res,
+      `Failed to save ${collectionName}/${docId} (HTTP ${res.status}).`
+    );
+  }
 }
 
 async function firestoreDeleteDoc(
   collectionName: string,
   docId: string,
   idToken?: string
-): Promise<boolean> {
+): Promise<void> {
   const url = `${firestoreBaseUrl()}/${collectionName}/${encodeURIComponent(docId)}`;
   const headers: Record<string, string> = {};
   if (idToken) headers.Authorization = `Bearer ${idToken}`;
   const res = await fetch(url, { method: 'DELETE', headers });
-  return res.ok || res.status === 404;
+  if (!res.ok && res.status !== 404) {
+    throw await parseFirestoreHttpError(
+      res,
+      `Failed to delete ${collectionName}/${docId} (HTTP ${res.status}).`
+    );
+  }
 }
 
 async function firestoreListDocs<T>(
@@ -653,6 +837,36 @@ interface StoredProductDoc {
   image_urls?: string[];
 }
 
+const SEED_SKU_BY_ID: Record<string, string> = {
+  'sc-001': 'SC-DRS-001',
+  'sc-002': 'SC-ETH-002',
+  'sc-003': 'SC-WST-003',
+  'sc-004': 'SC-DRS-004',
+  'sc-005': 'SC-FST-005',
+  'sc-006': 'SC-FST-006',
+  'sc-007': 'SC-ETH-007',
+  'sc-008': 'SC-DRS-008',
+  'sc-009': 'SC-WST-009',
+  'sc-010': 'SC-FST-010',
+  'sc-011': 'SC-ACC-011',
+  'sc-012': 'SC-ACC-012',
+  'sc-101': 'SC-KRT-101',
+  'sc-102': 'SC-KRT-102',
+  'sc-103': 'SC-KRT-103',
+  'sc-104': 'SC-KRT-104',
+  'sc-105': 'SC-KST-105',
+  'sc-106': 'SC-KST-106',
+  'sc-107': 'SC-KST-107',
+  'sc-108': 'SC-SAR-108',
+  'sc-109': 'SC-SAR-109',
+  'sc-110': 'SC-SAR-110',
+  'sc-111': 'SC-SAR-111',
+  'sc-112': 'SC-CRD-112',
+  'sc-113': 'SC-CRD-113',
+  'sc-114': 'SC-DUP-114',
+  'sc-115': 'SC-DUP-115',
+};
+
 function buildSeedProductsDocs(): StoredProductDoc[] {
   return PRODUCTS.map((item) => {
     const ts = new Date(`${item.dateAdded}T10:00:00Z`).getTime() || Date.now();
@@ -662,7 +876,11 @@ function buildSeedProductsDocs(): StoredProductDoc[] {
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-|-$/g, '');
-    const sku = `SC-${item.id.toUpperCase()}`;
+    const sku =
+      SEED_SKU_BY_ID[item.id] ||
+      (item.id.toLowerCase().startsWith('sc-')
+        ? `SC-${item.id.slice(3).toUpperCase()}`
+        : `SC-${item.id.toUpperCase()}`);
     const pricePaise = item.pricePaise ?? Math.round(item.price * 100);
     const compareAtPaise =
       item.compareAtPaise ??
@@ -736,7 +954,233 @@ function buildSeedProductsDocs(): StoredProductDoc[] {
   });
 }
 
+function sanitizeProductDocForFirestore(
+  raw: StoredProductDoc,
+  productId: string
+): StoredProductDoc {
+  const now = Date.now();
+  const safeId = String(productId || raw.id || `prod_${now.toString(36)}`).trim();
+  const safeTitle = String(raw.title || 'Sahithi Piece').trim().slice(0, 160);
+  const safeTitlePadded = safeTitle.length >= 2 ? safeTitle : `${safeTitle} Piece`;
+  const rawSlug = String(raw.slug || safeTitlePadded)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 140);
+  const safeSlug = rawSlug.length >= 1 ? rawSlug : safeId.toLowerCase().slice(0, 140);
+  const rawSku = String(
+    SEED_SKU_BY_ID[safeId] && (!raw.sku || raw.sku.toUpperCase() === `SC-${safeId.toUpperCase()}`)
+      ? SEED_SKU_BY_ID[safeId]
+      : raw.sku || `SC-${safeId.toUpperCase()}`
+  )
+    .trim()
+    .toUpperCase()
+    .slice(0, 64);
+  const safeSku = rawSku.length >= 1 ? rawSku : `SC-${safeId.toUpperCase()}`.slice(0, 64);
+  const safeCategory = String(raw.category || 'Kurtis').trim().slice(0, 80) || 'Kurtis';
+  const safeDescription = String(raw.description || '').slice(0, 5000);
+  const safeFabricNote = String(raw.fabric_note || '').slice(0, 500);
+  const safePricePaise = Math.max(
+    100,
+    Math.min(100_000_000, Math.round(Number(raw.price_paise) || 69900))
+  );
+  const rawCompare =
+    raw.compare_at_paise !== null && raw.compare_at_paise !== undefined
+      ? Math.round(Number(raw.compare_at_paise))
+      : null;
+  const safeCompareAtPaise =
+    rawCompare !== null && Number.isFinite(rawCompare) && rawCompare >= 100
+      ? Math.max(safePricePaise, Math.min(100_000_000, rawCompare))
+      : null;
+
+  const rawVariants = Array.isArray(raw.variants) ? raw.variants.slice(0, 100) : [];
+  const safeVariants: NonNullable<StoredProductDoc['variants']> =
+    rawVariants.length > 0
+      ? rawVariants.map((v, idx) => {
+          const vPrice = Math.max(
+            100,
+            Math.min(100_000_000, Math.round(Number(v.price_paise) || safePricePaise))
+          );
+          const vCompareRaw =
+            v.compare_at_paise !== null && v.compare_at_paise !== undefined
+              ? Math.round(Number(v.compare_at_paise))
+              : null;
+          const vCompare =
+            vCompareRaw !== null && Number.isFinite(vCompareRaw) && vCompareRaw >= 100
+              ? Math.max(vPrice, Math.min(100_000_000, vCompareRaw))
+              : null;
+          return {
+            id: String(v.id || `${safeId}-var-${idx + 1}`),
+            product_id: safeId,
+            sku: String(v.sku || `${safeSku}-V${idx + 1}`).toUpperCase().slice(0, 64),
+            size: String(v.size || 'Free Size').slice(0, 40),
+            color_name: String(v.color_name || 'Signature').slice(0, 60),
+            color_hex: String(v.color_hex || '#49243E').slice(0, 16),
+            price_paise: vPrice,
+            compare_at_paise: vCompare,
+            stock_qty: Math.max(
+              0,
+              Math.min(1_000_000, Math.round(Number(v.stock_qty ?? 0) || 0))
+            ),
+            position: idx,
+          };
+        })
+      : [
+          {
+            id: `${safeId}-var-1`,
+            product_id: safeId,
+            sku: `${safeSku}-STD-1`.slice(0, 64),
+            size: 'Free Size',
+            color_name: 'Signature',
+            color_hex: '#49243E',
+            price_paise: safePricePaise,
+            compare_at_paise: safeCompareAtPaise,
+            stock_qty: Math.max(
+              0,
+              Math.min(1_000_000, Math.round(Number(raw.stock_qty ?? 1) || 0))
+            ),
+            position: 0,
+          },
+        ];
+
+  const safeStockQty = Math.max(
+    0,
+    Math.min(
+      1_000_000,
+      safeVariants.reduce((sum, v) => sum + v.stock_qty, 0)
+    )
+  );
+  const safeLowStock = Math.max(
+    0,
+    Math.min(10_000, Math.round(Number(raw.low_stock_threshold ?? 5) || 0))
+  );
+  const safeStatus: 'draft' | 'published' | 'archived' =
+    raw.status === 'draft' || raw.status === 'archived' ? raw.status : 'published';
+  const safeCreatedAt = Number(raw.created_at) > 0 ? Math.round(Number(raw.created_at)) : now;
+  const safeUpdatedAt = Number(raw.updated_at) > 0 ? Math.round(Number(raw.updated_at)) : now;
+  const safePublishedAt =
+    raw.published_at !== null && raw.published_at !== undefined && Number(raw.published_at) > 0
+      ? Math.round(Number(raw.published_at))
+      : safeStatus === 'published'
+        ? safeCreatedAt
+        : null;
+  const safeArchivedAt =
+    safeStatus === 'archived'
+      ? raw.archived_at !== null && raw.archived_at !== undefined && Number(raw.archived_at) > 0
+        ? Math.round(Number(raw.archived_at))
+        : now
+      : null;
+
+  const rawImages = Array.isArray(raw.images) ? raw.images.slice(0, 20) : [];
+  const safeImages: NonNullable<StoredProductDoc['images']> = rawImages.map((img, idx) => ({
+    id: String(img.id || `${safeId}-img-${idx + 1}`),
+    product_id: safeId,
+    media_id: typeof img.media_id === 'string' ? img.media_id : null,
+    url: String(img.url || ''),
+    alt_text: String(img.alt_text || safeTitlePadded).slice(0, 240),
+    is_cover: Boolean(img.is_cover ?? idx === 0),
+    position: idx,
+    created_at: Number(img.created_at) > 0 ? Math.round(Number(img.created_at)) : safeCreatedAt,
+  }));
+
+  const safeColorsJson = String(raw.colors_json || '[]').slice(0, 10_000);
+  const safeSizesJson = String(raw.sizes_json || '[]').slice(0, 5_000);
+  const safeVersion = Math.max(1, Math.round(Number(raw.version || 1)));
+
+  return {
+    id: safeId,
+    slug: safeSlug,
+    title: safeTitlePadded,
+    description: safeDescription,
+    fabric_note: safeFabricNote,
+    category: safeCategory,
+    sku: safeSku,
+    price_paise: safePricePaise,
+    compare_at_paise: safeCompareAtPaise,
+    stock_qty: safeStockQty,
+    low_stock_threshold: safeLowStock,
+    featured: Boolean(raw.featured),
+    status: safeStatus,
+    colors_json: safeColorsJson,
+    sizes_json: safeSizesJson,
+    version: safeVersion,
+    published_at: safePublishedAt,
+    archived_at: safeArchivedAt,
+    created_at: safeCreatedAt,
+    updated_at: safeUpdatedAt,
+    variants: safeVariants,
+    images: safeImages,
+    variant_skus: safeVariants.map((v) => v.sku).slice(0, 100),
+    image_urls: safeImages.map((i) => i.url).slice(0, 20),
+  };
+}
+
 const CLIENT_VISIBILITY_STORAGE_KEY = 'sahithi_catalog_visibility_v1';
+const CLIENT_PRODUCT_OVERRIDES_KEY = 'sahithi_catalog_product_overrides_v1';
+const memoryProductOverrides = new Map<string, StoredProductDoc>();
+
+function loadClientProductOverrides(): Map<string, StoredProductDoc> {
+  const merged = new Map<string, StoredProductDoc>(memoryProductOverrides);
+  if (typeof window !== 'undefined') {
+    try {
+      const raw = window.localStorage.getItem(CLIENT_PRODUCT_OVERRIDES_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Record<string, StoredProductDoc>;
+        if (parsed && typeof parsed === 'object') {
+          for (const [id, doc] of Object.entries(parsed)) {
+            if (doc && typeof doc === 'object' && doc.id) {
+              merged.set(id, sanitizeProductDocForFirestore(doc, id));
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore storage read errors
+    }
+  }
+  return merged;
+}
+
+function saveClientProductOverride(doc: StoredProductDoc): void {
+  const sanitized = sanitizeProductDocForFirestore(doc, doc.id);
+  memoryProductOverrides.set(sanitized.id, sanitized);
+  if (typeof window !== 'undefined') {
+    try {
+      const current = loadClientProductOverrides();
+      current.set(sanitized.id, sanitized);
+      const serializedObj: Record<string, StoredProductDoc> = {};
+      for (const [k, v] of current.entries()) {
+        serializedObj[k] = v;
+      }
+      window.localStorage.setItem(
+        CLIENT_PRODUCT_OVERRIDES_KEY,
+        JSON.stringify(serializedObj)
+      );
+    } catch {
+      // Ignore storage quota errors
+    }
+  }
+}
+
+function removeClientProductOverride(productId: string): void {
+  memoryProductOverrides.delete(productId);
+  if (typeof window !== 'undefined') {
+    try {
+      const current = loadClientProductOverrides();
+      current.delete(productId);
+      const serializedObj: Record<string, StoredProductDoc> = {};
+      for (const [k, v] of current.entries()) {
+        serializedObj[k] = v;
+      }
+      window.localStorage.setItem(
+        CLIENT_PRODUCT_OVERRIDES_KEY,
+        JSON.stringify(serializedObj)
+      );
+    } catch {
+      // Ignore storage errors
+    }
+  }
+}
 
 interface ClientCatalogVisibilityMeta {
   hiddenIds: Set<string>;
@@ -797,22 +1241,7 @@ async function saveClientCatalogVisibilityMeta(
   meta: ClientCatalogVisibilityMeta,
   idToken?: string
 ): Promise<void> {
-  if (typeof window !== 'undefined') {
-    try {
-      window.localStorage.setItem(
-        CLIENT_VISIBILITY_STORAGE_KEY,
-        JSON.stringify({
-          hiddenIds: Array.from(meta.hiddenIds),
-          hiddenSlugs: Array.from(meta.hiddenSlugs),
-          deletedIds: Array.from(meta.deletedIds),
-        })
-      );
-    } catch {
-      // Ignore storage write errors
-    }
-  }
-  if (!idToken) return;
-  try {
+  if (idToken) {
     const existing = await firestoreGetDoc<Record<string, unknown>>(
       'site_documents',
       'settings',
@@ -831,8 +1260,20 @@ async function saveClientCatalogVisibilityMeta(
       },
       idToken
     );
-  } catch {
-    // Ignore non-fatal write errors
+  }
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.setItem(
+        CLIENT_VISIBILITY_STORAGE_KEY,
+        JSON.stringify({
+          hiddenIds: Array.from(meta.hiddenIds),
+          hiddenSlugs: Array.from(meta.hiddenSlugs),
+          deletedIds: Array.from(meta.deletedIds),
+        })
+      );
+    } catch {
+      // Ignore storage write errors
+    }
   }
 }
 
@@ -862,7 +1303,7 @@ async function firestoreListPublishedProducts(): Promise<StoredProductDoc[]> {
         const parsed = docToRecord<StoredProductDoc>(row.document);
         if (parsed) results.push(parsed);
       }
-      if (results.length > 0) return results;
+      return results;
     }
   } catch {
     // Fallback to standard list below
@@ -877,27 +1318,493 @@ async function getMergedProductDocs(idToken?: string): Promise<StoredProductDoc[
       : firestoreListPublishedProducts(),
     getClientCatalogVisibilityMeta(idToken),
   ]);
-  const filteredRemote = remoteDocs.filter((d) => !meta.deletedIds.has(d.id));
-  const seenIds = new Set(filteredRemote.map((d) => d.id));
-  const seenSlugs = new Set(filteredRemote.map((d) => d.slug));
-  const merged = [...filteredRemote];
+  const overrides = loadClientProductOverrides();
+
+  const byId = new Map<string, StoredProductDoc>();
+  for (const raw of remoteDocs) {
+    if (!raw || !raw.id || meta.deletedIds.has(raw.id)) continue;
+    const clean = sanitizeProductDocForFirestore(raw, raw.id);
+    if (meta.hiddenIds.has(clean.id) && clean.status === 'published') {
+      clean.status = 'draft';
+    }
+    byId.set(clean.id, clean);
+  }
+
+  for (const [ovId, ovDoc] of overrides.entries()) {
+    if (meta.deletedIds.has(ovId)) continue;
+    const existing = byId.get(ovId);
+    if (!existing || Number(ovDoc.updated_at || 0) >= Number(existing.updated_at || 0)) {
+      const nextDoc = { ...ovDoc };
+      if (meta.hiddenIds.has(nextDoc.id) && nextDoc.status === 'published') {
+        nextDoc.status = 'draft';
+      }
+      byId.set(ovId, nextDoc);
+    }
+  }
+
+  const seenIds = new Set(byId.keys());
+  const seenSlugs = new Set(Array.from(byId.values()).map((d) => d.slug));
+
   for (const seed of buildSeedProductsDocs()) {
     if (meta.deletedIds.has(seed.id)) continue;
-    if (!idToken && (meta.hiddenIds.has(seed.id) || meta.hiddenSlugs.has(seed.slug))) {
-      continue;
-    }
     if (!seenIds.has(seed.id) && !seenSlugs.has(seed.slug)) {
-      if (idToken && meta.hiddenIds.has(seed.id)) {
-        merged.push({ ...seed, status: 'draft' });
+      if (meta.hiddenIds.has(seed.id) || meta.hiddenSlugs.has(seed.slug)) {
+        byId.set(seed.id, { ...seed, status: 'draft' });
       } else {
-        merged.push(seed);
+        byId.set(seed.id, seed);
+      }
+      seenIds.add(seed.id);
+      seenSlugs.add(seed.slug);
+    }
+  }
+
+  const allDocs = Array.from(byId.values());
+  if (!idToken) {
+    return allDocs.filter(
+      (d) =>
+        (d.status === 'published' || d.status === 'active') &&
+        !meta.hiddenIds.has(d.id) &&
+        !meta.hiddenSlugs.has(d.slug) &&
+        !meta.deletedIds.has(d.id)
+    );
+  }
+  return allDocs;
+}
+
+interface ClientOrderDoc {
+  id: string;
+  product_ids?: string[];
+  items?: Array<{ product_id?: string }>;
+}
+
+function computeProductOrderCounts(orders: ClientOrderDoc[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const order of orders) {
+    if (Array.isArray(order.items) && order.items.length > 0) {
+      for (const item of order.items) {
+        if (item && typeof item.product_id === 'string' && item.product_id) {
+          counts.set(item.product_id, (counts.get(item.product_id) || 0) + 1);
+        }
+      }
+    } else if (Array.isArray(order.product_ids)) {
+      for (const pid of order.product_ids) {
+        if (typeof pid === 'string' && pid) {
+          counts.set(pid, (counts.get(pid) || 0) + 1);
+        }
       }
     }
   }
-  return merged;
+  return counts;
 }
 
-function formatProductDto(doc: StoredProductDoc, includeAdmin = false) {
+function assertProductDocWithinFirestoreSizeLimit(doc: StoredProductDoc): void {
+  const json = JSON.stringify(doc);
+  const byteLength =
+    typeof TextEncoder !== 'undefined' ? new TextEncoder().encode(json).length : json.length * 2;
+  if (byteLength > 880_000) {
+    const msg =
+      'Product images and details exceed the 900 KB Firestore document size limit. Please upload fewer or smaller images.';
+    throw new ClientFirebaseError(400, 'PAYLOAD_TOO_LARGE', msg, { images: msg });
+  }
+}
+
+async function writeProductAuditLog(
+  idToken: string,
+  params: {
+    productId: string;
+    productTitle: string;
+    actorUserId: string;
+    actorEmail: string;
+    action: string;
+    summary: string;
+    before?: unknown;
+    after?: unknown;
+    createdAt?: number;
+  }
+): Promise<void> {
+  const now = params.createdAt ?? Date.now();
+  const auditId = `aud_${now.toString(36)}_${randomHex(4)}`;
+  await firestoreSetDoc(
+    'product_audit_logs',
+    auditId,
+    {
+      id: auditId,
+      product_id: params.productId,
+      product_title: params.productTitle,
+      actor_user_id: params.actorUserId,
+      actor_email: params.actorEmail,
+      action: params.action,
+      entity_type: 'product',
+      entity_id: params.productId,
+      summary: params.summary,
+      ...(params.before !== undefined ? { before_json: JSON.stringify(params.before) } : {}),
+      ...(params.after !== undefined ? { after_json: JSON.stringify(params.after) } : {}),
+      created_at: now,
+    },
+    idToken
+  ).catch(() => undefined);
+}
+
+interface ValidatedClientProductPayload {
+  title: string;
+  description: string;
+  fabricNote: string;
+  category: string;
+  sku: string;
+  pricePaise: number;
+  compareAtPaise: number | null;
+  lowStockThreshold: number;
+  featured: boolean;
+  status: 'draft' | 'published' | 'archived';
+  colors: Array<{ name: string; hex: string }>;
+  sizes: string[];
+  variants: NonNullable<StoredProductDoc['variants']>;
+  images: NonNullable<StoredProductDoc['images']>;
+}
+
+function validateClientProductPayload(params: {
+  body: Record<string, unknown>;
+  allDocs: StoredProductDoc[];
+  existing?: StoredProductDoc;
+  productId: string;
+}):
+  | { ok: true; data: ValidatedClientProductPayload }
+  | { ok: false; error: string; fieldErrors: Record<string, string> } {
+  const { body, allDocs, existing, productId } = params;
+  const now = Date.now();
+
+  const rawTitle =
+    typeof body.title === 'string'
+      ? body.title
+      : typeof body.name === 'string'
+        ? body.name
+        : existing?.title ?? '';
+  const title = rawTitle.trim();
+  if (title.length < 2 || title.length > 140) {
+    const msg = 'Product title must be between 2 and 140 characters.';
+    return { ok: false, error: msg, fieldErrors: { title: msg } };
+  }
+
+  const rawDescription =
+    typeof body.description === 'string' ? body.description : existing?.description ?? '';
+  const description = rawDescription.trim();
+  if (description.length < 10 || description.length > 2500) {
+    const msg = 'Product description must be between 10 and 2500 characters.';
+    return { ok: false, error: msg, fieldErrors: { description: msg } };
+  }
+
+  const fabricNote = (
+    typeof body.fabricNote === 'string' ? body.fabricNote : existing?.fabric_note ?? ''
+  )
+    .trim()
+    .slice(0, 400);
+
+  const category = (
+    typeof body.category === 'string' ? body.category : existing?.category ?? ''
+  ).trim();
+  if (!category || category.length > 80) {
+    const msg = 'Please choose a valid boutique collection category.';
+    return { ok: false, error: msg, fieldErrors: { category: msg } };
+  }
+
+  const requestedStatus: 'draft' | 'published' | 'archived' =
+    body.status === 'draft' || body.status === 'archived'
+      ? body.status
+      : body.status === 'published' || body.status === 'active'
+        ? 'published'
+        : existing
+          ? existing.status === 'active'
+            ? 'published'
+            : existing.status
+          : 'published';
+
+  const rawSku = typeof body.sku === 'string' ? body.sku.trim().toUpperCase() : existing?.sku ?? '';
+  const sku = rawSku || `SC-${now.toString(36).toUpperCase()}`;
+  if (!/^[A-Z0-9][A-Z0-9_-]{1,47}$/.test(sku)) {
+    const msg = 'SKU must be 2–48 uppercase letters, numbers, hyphens, or underscores.';
+    return { ok: false, error: msg, fieldErrors: { sku: msg } };
+  }
+  const duplicateMasterSku = allDocs.find(
+    (d) => d.id !== existing?.id && d.sku.toUpperCase() === sku
+  );
+  if (duplicateMasterSku) {
+    const msg = `SKU "${sku}" is already assigned to "${duplicateMasterSku.title}".`;
+    return { ok: false, error: msg, fieldErrors: { sku: msg } };
+  }
+
+  let basePricePaise = existing?.price_paise ?? 0;
+  if (body.pricePaise !== undefined) {
+    const n = Number(body.pricePaise);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 100 || n > 100_000_000) {
+      const msg = 'Selling price must be between ₹1 and ₹10,00,000.';
+      return { ok: false, error: msg, fieldErrors: { price: msg } };
+    }
+    basePricePaise = n;
+  } else if (body.priceInr !== undefined) {
+    const n = Math.round(Number(body.priceInr) * 100);
+    if (!Number.isFinite(n) || n < 100 || n > 100_000_000) {
+      const msg = 'Selling price must be between ₹1 and ₹10,00,000.';
+      return { ok: false, error: msg, fieldErrors: { price: msg } };
+    }
+    basePricePaise = n;
+  } else if (!existing) {
+    const msg = 'Selling price is required.';
+    return { ok: false, error: msg, fieldErrors: { price: msg } };
+  }
+
+  let baseCompareAtPaise: number | null = existing?.compare_at_paise ?? null;
+  if (body.compareAtPaise !== undefined) {
+    if (body.compareAtPaise === null || body.compareAtPaise === '') {
+      baseCompareAtPaise = null;
+    } else {
+      const n = Number(body.compareAtPaise);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 100 || n > 100_000_000) {
+        const msg = 'Compare-at MRP must be a valid INR amount (₹1 or higher).';
+        return { ok: false, error: msg, fieldErrors: { compareAtPrice: msg } };
+      }
+      if (n <= basePricePaise) {
+        const msg = 'Compare-at MRP must be greater than the selling price.';
+        return { ok: false, error: msg, fieldErrors: { compareAtPrice: msg } };
+      }
+      baseCompareAtPaise = n;
+    }
+  } else if (body.compareAtInr !== undefined) {
+    if (body.compareAtInr === null || body.compareAtInr === '') {
+      baseCompareAtPaise = null;
+    } else {
+      const n = Math.round(Number(body.compareAtInr) * 100);
+      if (!Number.isFinite(n) || n < 100 || n > 100_000_000) {
+        const msg = 'Compare-at MRP must be a valid INR amount (₹1 or higher).';
+        return { ok: false, error: msg, fieldErrors: { compareAtPrice: msg } };
+      }
+      if (n <= basePricePaise) {
+        const msg = 'Compare-at MRP must be greater than the selling price.';
+        return { ok: false, error: msg, fieldErrors: { compareAtPrice: msg } };
+      }
+      baseCompareAtPaise = n;
+    }
+  }
+
+  const lowStockThreshold =
+    body.lowStockThreshold !== undefined
+      ? Math.max(0, Math.min(10_000, Math.round(Number(body.lowStockThreshold) || 0)))
+      : existing?.low_stock_threshold ?? 5;
+  const featured =
+    body.featured !== undefined ? Boolean(body.featured) : Boolean(existing?.featured);
+
+  const normalizedImages: NonNullable<StoredProductDoc['images']> = Array.isArray(body.images)
+    ? body.images
+        .filter((img): img is Record<string, unknown> => Boolean(img && typeof img === 'object'))
+        .map((img, idx) => ({
+          id:
+            typeof img.id === 'string' && img.id.trim()
+              ? img.id.trim()
+              : `${productId}-img-${idx + 1}`,
+          product_id: productId,
+          media_id: typeof img.mediaId === 'string' ? img.mediaId : null,
+          url: String(img.url || img.src || '').trim(),
+          alt_text: String(img.alt || title).trim().slice(0, 240) || title,
+          is_cover: Boolean(img.isCover ?? idx === 0),
+          position: idx,
+          created_at: now,
+        }))
+        .filter((img) => Boolean(img.url))
+    : existing?.images ?? [];
+
+  if (requestedStatus === 'published' && normalizedImages.length === 0) {
+    const msg = 'Add at least one product photo before publishing.';
+    return { ok: false, error: msg, fieldErrors: { images: msg } };
+  }
+  if (normalizedImages.length > 0 && !normalizedImages.some((i) => i.is_cover)) {
+    normalizedImages[0].is_cover = true;
+  }
+
+  const normalizedVariants: NonNullable<StoredProductDoc['variants']> = [];
+  if (Array.isArray(body.variants)) {
+    if (body.variants.length === 0) {
+      const msg = 'Add at least one size/color variant before saving.';
+      return { ok: false, error: msg, fieldErrors: { variants: msg } };
+    }
+    const seenCombos = new Set<string>();
+    const seenVariantSkus = new Set<string>();
+    const otherVariantSkus = new Set<string>();
+    for (const other of allDocs) {
+      if (other.id === existing?.id) continue;
+      for (const v of other.variants || []) {
+        if (v.sku) otherVariantSkus.add(v.sku.toUpperCase());
+      }
+    }
+
+    for (let idx = 0; idx < body.variants.length; idx += 1) {
+      const rawV = body.variants[idx] as Record<string, unknown>;
+      if (!rawV || typeof rawV !== 'object') {
+        const msg = 'Invalid variant entry.';
+        return { ok: false, error: msg, fieldErrors: { variants: msg } };
+      }
+      const size = String(rawV.size || '').trim();
+      const colorName = String(rawV.colorName || '').trim();
+      if (!size || !colorName) {
+        const msg = 'Every variant row must specify both a size and a color name.';
+        return { ok: false, error: msg, fieldErrors: { variants: msg } };
+      }
+      const comboKey = `${size.toLowerCase()}::${colorName.toLowerCase()}`;
+      if (seenCombos.has(comboKey)) {
+        const msg = `Duplicate variant for size "${size}" and color "${colorName}".`;
+        return { ok: false, error: msg, fieldErrors: { variants: msg } };
+      }
+      seenCombos.add(comboKey);
+
+      const vSkuRaw = typeof rawV.sku === 'string' ? rawV.sku.trim().toUpperCase() : '';
+      const vSku =
+        vSkuRaw ||
+        `${sku}-${size.replace(/[^A-Z0-9]/gi, '').slice(0, 6).toUpperCase() || 'SZ'}-${idx + 1}`;
+      if (!/^[A-Z0-9][A-Z0-9_-]{1,63}$/.test(vSku)) {
+        const msg = `Variant SKU "${vSku}" contains invalid characters.`;
+        return { ok: false, error: msg, fieldErrors: { variants: msg } };
+      }
+      if (seenVariantSkus.has(vSku)) {
+        const msg = `Duplicate variant SKU "${vSku}" within this product.`;
+        return { ok: false, error: msg, fieldErrors: { variants: msg } };
+      }
+      seenVariantSkus.add(vSku);
+      if (otherVariantSkus.has(vSku)) {
+        const msg = `Variant SKU "${vSku}" is already used by another product.`;
+        return { ok: false, error: msg, fieldErrors: { variants: msg } };
+      }
+
+      const vPricePaise =
+        rawV.pricePaise !== undefined
+          ? Number(rawV.pricePaise)
+          : rawV.priceInr !== undefined
+            ? Math.round(Number(rawV.priceInr) * 100)
+            : basePricePaise;
+      if (!Number.isFinite(vPricePaise) || vPricePaise < 100 || vPricePaise > 100_000_000) {
+        const msg = `Enter a valid INR price (at least ₹1) for variant ${size} / ${colorName}.`;
+        return { ok: false, error: msg, fieldErrors: { variants: msg } };
+      }
+
+      let vComparePaise: number | null = baseCompareAtPaise;
+      if (rawV.compareAtPaise !== undefined) {
+        if (rawV.compareAtPaise === null || rawV.compareAtPaise === '') {
+          vComparePaise = null;
+        } else {
+          const parsedC = Number(rawV.compareAtPaise);
+          if (!Number.isFinite(parsedC) || parsedC <= vPricePaise) {
+            const msg = `Compare-at MRP for ${size} / ${colorName} must be higher than its selling price.`;
+            return { ok: false, error: msg, fieldErrors: { variants: msg } };
+          }
+          vComparePaise = Math.round(parsedC);
+        }
+      } else if (rawV.compareAtInr !== undefined) {
+        if (rawV.compareAtInr === null || rawV.compareAtInr === '') {
+          vComparePaise = null;
+        } else {
+          const parsedC = Math.round(Number(rawV.compareAtInr) * 100);
+          if (!Number.isFinite(parsedC) || parsedC <= vPricePaise) {
+            const msg = `Compare-at MRP for ${size} / ${colorName} must be higher than its selling price.`;
+            return { ok: false, error: msg, fieldErrors: { variants: msg } };
+          }
+          vComparePaise = parsedC;
+        }
+      } else if (vComparePaise !== null && vComparePaise <= vPricePaise) {
+        vComparePaise = null;
+      }
+
+      const rawStock = rawV.stockQty ?? body.stockQty ?? 0;
+      const stockNum = Number(rawStock);
+      if (!Number.isInteger(stockNum) || stockNum < 0 || stockNum > 100_000) {
+        const msg = `Stock quantity for ${size} / ${colorName} must be an integer between 0 and 100,000.`;
+        return { ok: false, error: msg, fieldErrors: { variants: msg } };
+      }
+
+      normalizedVariants.push({
+        id:
+          typeof rawV.id === 'string' && rawV.id && !rawV.id.startsWith('new-')
+            ? rawV.id
+            : `${productId}-var-${idx + 1}`,
+        product_id: productId,
+        sku: vSku,
+        size,
+        color_name: colorName,
+        color_hex:
+          typeof rawV.colorHex === 'string' && /^#[0-9a-fA-F]{6}$/.test(rawV.colorHex.trim())
+            ? rawV.colorHex.trim()
+            : '#49243E',
+        price_paise: Math.round(vPricePaise),
+        compare_at_paise: vComparePaise,
+        stock_qty: stockNum,
+        position: idx,
+      });
+    }
+  } else if (existing?.variants && existing.variants.length > 0) {
+    existing.variants.forEach((v, idx) => {
+      normalizedVariants.push({
+        ...v,
+        position: idx,
+        price_paise:
+          body.pricePaise !== undefined || body.priceInr !== undefined
+            ? basePricePaise
+            : Number(v.price_paise),
+        compare_at_paise:
+          body.compareAtPaise !== undefined || body.compareAtInr !== undefined
+            ? baseCompareAtPaise
+            : v.compare_at_paise,
+        stock_qty:
+          body.stockQty !== undefined && idx === 0
+            ? Math.max(0, Math.round(Number(body.stockQty)))
+            : Number(v.stock_qty),
+      });
+    });
+  } else {
+    const singleStock = Math.max(0, Math.round(Number(body.stockQty ?? 1)));
+    normalizedVariants.push({
+      id: `${productId}-var-1`,
+      product_id: productId,
+      sku: `${sku}-STD-1`,
+      size: 'Free Size',
+      color_name: 'Signature',
+      color_hex: '#49243E',
+      price_paise: basePricePaise,
+      compare_at_paise: baseCompareAtPaise,
+      stock_qty: singleStock,
+      position: 0,
+    });
+  }
+
+  const derivedColors = Array.from(
+    new Map(
+      normalizedVariants.map((v) => [
+        v.color_name,
+        { name: v.color_name, hex: v.color_hex },
+      ])
+    ).values()
+  );
+  const derivedSizes = Array.from(new Set(normalizedVariants.map((v) => v.size)));
+  const minPricePaise = Math.min(...normalizedVariants.map((v) => Number(v.price_paise)));
+  const lowestVariant = normalizedVariants.find((v) => Number(v.price_paise) === minPricePaise);
+
+  return {
+    ok: true,
+    data: {
+      title,
+      description,
+      fabricNote,
+      category,
+      sku,
+      pricePaise: minPricePaise,
+      compareAtPaise: lowestVariant?.compare_at_paise ?? baseCompareAtPaise,
+      lowStockThreshold,
+      featured,
+      status: requestedStatus,
+      colors: derivedColors,
+      sizes: derivedSizes,
+      variants: normalizedVariants,
+      images: normalizedImages,
+    },
+  };
+}
+
+function formatProductDto(doc: StoredProductDoc, includeAdmin = false, orderCount = 0) {
   const variants = Array.isArray(doc.variants) ? doc.variants : [];
   const images = Array.isArray(doc.images) ? doc.images : [];
   const totalStock =
@@ -976,12 +1883,12 @@ function formatProductDto(doc: StoredProductDoc, includeAdmin = false) {
   return {
     ...pub,
     sku: doc.sku,
-    status: doc.status || 'active',
+    status: doc.status === 'active' ? 'published' : doc.status || 'published',
     version: Number(doc.version || 1),
     publishedAt: doc.published_at,
     archivedAt: doc.archived_at,
     createdAt: Number(doc.created_at || Date.now()),
-    orderCount: 0,
+    orderCount,
     rawImages: images.map((img) => ({
       id: img.id,
       url: img.url,
@@ -1050,8 +1957,16 @@ async function ensureCompletedClientSignIn(params: {
     };
   }
 
-  const account = await lookupFirebaseAccount(signIn.idToken);
-  if (!account) {
+  const lookup = await lookupFirebaseAccountDetailed(signIn.idToken);
+  if (lookup.status === 'transient_error') {
+    return {
+      ok: false,
+      status: 503,
+      code: 'AUTH_UNAVAILABLE',
+      error: 'Unable to reach Firebase Authentication right now. Please try again in a moment.',
+    };
+  }
+  if (lookup.status !== 'ok') {
     return {
       ok: false,
       status: 401,
@@ -1059,6 +1974,7 @@ async function ensureCompletedClientSignIn(params: {
       error: 'Unable to verify your login token. Please try again.',
     };
   }
+  const account = lookup.account;
 
   if (!account.emailVerified) {
     const existing = getPendingVerify(email);
@@ -1084,47 +2000,70 @@ async function ensureCompletedClientSignIn(params: {
     signIn.displayName ||
     (isOwner ? 'Store Owner' : 'Member');
 
-  // Sync user profile and owner binding in Firestore using the user's verified Firebase idToken
+  // Sync user profile in Firestore using rules-compliant schema (boolean email_verified, no password_hash)
+  const existingUserDoc = await firestoreGetDoc<{
+    created_at?: number;
+    phone_e164?: string | null;
+    phone_verified?: boolean;
+  }>('users', account.uid, signIn.idToken).catch(() => null);
+
   await firestoreSetDoc(
     'users',
     account.uid,
     {
       id: account.uid,
-      full_name: fullName,
+      full_name: fullName.slice(0, 100),
       email: account.email,
-      email_verified: 1,
-      password_hash: 'firebase-managed',
-      phone_e164: null,
-      phone_verified: 0,
-      created_at: now,
+      email_verified: true,
+      phone_e164: existingUserDoc?.phone_e164 ?? null,
+      phone_verified:
+        typeof existingUserDoc?.phone_verified === 'boolean'
+          ? existingUserDoc.phone_verified
+          : false,
+      created_at: Number(existingUserDoc?.created_at || now),
       updated_at: now,
     },
     signIn.idToken
-  ).catch(() => false);
+  ).catch(() => undefined);
 
   let boundAt = now;
-  const boundVia = 'firebase_verified_owner';
+  let boundVia = 'firebase_verified_owner';
   if (isOwner) {
     const existingBinding = await firestoreGetDoc<{
       owner_user_id?: string;
+      bound_email?: string;
       bound_at?: number;
-    }>('settings', 'admin_binding', signIn.idToken);
+      bound_via?: string;
+    }>('admin_bindings', 'primary', signIn.idToken).catch(() => null);
+
+    if (
+      existingBinding?.owner_user_id &&
+      existingBinding.owner_user_id !== account.uid
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        code: 'OWNER_CONFLICT',
+        error:
+          'Owner access is already bound to a different Firebase Auth UID. Contact support to transfer ownership.',
+      };
+    }
+
     if (existingBinding?.bound_at) {
       boundAt = Number(existingBinding.bound_at);
+      boundVia = existingBinding.bound_via || boundVia;
     } else {
       await firestoreSetDoc(
-        'settings',
-        'admin_binding',
+        'admin_bindings',
+        'primary',
         {
-          singleton: 1,
-          owner_email: account.email,
           owner_user_id: account.uid,
+          bound_email: account.email,
           bound_at: now,
           bound_via: boundVia,
-          updated_at: now,
         },
         signIn.idToken
-      ).catch(() => false);
+      ).catch(() => undefined);
     }
   }
 
@@ -1138,6 +2077,7 @@ async function ensureCompletedClientSignIn(params: {
     lastReauthAt: now,
     issuedAt: now,
     expiresAtMs: account.expiresAtMs,
+    lastVerifiedAt: now,
     csrfToken: randomHex(16),
   };
   saveStoredSession(session);
@@ -1677,6 +2617,42 @@ export async function handleClientlessApiRequest<T>(
           error: 'Access denied. Only the verified store owner account may access this portal.',
         };
       }
+      const existingBinding = await firestoreGetDoc<{
+        owner_user_id?: string;
+        bound_email?: string;
+        bound_at?: number;
+        bound_via?: string;
+      }>('admin_bindings', 'primary', session.idToken).catch(() => null);
+
+      if (
+        existingBinding?.owner_user_id &&
+        existingBinding.owner_user_id !== session.uid
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'OWNER_CONFLICT',
+          error:
+            'Owner access is already bound to a different Firebase Auth UID. Contact support to transfer ownership.',
+        };
+      }
+
+      const boundAt = Number(existingBinding?.bound_at || session.issuedAt);
+      const boundVia = existingBinding?.bound_via || 'firebase_verified_owner';
+      if (!existingBinding?.owner_user_id) {
+        await firestoreSetDoc(
+          'admin_bindings',
+          'primary',
+          {
+            owner_user_id: session.uid,
+            bound_email: session.email,
+            bound_at: boundAt,
+            bound_via: boundVia,
+          },
+          session.idToken
+        ).catch(() => undefined);
+      }
+
       return {
         ok: true,
         data: {
@@ -1684,8 +2660,8 @@ export async function handleClientlessApiRequest<T>(
           isOwner: true,
           user: buildPublicAuthUser(session),
           ownerBinding: {
-            boundAt: session.issuedAt,
-            boundVia: 'firebase_verified_owner',
+            boundAt,
+            boundVia,
           },
         } as unknown as T,
       };
@@ -1723,6 +2699,12 @@ export async function handleClientlessApiRequest<T>(
           displayName: fullName,
           returnSecureToken: false,
         }).catch(() => undefined);
+        const now = Date.now();
+        const existingUserDoc = await firestoreGetDoc<{
+          created_at?: number;
+          phone_e164?: string | null;
+          phone_verified?: boolean;
+        }>('users', session.uid, session.idToken).catch(() => null);
         const updatedSession: ClientFirebaseSession = {
           ...session,
           fullName,
@@ -1735,12 +2717,17 @@ export async function handleClientlessApiRequest<T>(
             id: session.uid,
             full_name: fullName,
             email: session.email,
-            email_verified: 1,
-            password_hash: 'firebase-managed',
-            updated_at: Date.now(),
+            email_verified: Boolean(session.emailVerified),
+            phone_e164: existingUserDoc?.phone_e164 ?? null,
+            phone_verified:
+              typeof existingUserDoc?.phone_verified === 'boolean'
+                ? existingUserDoc.phone_verified
+                : false,
+            created_at: Number(existingUserDoc?.created_at || session.issuedAt || now),
+            updated_at: now,
           },
           session.idToken
-        ).catch(() => false);
+        ).catch(() => undefined);
         return {
           ok: true,
           data: { user: buildPublicAuthUser(updatedSession) } as unknown as T,
@@ -1844,23 +2831,34 @@ export async function handleClientlessApiRequest<T>(
 
     // 13. Public Storefront & Catalog Endpoints
     if (cleanPath === '/api/storefront' && upperMethod === 'GET') {
-      const [settingsDoc, contentDoc, categoriesDocs] = await Promise.all([
-        firestoreGetDoc<{ data?: unknown }>('settings', 'site_settings'),
-        firestoreGetDoc<{ data?: unknown }>('settings', 'storefront_content'),
-        firestoreListDocs<{
-          id: string;
-          name: string;
-          slug: string;
-          subtitle: string;
-          image_url: string;
-          alt_text: string;
-          position: number;
-        }>('categories'),
-      ]);
+      const [siteSettingsDoc, legacySettingsDoc, siteContentDoc, legacyContentDoc, categoriesDocs] =
+        await Promise.all([
+          firestoreGetDoc<{ value?: unknown; data?: unknown }>('site_documents', 'settings'),
+          firestoreGetDoc<{ data?: unknown }>('settings', 'site_settings'),
+          firestoreGetDoc<{ value?: unknown; data?: unknown }>('site_documents', 'content'),
+          firestoreGetDoc<{ data?: unknown }>('settings', 'storefront_content'),
+          firestoreListDocs<{
+            id: string;
+            name: string;
+            slug: string;
+            subtitle: string;
+            image_url: string;
+            alt_text: string;
+            position: number;
+          }>('categories'),
+        ]);
 
-      const settings = mergeSiteSettings(settingsDoc?.data ?? DEFAULT_SITE_SETTINGS);
+      const settings = mergeSiteSettings(
+        (siteSettingsDoc?.value ??
+          siteSettingsDoc?.data ??
+          legacySettingsDoc?.data ??
+          DEFAULT_SITE_SETTINGS) as Partial<typeof DEFAULT_SITE_SETTINGS>
+      );
       const content = mergeStorefrontContent(
-        contentDoc?.data ?? DEFAULT_STOREFRONT_CONTENT
+        (siteContentDoc?.value ??
+          siteContentDoc?.data ??
+          legacyContentDoc?.data ??
+          DEFAULT_STOREFRONT_CONTENT) as Partial<typeof DEFAULT_STOREFRONT_CONTENT>
       );
       const mappedRemoteCats = [...categoriesDocs]
         .sort((a, b) => Number(a.position || 0) - Number(b.position || 0))
@@ -2192,12 +3190,31 @@ export async function handleClientlessApiRequest<T>(
 
     // 14. Public Contact Enquiry
     if (cleanPath === '/api/contact' && upperMethod === 'POST') {
-      const fullName = typeof body.fullName === 'string' ? body.fullName.trim() : '';
-      const phone = typeof body.phone === 'string' ? body.phone.trim() : '';
-      const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : null;
+      const fullName =
+        typeof body.fullName === 'string'
+          ? body.fullName.trim()
+          : typeof body.senderName === 'string'
+            ? body.senderName.trim()
+            : '';
+      const phone =
+        typeof body.phone === 'string'
+          ? body.phone.trim()
+          : typeof body.senderPhone === 'string'
+            ? body.senderPhone.trim()
+            : '';
+      const email =
+        typeof body.email === 'string'
+          ? body.email.trim().toLowerCase()
+          : typeof body.senderEmail === 'string'
+            ? body.senderEmail.trim().toLowerCase()
+            : 'guest@sahithidesigns.online';
       const message = typeof body.message === 'string' ? body.message.trim() : '';
       const productInterest =
-        typeof body.productInterest === 'string' ? body.productInterest.trim() : null;
+        typeof body.productInterest === 'string' && body.productInterest.trim()
+          ? body.productInterest.trim()
+          : typeof body.subject === 'string' && body.subject.trim()
+            ? body.subject.trim()
+            : 'Boutique Enquiry';
 
       if (fullName.length < 2 || message.length < 5) {
         return {
@@ -2211,13 +3228,13 @@ export async function handleClientlessApiRequest<T>(
       const now = Date.now();
       await firestoreSetDoc('contact_messages', id, {
         id,
-        full_name: fullName,
-        phone,
-        email,
-        product_interest: productInterest,
-        message,
-        status: 'new',
-        admin_notes: '',
+        sender_name: fullName.slice(0, 120),
+        sender_email: (email || 'guest@sahithidesigns.online').slice(0, 254),
+        sender_phone: phone.slice(0, 32),
+        subject: productInterest.slice(0, 140),
+        message: message.slice(0, 3000),
+        status: 'unread',
+        admin_note: '',
         created_at: now,
         updated_at: now,
       });
@@ -2231,7 +3248,7 @@ export async function handleClientlessApiRequest<T>(
       };
     }
 
-    // 15. Protected Admin Dashboard Operations (Overview, Products, Categories, Content, Settings, Messages, Orders, Audit)
+    // 15. Protected Admin Dashboard Operations (Overview, Products, Categories, Content, Settings, Messages, Orders, Audit, Uploads)
     if (cleanPath.startsWith('/api/admin/')) {
       const session = await getValidClientSession();
       if (!session) {
@@ -2253,39 +3270,104 @@ export async function handleClientlessApiRequest<T>(
 
       const idToken = session.idToken;
 
-      if (cleanPath === '/api/admin/overview' && upperMethod === 'GET') {
-        const products = await firestoreListDocs<StoredProductDoc>('products', idToken);
-        const categories = await firestoreListDocs<{ id: string }>('categories', idToken);
-        const messages = await firestoreListDocs<{ status?: string }>(
-          'contact_messages',
-          idToken
-        );
-        const orders = await firestoreListDocs<{
-          status?: string;
-          total_paise?: number;
-        }>('orders', idToken);
-        const auditLogs = await firestoreListDocs<{
+      if (cleanPath === '/api/admin/uploads' && upperMethod === 'POST') {
+        const filesOut: Array<{
           id: string;
-          actor_email: string;
-          action: string;
-          entity_type: string;
-          entity_id: string | null;
-          summary: string;
-          created_at: number;
-        }>('admin_audit_log', idToken);
+          url: string;
+          originalName: string;
+          mimeType: string;
+          sizeBytes: number;
+        }> = [];
+        if (typeof FormData !== 'undefined' && rawBody instanceof FormData) {
+          const entries = rawBody.getAll('files');
+          const singleFile = rawBody.get('file');
+          const allItems = entries.length > 0 ? entries : singleFile ? [singleFile] : [];
+          for (const entry of allItems) {
+            if (typeof Blob !== 'undefined' && entry instanceof Blob) {
+              const fileObj = entry as File;
+              const buf = await fileObj.arrayBuffer();
+              const bytes = new Uint8Array(buf);
+              let binary = '';
+              for (let i = 0; i < bytes.length; i += 1) {
+                binary += String.fromCharCode(bytes[i]);
+              }
+              const base64 =
+                typeof btoa === 'function'
+                  ? btoa(binary)
+                  : Buffer.from(bytes).toString('base64');
+              const mime = fileObj.type || 'image/jpeg';
+              const dataUrl = `data:${mime};base64,${base64}`;
+              filesOut.push({
+                id: `media_${Date.now().toString(36)}_${randomHex(3)}`,
+                url: dataUrl,
+                originalName: fileObj.name || 'upload.jpg',
+                mimeType: mime,
+                sizeBytes: fileObj.size || bytes.length,
+              });
+            }
+          }
+        }
+        return {
+          ok: true,
+          data: {
+            uploaded: true,
+            files: filesOut,
+          } as unknown as T,
+        };
+      }
 
-        const activeCount = products.filter((p) => (p.status === 'active' || p.status === 'published')).length;
+      if (cleanPath === '/api/admin/overview' && upperMethod === 'GET') {
+        const [products, categories, messages, orders, auditLogs] = await Promise.all([
+          getMergedProductDocs(idToken),
+          firestoreListDocs<{ id: string }>('categories', idToken),
+          firestoreListDocs<{ status?: string; created_at?: number }>(
+            'contact_messages',
+            idToken
+          ),
+          firestoreListDocs<
+            ClientOrderDoc & {
+              status?: string;
+              total_paise?: number;
+              created_at?: number;
+            }
+          >('orders', idToken),
+          firestoreListDocs<{
+            id: string;
+            product_id?: string | null;
+            product_title?: string;
+            actor_user_id?: string;
+            actor_email?: string;
+            action: string;
+            entity_type?: string;
+            entity_id?: string | null;
+            summary: string;
+            created_at: number;
+          }>('product_audit_logs', idToken),
+        ]);
+
+        const orderCounts = computeProductOrderCounts(orders);
+        const activeCount = products.filter(
+          (p) => p.status === 'active' || p.status === 'published'
+        ).length;
         const draftCount = products.filter((p) => p.status === 'draft').length;
         const archivedCount = products.filter((p) => p.status === 'archived').length;
         const lowStockCount = products.filter(
-          (p) => (p.status === 'active' || p.status === 'published') && Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 2)
+          (p) =>
+            (p.status === 'active' || p.status === 'published') &&
+            Number(p.stock_qty) > 0 &&
+            Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 5)
         ).length;
         const outOfStockCount = products.filter(
           (p) => (p.status === 'active' || p.status === 'published') && Number(p.stock_qty) <= 0
         ).length;
 
         const paidOrders = orders.filter(
-          (o) => o.status === 'paid' || o.status === 'fulfilled'
+          (o) =>
+            o.status === 'paid' ||
+            o.status === 'fulfilled' ||
+            o.status === 'confirmed' ||
+            o.status === 'shipped' ||
+            o.status === 'delivered'
         );
         const totalRevenuePaise = paidOrders.reduce(
           (sum, o) => sum + Number(o.total_paise || 0),
@@ -2296,35 +3378,50 @@ export async function handleClientlessApiRequest<T>(
           ok: true,
           data: normalizeAdminOverview({
             metrics: {
-              totalProducts: products.length,
+              totalProducts: products.filter((p) => p.status !== 'archived').length,
               activeProducts: activeCount,
+              publishedProducts: activeCount,
               draftProducts: draftCount,
               archivedProducts: archivedCount,
               lowStockProducts: lowStockCount,
+              lowStockCount,
               outOfStockProducts: outOfStockCount,
+              outOfStockCount,
               totalCategories: categories.length || INITIAL_SEED_CATEGORIES.length,
               totalOrders: orders.length,
               pendingOrders: orders.filter((o) => o.status === 'pending').length,
               totalRevenuePaise,
               totalRevenue: Number((totalRevenuePaise / 100).toFixed(2)),
-              unreadMessages: messages.filter((m) => (m.status === 'new' || m.status === 'unread')).length,
+              unreadMessages: messages.filter(
+                (m) => m.status === 'new' || m.status === 'unread'
+              ).length,
               totalMessages: messages.length,
               totalAuditEvents: auditLogs.length,
             },
             lowStockItems: products
-              .filter(p => (p.status === 'active' || p.status === 'published') && Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 2))
-              .slice(0, 8).map(p => formatProductDto(p, true)),
-            recentOrders: [...orders].sort((a, b) => Number((b as any).created_at || 0) - Number((a as any).created_at || 0)).slice(0, 8),
-            recentMessages: [...messages].sort((a, b) => Number((b as any).created_at || 0) - Number((a as any).created_at || 0)).slice(0, 8),
+              .filter(
+                (p) =>
+                  (p.status === 'active' || p.status === 'published') &&
+                  Number(p.stock_qty) <= Number(p.low_stock_threshold ?? 5)
+              )
+              .slice(0, 8)
+              .map((p) => formatProductDto(p, true, orderCounts.get(p.id) || 0)),
+            recentOrders: [...orders]
+              .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
+              .slice(0, 8),
+            recentMessages: [...messages]
+              .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
+              .slice(0, 8),
             recentAuditLogs: [...auditLogs]
               .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
               .slice(0, 12)
               .map((log) => ({
                 id: log.id,
-                actorEmail: log.actor_email,
+                actorEmail: log.actor_email || AUTHORIZED_OWNER_EMAIL,
                 action: log.action,
-                entityType: log.entity_type,
-                entityId: log.entity_id,
+                entityType: log.entity_type || 'product',
+                entityId: log.entity_id ?? log.product_id ?? null,
+                productTitle: log.product_title || '',
                 summary: log.summary,
                 createdAt: Number(log.created_at || Date.now()),
               })),
@@ -2333,7 +3430,11 @@ export async function handleClientlessApiRequest<T>(
       }
 
       if (cleanPath === '/api/admin/products' && upperMethod === 'GET') {
-        const docs = await getMergedProductDocs(idToken);
+        const [docs, orders] = await Promise.all([
+          getMergedProductDocs(idToken),
+          firestoreListDocs<ClientOrderDoc>('orders', idToken),
+        ]);
+        const orderCounts = computeProductOrderCounts(orders);
         const queryString = rawPath.includes('?') ? rawPath.slice(rawPath.indexOf('?') + 1) : '';
         const params = new URLSearchParams(queryString);
         const statusFilter = params.get('status') || 'all';
@@ -2400,7 +3501,9 @@ export async function handleClientlessApiRequest<T>(
         return {
           ok: true,
           data: {
-            items: filtered.slice(offset, offset + pageSize).map((d) => formatProductDto(d, true)),
+            items: filtered
+              .slice(offset, offset + pageSize)
+              .map((d) => formatProductDto(d, true, orderCounts.get(d.id) || 0)),
             total,
             page,
             pageSize,
@@ -2411,41 +3514,44 @@ export async function handleClientlessApiRequest<T>(
 
       if (cleanPath === '/api/admin/content') {
         if (upperMethod === 'GET') {
-          const doc = await firestoreGetDoc<{ data?: unknown; updated_at?: number }>(
-            'settings',
-            'storefront_content',
-            idToken
-          );
+          const [siteDoc, legacyDoc] = await Promise.all([
+            firestoreGetDoc<{ value?: unknown; data?: unknown; updated_at?: number }>(
+              'site_documents',
+              'content',
+              idToken
+            ),
+            firestoreGetDoc<{ data?: unknown; updated_at?: number }>(
+              'settings',
+              'storefront_content',
+              idToken
+            ),
+          ]);
           return {
             ok: true,
             data: {
-              content: mergeStorefrontContent(doc?.data ?? DEFAULT_STOREFRONT_CONTENT),
-              updatedAt: Number(doc?.updated_at || Date.now()),
+              content: mergeStorefrontContent(
+                (siteDoc?.value ??
+                  siteDoc?.data ??
+                  legacyDoc?.data ??
+                  DEFAULT_STOREFRONT_CONTENT) as Partial<typeof DEFAULT_STOREFRONT_CONTENT>
+              ),
+              updatedAt: Number(siteDoc?.updated_at || legacyDoc?.updated_at || Date.now()),
             } as unknown as T,
           };
         }
-        if (upperMethod === 'PUT') {
+        if (upperMethod === 'PUT' || upperMethod === 'POST' || upperMethod === 'PATCH') {
           const merged = mergeStorefrontContent(body.content ?? body);
           const now = Date.now();
-          const saved = await firestoreSetDoc(
-            'settings',
-            'storefront_content',
+          await firestoreSetDoc(
+            'site_documents',
+            'content',
             {
-              singleton: 1,
-              data: merged,
+              key: 'content',
+              value: merged,
               updated_at: now,
-              updated_by: session.uid,
             },
             idToken
           );
-          if (!saved) {
-            return {
-              ok: false,
-              status: 500,
-              code: 'WRITE_FAILED',
-              error: 'Failed to persist storefront content to Firestore.',
-            };
-          }
           return {
             ok: true,
             data: {
@@ -2459,41 +3565,48 @@ export async function handleClientlessApiRequest<T>(
 
       if (cleanPath === '/api/admin/settings') {
         if (upperMethod === 'GET') {
-          const doc = await firestoreGetDoc<{ data?: unknown; updated_at?: number }>(
-            'settings',
-            'site_settings',
-            idToken
-          );
+          const [siteDoc, legacyDoc] = await Promise.all([
+            firestoreGetDoc<{ value?: unknown; data?: unknown; updated_at?: number }>(
+              'site_documents',
+              'settings',
+              idToken
+            ),
+            firestoreGetDoc<{ data?: unknown; updated_at?: number }>(
+              'settings',
+              'site_settings',
+              idToken
+            ),
+          ]);
           return {
             ok: true,
             data: {
-              settings: mergeSiteSettings(doc?.data ?? DEFAULT_SITE_SETTINGS),
-              updatedAt: Number(doc?.updated_at || Date.now()),
+              settings: mergeSiteSettings(
+                (siteDoc?.value ??
+                  siteDoc?.data ??
+                  legacyDoc?.data ??
+                  DEFAULT_SITE_SETTINGS) as Partial<typeof DEFAULT_SITE_SETTINGS>
+              ),
+              updatedAt: Number(siteDoc?.updated_at || legacyDoc?.updated_at || Date.now()),
             } as unknown as T,
           };
         }
-        if (upperMethod === 'PUT') {
+        if (upperMethod === 'PUT' || upperMethod === 'POST' || upperMethod === 'PATCH') {
           const merged = mergeSiteSettings(body.settings ?? body);
           const now = Date.now();
-          const saved = await firestoreSetDoc(
+          const meta = await getClientCatalogVisibilityMeta(idToken);
+          await firestoreSetDoc(
+            'site_documents',
             'settings',
-            'site_settings',
             {
-              singleton: 1,
-              data: merged,
+              key: 'settings',
+              value: merged,
+              hidden_product_ids: Array.from(meta.hiddenIds),
+              hidden_product_slugs: Array.from(meta.hiddenSlugs),
+              deleted_product_ids: Array.from(meta.deletedIds),
               updated_at: now,
-              updated_by: session.uid,
             },
             idToken
           );
-          if (!saved) {
-            return {
-              ok: false,
-              status: 500,
-              code: 'WRITE_FAILED',
-              error: 'Failed to persist site settings to Firestore.',
-            };
-          }
           return {
             ok: true,
             data: {
@@ -2543,33 +3656,49 @@ export async function handleClientlessApiRequest<T>(
       if (cleanPath === '/api/admin/messages' && upperMethod === 'GET') {
         const docs = await firestoreListDocs<{
           id: string;
-          full_name: string;
-          phone: string;
-          email: string | null;
-          product_interest: string | null;
+          sender_name?: string;
+          full_name?: string;
+          sender_phone?: string;
+          phone?: string;
+          sender_email?: string | null;
+          email?: string | null;
+          subject?: string | null;
+          product_interest?: string | null;
           message: string;
           status: string;
-          admin_notes: string;
+          admin_note?: string;
+          admin_notes?: string;
           created_at: number;
           updated_at: number;
         }>('contact_messages', idToken);
+        const items = docs
+          .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
+          .map((m) => ({
+            id: m.id,
+            senderName: m.sender_name || m.full_name || 'Guest',
+            fullName: m.sender_name || m.full_name || 'Guest',
+            senderPhone: m.sender_phone || m.phone || '',
+            phone: m.sender_phone || m.phone || '',
+            senderEmail: m.sender_email || m.email || '',
+            email: m.sender_email || m.email || null,
+            subject: m.subject || m.product_interest || 'Boutique Enquiry',
+            productInterest: m.product_interest || m.subject || null,
+            message: m.message || '',
+            status: m.status === 'new' ? 'unread' : m.status || 'unread',
+            adminNote: m.admin_note ?? m.admin_notes ?? '',
+            adminNotes: m.admin_note ?? m.admin_notes ?? '',
+            createdAt: Number(m.created_at || Date.now()),
+            updatedAt: Number(m.updated_at || Date.now()),
+          }));
         return {
           ok: true,
           data: {
-            items: docs
-              .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
-              .map((m) => ({
-                id: m.id,
-                fullName: m.full_name,
-                phone: m.phone,
-                email: m.email,
-                productInterest: m.product_interest,
-                message: m.message,
-                status: m.status || 'new',
-                adminNotes: m.admin_notes || '',
-                createdAt: Number(m.created_at || Date.now()),
-                updatedAt: Number(m.updated_at || Date.now()),
-              })),
+            items,
+            total: items.length,
+            page: 1,
+            pageSize: 50,
+            totalPages: 1,
+            unreadCount: items.filter((m) => m.status === 'unread').length,
           } as unknown as T,
         };
       }
@@ -2581,56 +3710,80 @@ export async function handleClientlessApiRequest<T>(
           customer_name: string;
           customer_phone: string;
           customer_email: string | null;
+          shipping_address?: string;
           status: string;
           subtotal_paise: number;
           total_paise: number;
-          notes: string | null;
+          notes?: string | null;
           created_at: number;
-          updated_at: number;
+          updated_at?: number;
           items?: Array<{
             id: string;
             product_id: string;
             variant_id: string | null;
-            title_snapshot: string;
-            sku_snapshot: string;
-            size_snapshot: string;
-            color_snapshot: string;
+            product_title?: string;
+            title_snapshot?: string;
+            variant_label?: string;
+            sku?: string;
+            sku_snapshot?: string;
+            size_snapshot?: string;
+            color_snapshot?: string;
             unit_price_paise: number;
-            qty: number;
+            quantity?: number;
+            qty?: number;
+            line_total_paise?: number;
           }>;
         }>('orders', idToken);
+        const items = docs
+          .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
+          .map((o) => ({
+            id: o.id,
+            orderNumber: o.order_number,
+            customerName: o.customer_name,
+            customerPhone: o.customer_phone,
+            customerEmail: o.customer_email || '',
+            shippingAddress: o.shipping_address || '',
+            status: o.status,
+            subtotalPaise: Number(o.subtotal_paise || 0),
+            totalPaise: Number(o.total_paise || 0),
+            subtotal: Number((Number(o.subtotal_paise || 0) / 100).toFixed(2)),
+            total: Number((Number(o.total_paise || 0) / 100).toFixed(2)),
+            notes: o.notes || '',
+            createdAt: Number(o.created_at || Date.now()),
+            updatedAt: Number(o.updated_at || o.created_at || Date.now()),
+            items: (o.items ?? []).map((it) => {
+              const qty = Number(it.quantity ?? it.qty ?? 1);
+              const unitPaise = Number(it.unit_price_paise || 0);
+              return {
+                id: it.id,
+                productId: it.product_id,
+                variantId: it.variant_id,
+                productTitle: it.product_title || it.title_snapshot || 'Boutique Piece',
+                titleSnapshot: it.title_snapshot || it.product_title || 'Boutique Piece',
+                variantLabel:
+                  it.variant_label ||
+                  [it.size_snapshot, it.color_snapshot].filter(Boolean).join(' / ') ||
+                  'Standard',
+                sku: it.sku || it.sku_snapshot || '',
+                skuSnapshot: it.sku_snapshot || it.sku || '',
+                sizeSnapshot: it.size_snapshot || '',
+                colorSnapshot: it.color_snapshot || '',
+                unitPricePaise: unitPaise,
+                unitPrice: Number((unitPaise / 100).toFixed(2)),
+                quantity: qty,
+                qty,
+                lineTotalPaise: Number(it.line_total_paise ?? unitPaise * qty),
+              };
+            }),
+          }));
         return {
           ok: true,
           data: {
-            items: docs
-              .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
-              .map((o) => ({
-                id: o.id,
-                orderNumber: o.order_number,
-                customerName: o.customer_name,
-                customerPhone: o.customer_phone,
-                customerEmail: o.customer_email,
-                status: o.status,
-                subtotalPaise: Number(o.subtotal_paise || 0),
-                totalPaise: Number(o.total_paise || 0),
-                subtotal: Number((Number(o.subtotal_paise || 0) / 100).toFixed(2)),
-                total: Number((Number(o.total_paise || 0) / 100).toFixed(2)),
-                notes: o.notes || '',
-                createdAt: Number(o.created_at || Date.now()),
-                updatedAt: Number(o.updated_at || Date.now()),
-                items: (o.items ?? []).map((it) => ({
-                  id: it.id,
-                  productId: it.product_id,
-                  variantId: it.variant_id,
-                  titleSnapshot: it.title_snapshot,
-                  skuSnapshot: it.sku_snapshot,
-                  sizeSnapshot: it.size_snapshot,
-                  colorSnapshot: it.color_snapshot,
-                  unitPricePaise: Number(it.unit_price_paise || 0),
-                  unitPrice: Number((Number(it.unit_price_paise || 0) / 100).toFixed(2)),
-                  qty: Number(it.qty || 1),
-                })),
-              })),
+            items,
+            total: items.length,
+            page: 1,
+            pageSize: 20,
+            totalPages: 1,
           } as unknown as T,
         };
       }
@@ -2638,177 +3791,171 @@ export async function handleClientlessApiRequest<T>(
       if (cleanPath === '/api/admin/audit' && upperMethod === 'GET') {
         const docs = await firestoreListDocs<{
           id: string;
-          actor_email: string;
+          product_id?: string | null;
+          product_title?: string;
+          actor_email?: string;
           action: string;
-          entity_type: string;
-          entity_id: string | null;
+          entity_type?: string;
+          entity_id?: string | null;
           summary: string;
           created_at: number;
-        }>('admin_audit_log', idToken);
+        }>('product_audit_logs', idToken);
+        const items = docs
+          .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
+          .slice(0, 100)
+          .map((log) => ({
+            id: log.id,
+            actorEmail: log.actor_email || AUTHORIZED_OWNER_EMAIL,
+            action: log.action,
+            entityType: log.entity_type || 'product',
+            entityId: log.entity_id ?? log.product_id ?? null,
+            productId: log.product_id ?? log.entity_id ?? null,
+            productTitle: log.product_title || 'Catalog Item',
+            summary: log.summary,
+            createdAt: Number(log.created_at || Date.now()),
+          }));
         return {
           ok: true,
           data: {
-            items: docs
-              .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
-              .slice(0, 100)
-              .map((log) => ({
-                id: log.id,
-                actorEmail: log.actor_email,
-                action: log.action,
-                entityType: log.entity_type,
-                entityId: log.entity_id,
-                summary: log.summary,
-                createdAt: Number(log.created_at || Date.now()),
-              })),
+            items,
+            total: items.length,
+            page: 1,
+            pageSize: 50,
+            totalPages: 1,
           } as unknown as T,
         };
       }
 
       if (cleanPath === '/api/admin/products' && upperMethod === 'POST') {
         const now = Date.now();
-        const title = typeof body.title === 'string' ? body.title.trim() : 'New Piece';
         const id = `prod_${now.toString(36)}_${randomHex(3)}`;
-        const slug =
+        const allDocs = await getMergedProductDocs(idToken);
+        const validated = validateClientProductPayload({
+          body,
+          allDocs,
+          productId: id,
+        });
+        if (!validated.ok) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'VALIDATION_ERROR',
+            error: validated.error,
+            fieldErrors: validated.fieldErrors,
+          };
+        }
+
+        const d = validated.data;
+        const existingSlugs = new Set(allDocs.map((item) => item.slug.toLowerCase()));
+        const baseSlug =
           (typeof body.slug === 'string' && body.slug.trim()) ||
-          title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') ||
+          d.title
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-|-$/g, '') ||
           id;
-        const sku =
-          (typeof body.sku === 'string' && body.sku.trim().toUpperCase()) ||
-          `SC-${now.toString(36).toUpperCase()}`;
-        const basePricePaise = Math.max(100, Math.round(Number(body.pricePaise || 100000)));
-        const baseCompareAtPaise =
-          body.compareAtPaise !== null && body.compareAtPaise !== undefined
-            ? Math.round(Number(body.compareAtPaise))
-            : null;
-        const status: 'draft' | 'published' | 'archived' =
-          body.status === 'draft' || body.status === 'archived' ? body.status : 'published';
-        const rawImages = Array.isArray(body.images) ? body.images : [];
-        const rawVariants = Array.isArray(body.variants) ? body.variants : [];
-        const variants = rawVariants.map((v: Record<string, unknown>, idx: number) => ({
-          id: typeof v.id === 'string' && v.id ? v.id : `var_${id}_${idx + 1}`,
-          product_id: id,
-          sku: String(v.sku || `${sku}-${idx + 1}`).toUpperCase(),
-          size: String(v.size || 'Free Size'),
-          color_name: String(v.colorName || 'Signature'),
-          color_hex: String(v.colorHex || '#49243E'),
-          price_paise: Math.max(100, Math.round(Number(v.pricePaise || basePricePaise))),
-          compare_at_paise:
-            v.compareAtPaise !== null && v.compareAtPaise !== undefined
-              ? Math.round(Number(v.compareAtPaise))
-              : baseCompareAtPaise,
-          stock_qty: Math.max(0, Math.round(Number(v.stockQty ?? body.stockQty ?? 1))),
-          position: idx,
-        }));
-        const images = rawImages.map((img: Record<string, unknown>, idx: number) => ({
-          id: `img_${id}_${idx + 1}`,
-          product_id: id,
-          media_id: null,
-          url: String(img.url || img.src || ''),
-          alt_text: String(img.alt || title),
-          is_cover: Boolean(img.isCover ?? idx === 0),
-          position: idx,
-          created_at: now,
-        }));
-        const totalStock =
-          variants.length > 0
-            ? variants.reduce((sum, v) => sum + v.stock_qty, 0)
-            : Math.max(0, Math.round(Number(body.stockQty ?? 1)));
-        const minPricePaise =
-          variants.length > 0
-            ? Math.min(...variants.map((v) => v.price_paise))
-            : basePricePaise;
-        const derivedColors =
-          variants.length > 0
-            ? Array.from(
-                new Map(
-                  variants.map((v) => [v.color_name, { name: v.color_name, hex: v.color_hex }])
-                ).values()
-              )
-            : Array.isArray(body.colors)
-              ? body.colors
-              : [];
-        const derivedSizes =
-          variants.length > 0
-            ? Array.from(new Set(variants.map((v) => v.size)))
-            : Array.isArray(body.sizes)
-              ? body.sizes
-              : [];
-        const doc: StoredProductDoc = {
+        let slug = baseSlug;
+        if (existingSlugs.has(slug.toLowerCase())) {
+          slug = `${baseSlug}-${id.slice(-4)}`.slice(0, 140);
+        }
+
+        const totalStock = d.variants.reduce((sum, v) => sum + Number(v.stock_qty || 0), 0);
+        const rawDoc: StoredProductDoc = {
           id,
-          sku,
+          sku: d.sku,
           slug,
-          title,
-          description: typeof body.description === 'string' ? body.description.trim() : '',
-          fabric_note: typeof body.fabricNote === 'string' ? body.fabricNote.trim() : '',
-          category: typeof body.category === 'string' ? body.category : 'Kurtis',
-          status,
-          featured: Boolean(body.featured),
-          price_paise: minPricePaise,
-          compare_at_paise: baseCompareAtPaise,
+          title: d.title,
+          description: d.description,
+          fabric_note: d.fabricNote,
+          category: d.category,
+          status: d.status,
+          featured: d.featured,
+          price_paise: d.pricePaise,
+          compare_at_paise: d.compareAtPaise,
           stock_qty: totalStock,
-          low_stock_threshold: Math.max(0, Number(body.lowStockThreshold ?? 5)),
-          colors_json: JSON.stringify(derivedColors),
-          sizes_json: JSON.stringify(derivedSizes),
+          low_stock_threshold: d.lowStockThreshold,
+          colors_json: JSON.stringify(d.colors),
+          sizes_json: JSON.stringify(d.sizes),
           version: 1,
-          published_at: status === 'published' ? now : null,
-          archived_at: status === 'archived' ? now : null,
+          published_at: d.status === 'published' ? now : null,
+          archived_at: d.status === 'archived' ? now : null,
           created_at: now,
           updated_at: now,
-          images,
-          variants,
-          variant_skus: variants.map((v) => v.sku),
-          image_urls: images.map((i) => i.url),
+          images: d.images,
+          variants: d.variants,
+          variant_skus: d.variants.map((v) => v.sku),
+          image_urls: d.images.map((i) => i.url),
         };
-        const saved = await firestoreSetDoc(
+        const doc = sanitizeProductDocForFirestore(rawDoc, id);
+        assertProductDocWithinFirestoreSizeLimit(doc);
+
+        const meta = await getClientCatalogVisibilityMeta(idToken);
+        meta.deletedIds.delete(id);
+        if (d.status === 'published') {
+          meta.hiddenIds.delete(id);
+          meta.hiddenSlugs.delete(doc.slug);
+        } else {
+          meta.hiddenIds.add(id);
+          meta.hiddenSlugs.add(doc.slug);
+        }
+
+        await firestoreSetDoc(
           'products',
           id,
           doc as unknown as Record<string, unknown>,
           idToken
         );
-        if (!saved) {
-          return {
-            ok: false,
-            status: 500,
-            code: 'WRITE_FAILED',
-            error: 'Failed to save product to Firestore.',
-          };
-        }
-        const dto = formatProductDto(doc, true);
+        await saveClientCatalogVisibilityMeta(meta, idToken);
+        saveClientProductOverride(doc);
+
+        await writeProductAuditLog(idToken, {
+          productId: id,
+          productTitle: doc.title,
+          actorUserId: session.uid,
+          actorEmail: session.email,
+          action: d.status === 'published' ? 'publish' : 'create',
+          summary:
+            d.status === 'published'
+              ? `Created and published "${doc.title}" at ₹${(doc.price_paise / 100).toLocaleString('en-IN')} (${totalStock} in stock).`
+              : `Created draft "${doc.title}" (${totalStock} in stock).`,
+          after: {
+            pricePaise: doc.price_paise,
+            stockQty: totalStock,
+            status: doc.status,
+            variantsCount: d.variants.length,
+          },
+          createdAt: now,
+        });
+
+        const dto = formatProductDto(doc, true, 0);
         return {
           ok: true,
           data: { product: dto, item: dto } as unknown as T,
         };
       }
 
-      if (cleanPath.startsWith('/api/admin/products/') && upperMethod === 'GET') {
-        const productId = decodeURIComponent(cleanPath.slice('/api/admin/products/'.length));
-        const allDocs = await getMergedProductDocs(idToken);
-        const found = allDocs.find((d) => d.id === productId);
-        if (!found) {
-          return {
-            ok: false,
-            status: 404,
-            code: 'PRODUCT_NOT_FOUND',
-            error: 'Product not found.',
-          };
-        }
-        return {
-          ok: true,
-          data: {
-            product: formatProductDto(found, true),
-            auditLogs: [],
-          } as unknown as T,
-        };
-      }
-
-      if (cleanPath.startsWith('/api/admin/products/') && upperMethod === 'POST') {
-        const sub = cleanPath.slice('/api/admin/products/'.length);
+      if (cleanPath.startsWith('/api/admin/products/')) {
+        const sub = cleanPath.slice('/api/admin/products/'.length).replace(/\/+$/, '');
         const slashIdx = sub.lastIndexOf('/');
-        if (slashIdx > 0) {
-          const productId = decodeURIComponent(sub.slice(0, slashIdx));
-          const action = sub.slice(slashIdx + 1);
+        const possibleAction = slashIdx > 0 ? sub.slice(slashIdx + 1).toLowerCase() : '';
+        const isLifecycleOrSubAction =
+          possibleAction === 'publish' ||
+          possibleAction === 'unpublish' ||
+          possibleAction === 'archive' ||
+          possibleAction === 'restore' ||
+          possibleAction === 'duplicate' ||
+          possibleAction === 'status';
+
+        if (isLifecycleOrSubAction) {
+          const rawProductId = decodeURIComponent(sub.slice(0, slashIdx));
           const allDocs = await getMergedProductDocs(idToken);
-          const existing = allDocs.find((d) => d.id === productId);
+          const existing = allDocs.find(
+            (d) =>
+              d.id === rawProductId ||
+              d.id.toLowerCase() === rawProductId.toLowerCase() ||
+              d.slug === rawProductId ||
+              d.sku.toLowerCase() === rawProductId.toLowerCase()
+          );
           if (!existing) {
             return {
               ok: false,
@@ -2817,15 +3964,17 @@ export async function handleClientlessApiRequest<T>(
               error: 'Product not found.',
             };
           }
+          const canonicalId = existing.id;
           const now = Date.now();
-          if (action === 'duplicate') {
+
+          if (possibleAction === 'duplicate') {
             const newId = `prod_${now.toString(36)}_${randomHex(3)}`;
-            const newTitle = `${existing.title} (Copy)`;
+            const newTitle = `${existing.title} (Copy)`.slice(0, 140);
             const newSku = `${existing.sku}-COPY`.slice(0, 48);
-            const copyDoc: StoredProductDoc = {
+            const copyRaw: StoredProductDoc = {
               ...existing,
               id: newId,
-              slug: `${existing.slug}-copy-${randomHex(2)}`,
+              slug: `${existing.slug}-copy-${randomHex(2)}`.slice(0, 140),
               title: newTitle,
               sku: newSku,
               featured: Boolean(existing.featured),
@@ -2839,7 +3988,7 @@ export async function handleClientlessApiRequest<T>(
                 ...v,
                 id: `${newId}-var-${idx + 1}`,
                 product_id: newId,
-                sku: `${newSku}-V${idx + 1}`,
+                sku: `${newSku}-V${idx + 1}`.slice(0, 64),
               })),
               images: (existing.images || []).map((img, idx) => ({
                 ...img,
@@ -2848,311 +3997,545 @@ export async function handleClientlessApiRequest<T>(
                 media_id: img.media_id ?? null,
                 is_cover: Boolean(img.is_cover),
               })),
-              variant_skus: (existing.variants || []).map((_, idx) => `${newSku}-V${idx + 1}`),
-              image_urls: (existing.images || []).map((i) => i.url),
             };
+            const copyDoc = sanitizeProductDocForFirestore(copyRaw, newId);
+            assertProductDocWithinFirestoreSizeLimit(copyDoc);
             await firestoreSetDoc(
               'products',
               newId,
               copyDoc as unknown as Record<string, unknown>,
               idToken
             );
-            const dto = formatProductDto(copyDoc, true);
+            saveClientProductOverride(copyDoc);
+            await writeProductAuditLog(idToken, {
+              productId: newId,
+              productTitle: copyDoc.title,
+              actorUserId: session.uid,
+              actorEmail: session.email,
+              action: 'duplicate',
+              summary: `Duplicated from "${existing.title}" as draft`,
+              after: { status: 'draft', sku: copyDoc.sku },
+              createdAt: now,
+            });
+            const dto = formatProductDto(copyDoc, true, 0);
             return { ok: true, data: { product: dto, item: dto } as unknown as T };
           }
 
           if (
-            action === 'publish' ||
-            action === 'unpublish' ||
-            action === 'archive' ||
-            action === 'restore'
+            typeof body.expectedVersion === 'number' &&
+            body.expectedVersion !== Number(existing.version || 1)
           ) {
-            const targetStatus: 'published' | 'draft' | 'archived' =
-              action === 'publish'
-                ? 'published'
-                : action === 'archive'
-                  ? 'archived'
-                  : 'draft';
-            const updated: StoredProductDoc = {
+            return {
+              ok: false,
+              status: 409,
+              code: 'VERSION_CONFLICT',
+              error: 'Product version changed concurrently. Refresh and retry.',
+            };
+          }
+
+          const targetStatus: 'published' | 'draft' | 'archived' =
+            possibleAction === 'publish'
+              ? 'published'
+              : possibleAction === 'archive'
+                ? 'archived'
+                : possibleAction === 'unpublish' || possibleAction === 'restore'
+                  ? 'draft'
+                  : body.status === 'published' || body.status === 'active'
+                    ? 'published'
+                    : body.status === 'archived'
+                      ? 'archived'
+                      : 'draft';
+
+          if (targetStatus === 'published' && (!existing.images || existing.images.length === 0)) {
+            return {
+              ok: false,
+              status: 400,
+              code: 'VALIDATION_ERROR',
+              error: 'Add at least one photo before publishing this product to the storefront.',
+            };
+          }
+
+          const updatedRaw: StoredProductDoc = {
+            ...existing,
+            id: canonicalId,
+            featured: Boolean(existing.featured),
+            status: targetStatus,
+            version: Number(existing.version || 1) + 1,
+            published_at:
+              targetStatus === 'published'
+                ? existing.published_at ?? now
+                : existing.published_at,
+            archived_at: targetStatus === 'archived' ? now : null,
+            updated_at: now,
+          };
+          const updated = sanitizeProductDocForFirestore(updatedRaw, canonicalId);
+          assertProductDocWithinFirestoreSizeLimit(updated);
+
+          const meta = await getClientCatalogVisibilityMeta(idToken);
+          meta.deletedIds.delete(canonicalId);
+          if (targetStatus === 'published') {
+            meta.hiddenIds.delete(canonicalId);
+            meta.hiddenSlugs.delete(updated.slug);
+            meta.hiddenSlugs.delete(existing.slug);
+          } else {
+            meta.hiddenIds.add(canonicalId);
+            meta.hiddenSlugs.add(updated.slug);
+            meta.hiddenSlugs.add(existing.slug);
+          }
+
+          await firestoreSetDoc(
+            'products',
+            canonicalId,
+            updated as unknown as Record<string, unknown>,
+            idToken
+          );
+          await saveClientCatalogVisibilityMeta(meta, idToken);
+          saveClientProductOverride(updated);
+
+          await writeProductAuditLog(idToken, {
+            productId: canonicalId,
+            productTitle: updated.title,
+            actorUserId: session.uid,
+            actorEmail: session.email,
+            action: possibleAction === 'status' ? targetStatus : possibleAction,
+            summary: `${
+              possibleAction === 'unpublish'
+                ? 'Unpublished'
+                : possibleAction === 'publish'
+                  ? 'Published'
+                  : possibleAction === 'archive'
+                    ? 'Archived'
+                    : 'Restored'
+            } "${updated.title}" (${existing.status} -> ${targetStatus})`,
+            before: { status: existing.status },
+            after: { status: targetStatus },
+            createdAt: now,
+          });
+
+          const orders = await firestoreListDocs<ClientOrderDoc>('orders', idToken).catch(() => []);
+          const orderCount = computeProductOrderCounts(orders).get(canonicalId) || 0;
+          const dto = formatProductDto(updated, true, orderCount);
+          return { ok: true, data: { product: dto, item: dto } as unknown as T };
+        }
+
+        const productId = decodeURIComponent(sub);
+
+        if (upperMethod === 'GET') {
+          const [allDocs, orders, auditDocs] = await Promise.all([
+            getMergedProductDocs(idToken),
+            firestoreListDocs<ClientOrderDoc>('orders', idToken),
+            firestoreListDocs<{
+              id: string;
+              product_id?: string | null;
+              action: string;
+              summary: string;
+              created_at: number;
+            }>('product_audit_logs', idToken),
+          ]);
+          const found = allDocs.find(
+            (d) =>
+              d.id === productId ||
+              d.id.toLowerCase() === productId.toLowerCase() ||
+              d.slug === productId
+          );
+          if (!found) {
+            return {
+              ok: false,
+              status: 404,
+              code: 'PRODUCT_NOT_FOUND',
+              error: 'Product not found.',
+            };
+          }
+          const orderCount = computeProductOrderCounts(orders).get(found.id) || 0;
+          const auditLogs = auditDocs
+            .filter((log) => log.product_id === found.id)
+            .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
+            .slice(0, 20)
+            .map((log) => ({
+              id: log.id,
+              action: log.action,
+              summary: log.summary,
+              createdAt: Number(log.created_at || Date.now()),
+            }));
+          return {
+            ok: true,
+            data: {
+              product: formatProductDto(found, true, orderCount),
+              auditLogs,
+            } as unknown as T,
+          };
+        }
+
+        if (upperMethod === 'PATCH' || upperMethod === 'PUT' || upperMethod === 'POST') {
+          const allDocs = await getMergedProductDocs(idToken);
+          const existing = allDocs.find(
+            (d) =>
+              d.id === productId ||
+              d.id.toLowerCase() === productId.toLowerCase() ||
+              d.slug === productId
+          );
+          if (!existing) {
+            return {
+              ok: false,
+              status: 404,
+              code: 'PRODUCT_NOT_FOUND',
+              error: 'Product not found.',
+            };
+          }
+          const canonicalId = existing.id;
+          const now = Date.now();
+          const currentVersion = Number(existing.version || 1);
+
+          // Support status-only PATCH updates
+          if (
+            typeof body.status === 'string' &&
+            ['published', 'draft', 'archived'].includes(body.status) &&
+            body.title === undefined &&
+            body.name === undefined
+          ) {
+            if (
+              typeof body.expectedVersion === 'number' &&
+              body.expectedVersion !== currentVersion
+            ) {
+              return {
+                ok: false,
+                status: 409,
+                code: 'VERSION_CONFLICT',
+                error: 'Product version changed concurrently. Refresh and retry.',
+              };
+            }
+            const targetStatus = body.status as 'published' | 'draft' | 'archived';
+            if (targetStatus === 'published' && (!existing.images || existing.images.length === 0)) {
+              return {
+                ok: false,
+                status: 400,
+                code: 'VALIDATION_ERROR',
+                error: 'Add at least one photo before publishing this product to the storefront.',
+                fieldErrors: {
+                  images: 'Add at least one photo before publishing this product to the storefront.',
+                },
+              };
+            }
+            const updatedRaw: StoredProductDoc = {
               ...existing,
+              id: canonicalId,
               featured: Boolean(existing.featured),
               status: targetStatus,
-              version: Number(existing.version || 1) + 1,
+              version: currentVersion + 1,
               published_at:
                 targetStatus === 'published'
                   ? existing.published_at ?? now
                   : existing.published_at,
               archived_at: targetStatus === 'archived' ? now : null,
               updated_at: now,
-              variant_skus:
-                existing.variant_skus || (existing.variants || []).map((v) => v.sku),
-              image_urls: existing.image_urls || (existing.images || []).map((i) => i.url),
             };
+            const updated = sanitizeProductDocForFirestore(updatedRaw, canonicalId);
+            assertProductDocWithinFirestoreSizeLimit(updated);
+            const meta = await getClientCatalogVisibilityMeta(idToken);
+            meta.deletedIds.delete(canonicalId);
+            if (targetStatus === 'published') {
+              meta.hiddenIds.delete(canonicalId);
+              meta.hiddenSlugs.delete(updated.slug);
+              meta.hiddenSlugs.delete(existing.slug);
+            } else {
+              meta.hiddenIds.add(canonicalId);
+              meta.hiddenSlugs.add(updated.slug);
+              meta.hiddenSlugs.add(existing.slug);
+            }
             await firestoreSetDoc(
               'products',
-              productId,
+              canonicalId,
               updated as unknown as Record<string, unknown>,
               idToken
             );
-            const meta = await getClientCatalogVisibilityMeta(idToken);
-            if (targetStatus === 'published') {
-              meta.hiddenIds.delete(productId);
-              meta.deletedIds.delete(productId);
-              meta.hiddenSlugs.delete(updated.slug);
-            } else {
-              meta.hiddenIds.add(productId);
-              meta.hiddenSlugs.add(updated.slug);
-            }
             await saveClientCatalogVisibilityMeta(meta, idToken);
-            const dto = formatProductDto(updated, true);
+            saveClientProductOverride(updated);
+            const actionName =
+              targetStatus === 'published'
+                ? 'publish'
+                : targetStatus === 'archived'
+                  ? 'archive'
+                  : existing.status === 'archived'
+                    ? 'restore'
+                    : 'unpublish';
+            await writeProductAuditLog(idToken, {
+              productId: canonicalId,
+              productTitle: updated.title,
+              actorUserId: session.uid,
+              actorEmail: session.email,
+              action: actionName,
+              summary: `${actionName}ed "${updated.title}" (${existing.status} -> ${targetStatus})`,
+              before: { status: existing.status },
+              after: { status: targetStatus },
+              createdAt: now,
+            });
+            const orders = await firestoreListDocs<ClientOrderDoc>('orders', idToken).catch(() => []);
+            const orderCount = computeProductOrderCounts(orders).get(canonicalId) || 0;
+            const dto = formatProductDto(updated, true, orderCount);
             return { ok: true, data: { product: dto, item: dto } as unknown as T };
           }
-        }
-      }
 
-      if (cleanPath.startsWith('/api/admin/products/') && upperMethod === 'PATCH') {
-        const sub = cleanPath.slice('/api/admin/products/'.length);
-        const isStatusPatch = sub.endsWith('/status');
-        const productId = decodeURIComponent(
-          isStatusPatch ? sub.slice(0, -'/status'.length) : sub
-        );
-        const allDocs = await getMergedProductDocs(idToken);
-        const existing = allDocs.find((d) => d.id === productId);
-        if (!existing) {
-          return {
-            ok: false,
-            status: 404,
-            code: 'PRODUCT_NOT_FOUND',
-            error: 'Product not found.',
-          };
-        }
-        const now = Date.now();
-        const rawStatus = body.status;
-        const nextStatus: 'draft' | 'published' | 'archived' =
-          rawStatus === 'draft' || rawStatus === 'archived'
-            ? rawStatus
-            : rawStatus === 'published' || rawStatus === 'active'
-              ? 'published'
-              : existing.status === 'active'
-                ? 'published'
-                : (existing.status as 'draft' | 'published' | 'archived');
-
-        const nextTitle =
-          typeof body.title === 'string' && body.title.trim()
-            ? body.title.trim()
-            : existing.title;
-        const nextSku =
-          typeof body.sku === 'string' && body.sku.trim()
-            ? body.sku.trim().toUpperCase()
-            : existing.sku;
-        const nextSlug =
-          typeof body.slug === 'string' && body.slug.trim()
-            ? body.slug.trim()
-            : existing.slug;
-        const basePricePaise =
-          body.pricePaise !== undefined
-            ? Math.max(100, Math.round(Number(body.pricePaise)))
-            : existing.price_paise;
-        const baseCompareAtPaise =
-          body.compareAtPaise !== undefined
-            ? body.compareAtPaise !== null
-              ? Math.round(Number(body.compareAtPaise))
-              : null
-            : existing.compare_at_paise;
-
-        const nextVariants = Array.isArray(body.variants)
-          ? body.variants.map((v: Record<string, unknown>, idx: number) => ({
-              id:
-                typeof v.id === 'string' && v.id && !v.id.startsWith('new-')
-                  ? v.id
-                  : `${productId}-var-${idx + 1}`,
-              product_id: productId,
-              sku: String(v.sku || `${nextSku}-${idx + 1}`).toUpperCase(),
-              size: String(v.size || 'Free Size'),
-              color_name: String(v.colorName || 'Signature'),
-              color_hex: String(v.colorHex || '#49243E'),
-              price_paise: Math.max(100, Math.round(Number(v.pricePaise ?? basePricePaise))),
-              compare_at_paise:
-                v.compareAtPaise !== null && v.compareAtPaise !== undefined
-                  ? Math.round(Number(v.compareAtPaise))
-                  : null,
-              stock_qty: Math.max(0, Math.round(Number(v.stockQty ?? 0))),
-              position: idx,
-            }))
-          : (existing.variants || []).map((v, idx) => ({
-              ...v,
-              position: idx,
-              price_paise:
-                body.pricePaise !== undefined ? basePricePaise : Number(v.price_paise),
-              stock_qty:
-                body.stockQty !== undefined && idx === 0
-                  ? Math.max(0, Math.round(Number(body.stockQty)))
-                  : Number(v.stock_qty),
-            }));
-
-        const nextImages = Array.isArray(body.images)
-          ? body.images.map((img: Record<string, unknown>, idx: number) => ({
-              id: `${productId}-img-${idx + 1}`,
-              product_id: productId,
-              media_id: null,
-              url: String(img.url || img.src || ''),
-              alt_text: String(img.alt || nextTitle),
-              is_cover: Boolean(img.isCover ?? idx === 0),
-              position: idx,
-              created_at: now,
-            }))
-          : (existing.images || []).map((img, idx) => ({
-              ...img,
-              media_id: img.media_id ?? null,
-              is_cover: Boolean(img.is_cover),
-              position: idx,
-            }));
-
-        const totalStock =
-          nextVariants.length > 0
-            ? nextVariants.reduce((sum, v) => sum + Number(v.stock_qty || 0), 0)
-            : body.stockQty !== undefined
-              ? Math.max(0, Math.round(Number(body.stockQty)))
-              : existing.stock_qty;
-        const effectivePricePaise =
-          nextVariants.length > 0
-            ? Math.min(...nextVariants.map((v) => Number(v.price_paise)))
-            : basePricePaise;
-        const derivedColors =
-          nextVariants.length > 0
-            ? Array.from(
-                new Map(
-                  nextVariants.map((v) => [
-                    v.color_name,
-                    { name: v.color_name, hex: v.color_hex },
-                  ])
-                ).values()
-              )
-            : undefined;
-        const derivedSizes =
-          nextVariants.length > 0
-            ? Array.from(new Set(nextVariants.map((v) => v.size)))
-            : undefined;
-
-        const updated: StoredProductDoc = isStatusPatch
-          ? {
-              ...existing,
-              featured: Boolean(existing.featured),
-              status: nextStatus,
-              version: Number(existing.version || 1) + 1,
-              updated_at: now,
-              variant_skus: nextVariants.map((v) => v.sku),
-              image_urls: nextImages.map((i) => i.url),
-            }
-          : {
-              ...existing,
-              title: nextTitle,
-              sku: nextSku,
-              slug: nextSlug,
-              description:
-                typeof body.description === 'string'
-                  ? body.description.trim()
-                  : existing.description,
-              fabric_note:
-                typeof body.fabricNote === 'string'
-                  ? body.fabricNote.trim()
-                  : existing.fabric_note,
-              category:
-                typeof body.category === 'string' ? body.category : existing.category,
-              status: nextStatus,
-              featured:
-                body.featured !== undefined
-                  ? Boolean(body.featured)
-                  : Boolean(existing.featured),
-              price_paise: effectivePricePaise,
-              compare_at_paise: baseCompareAtPaise,
-              stock_qty: totalStock,
-              low_stock_threshold:
-                body.lowStockThreshold !== undefined
-                  ? Math.max(0, Math.round(Number(body.lowStockThreshold)))
-                  : existing.low_stock_threshold,
-              colors_json: derivedColors
-                ? JSON.stringify(derivedColors)
-                : Array.isArray(body.colors)
-                  ? JSON.stringify(body.colors)
-                  : existing.colors_json,
-              sizes_json: derivedSizes
-                ? JSON.stringify(derivedSizes)
-                : Array.isArray(body.sizes)
-                  ? JSON.stringify(body.sizes)
-                  : existing.sizes_json,
-              version: Number(existing.version || 1) + 1,
-              published_at:
-                nextStatus === 'published'
-                  ? existing.published_at ?? now
-                  : existing.published_at,
-              archived_at: nextStatus === 'archived' ? now : null,
-              updated_at: now,
-              variants: nextVariants,
-              images: nextImages,
-              variant_skus: nextVariants.map((v) => v.sku),
-              image_urls: nextImages.map((i) => i.url),
+          if (
+            typeof body.expectedVersion === 'number' &&
+            body.expectedVersion !== currentVersion
+          ) {
+            return {
+              ok: false,
+              status: 409,
+              code: 'VERSION_CONFLICT',
+              error:
+                'This product was updated elsewhere since you opened it. Reload the latest version before saving.',
             };
-        const saved = await firestoreSetDoc(
-          'products',
-          productId,
-          updated as unknown as Record<string, unknown>,
-          idToken
-        );
-        if (!saved) {
+          }
+
+          const validated = validateClientProductPayload({
+            body,
+            allDocs,
+            existing,
+            productId: canonicalId,
+          });
+          if (!validated.ok) {
+            return {
+              ok: false,
+              status: 400,
+              code: 'VALIDATION_ERROR',
+              error: validated.error,
+              fieldErrors: validated.fieldErrors,
+            };
+          }
+
+          const d = validated.data;
+          // Preserve existing slug when editing unless a distinct explicit slug is requested
+          const nextSlug =
+            typeof body.slug === 'string' && body.slug.trim() && body.slug.trim() !== existing.slug
+              ? body.slug.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 140) ||
+                existing.slug
+              : existing.slug;
+          const totalStock = d.variants.reduce((sum, v) => sum + Number(v.stock_qty || 0), 0);
+          const nextStatus: 'draft' | 'published' | 'archived' =
+            body.status === 'published' || body.status === 'draft'
+              ? body.status
+              : existing.status === 'archived'
+                ? 'archived'
+                : d.status;
+
+          const updatedRaw: StoredProductDoc = {
+            ...existing,
+            id: canonicalId,
+            title: d.title,
+            sku: d.sku,
+            slug: nextSlug,
+            description: d.description,
+            fabric_note: d.fabricNote,
+            category: d.category,
+            status: nextStatus,
+            featured: d.featured,
+            price_paise: d.pricePaise,
+            compare_at_paise: d.compareAtPaise,
+            stock_qty: totalStock,
+            low_stock_threshold: d.lowStockThreshold,
+            colors_json: JSON.stringify(d.colors),
+            sizes_json: JSON.stringify(d.sizes),
+            version: currentVersion + 1,
+            published_at:
+              nextStatus === 'published'
+                ? existing.published_at ?? now
+                : existing.published_at,
+            archived_at: nextStatus === 'archived' ? existing.archived_at ?? now : null,
+            updated_at: now,
+            variants: d.variants,
+            images: d.images,
+            variant_skus: d.variants.map((v) => v.sku),
+            image_urls: d.images.map((i) => i.url),
+          };
+          const updated = sanitizeProductDocForFirestore(updatedRaw, canonicalId);
+          assertProductDocWithinFirestoreSizeLimit(updated);
+
+          const meta = await getClientCatalogVisibilityMeta(idToken);
+          meta.deletedIds.delete(canonicalId);
+          if (nextStatus === 'published') {
+            meta.hiddenIds.delete(canonicalId);
+            meta.hiddenSlugs.delete(updated.slug);
+            meta.hiddenSlugs.delete(existing.slug);
+          } else {
+            meta.hiddenIds.add(canonicalId);
+            meta.hiddenSlugs.add(updated.slug);
+            meta.hiddenSlugs.add(existing.slug);
+          }
+
+          await firestoreSetDoc(
+            'products',
+            canonicalId,
+            updated as unknown as Record<string, unknown>,
+            idToken
+          );
+          await saveClientCatalogVisibilityMeta(meta, idToken);
+          saveClientProductOverride(updated);
+
+          const priceChanged = Number(existing.price_paise) !== updated.price_paise;
+          const stockChanged = Number(existing.stock_qty) !== totalStock;
+          const statusChanged =
+            (existing.status === 'active' ? 'published' : existing.status) !== nextStatus;
+          const auditAction = statusChanged
+            ? nextStatus === 'published'
+              ? 'publish'
+              : 'unpublish'
+            : priceChanged
+              ? 'price_change'
+              : stockChanged
+                ? 'stock_change'
+                : 'update';
+          const notes: string[] = [];
+          if (priceChanged) {
+            notes.push(
+              `price ₹${(Number(existing.price_paise) / 100).toLocaleString('en-IN')} -> ₹${(
+                updated.price_paise / 100
+              ).toLocaleString('en-IN')}`
+            );
+          }
+          if (stockChanged) {
+            notes.push(`stock ${existing.stock_qty} -> ${totalStock}`);
+          }
+          if (existing.title !== updated.title) {
+            notes.push(`title updated`);
+          }
+          await writeProductAuditLog(idToken, {
+            productId: canonicalId,
+            productTitle: updated.title,
+            actorUserId: session.uid,
+            actorEmail: session.email,
+            action: auditAction,
+            summary: `Updated "${updated.title}"${notes.length > 0 ? ` (${notes.join(', ')})` : ''}`,
+            before: {
+              title: existing.title,
+              pricePaise: existing.price_paise,
+              stockQty: existing.stock_qty,
+              status: existing.status,
+            },
+            after: {
+              title: updated.title,
+              pricePaise: updated.price_paise,
+              stockQty: totalStock,
+              status: updated.status,
+            },
+            createdAt: now,
+          });
+
+          const orders = await firestoreListDocs<ClientOrderDoc>('orders', idToken).catch(() => []);
+          const orderCount = computeProductOrderCounts(orders).get(canonicalId) || 0;
+          const dto = formatProductDto(updated, true, orderCount);
           return {
-            ok: false,
-            status: 500,
-            code: 'WRITE_FAILED',
-            error: 'Failed to update product in Firestore.',
+            ok: true,
+            data: { product: dto, item: dto } as unknown as T,
           };
         }
-        const meta = await getClientCatalogVisibilityMeta(idToken);
-        meta.deletedIds.delete(productId);
-        if (nextStatus === 'published') {
-          meta.hiddenIds.delete(productId);
-          meta.hiddenSlugs.delete(updated.slug);
-        } else {
-          meta.hiddenIds.add(productId);
-          meta.hiddenSlugs.add(updated.slug);
+
+        if (upperMethod === 'DELETE') {
+          const [allDocs, orders] = await Promise.all([
+            getMergedProductDocs(idToken),
+            firestoreListDocs<ClientOrderDoc>('orders', idToken),
+          ]);
+          const existing = allDocs.find(
+            (d) =>
+              d.id === productId ||
+              d.id.toLowerCase() === productId.toLowerCase() ||
+              d.slug === productId
+          );
+          if (!existing) {
+            return {
+              ok: false,
+              status: 404,
+              code: 'PRODUCT_NOT_FOUND',
+              error: 'Product not found.',
+            };
+          }
+          const canonicalId = existing.id;
+          const now = Date.now();
+          const refCount = computeProductOrderCounts(orders).get(canonicalId) || 0;
+          const seedMatch = PRODUCTS.find((p) => p.id === canonicalId);
+          const meta = await getClientCatalogVisibilityMeta(idToken);
+
+          if (refCount > 0) {
+            const archivedRaw: StoredProductDoc = {
+              ...existing,
+              id: canonicalId,
+              status: 'archived',
+              archived_at: now,
+              version: Number(existing.version || 1) + 1,
+              updated_at: now,
+            };
+            const archivedDoc = sanitizeProductDocForFirestore(archivedRaw, canonicalId);
+            meta.deletedIds.delete(canonicalId);
+            meta.hiddenIds.add(canonicalId);
+            meta.hiddenSlugs.add(existing.slug);
+            if (seedMatch?.slug) meta.hiddenSlugs.add(seedMatch.slug);
+
+            await firestoreSetDoc(
+              'products',
+              canonicalId,
+              archivedDoc as unknown as Record<string, unknown>,
+              idToken
+            );
+            await saveClientCatalogVisibilityMeta(meta, idToken);
+            saveClientProductOverride(archivedDoc);
+
+            await writeProductAuditLog(idToken, {
+              productId: canonicalId,
+              productTitle: existing.title,
+              actorUserId: session.uid,
+              actorEmail: session.email,
+              action: 'archive',
+              summary: `Archived "${existing.title}" instead of deletion because ${refCount} historical order item(s) reference it.`,
+              before: { status: existing.status },
+              after: { status: 'archived' },
+              createdAt: now,
+            });
+
+            const dto = formatProductDto(archivedDoc, true, refCount);
+            return {
+              ok: true,
+              data: {
+                deleted: false,
+                archivedInsteadOfDeleted: true,
+                id: canonicalId,
+                product: dto,
+                message:
+                  'Product is referenced by existing customer orders and was archived to preserve order history.',
+              } as unknown as T,
+            };
+          }
+
+          meta.deletedIds.add(canonicalId);
+          meta.hiddenIds.add(canonicalId);
           meta.hiddenSlugs.add(existing.slug);
-        }
-        await saveClientCatalogVisibilityMeta(meta, idToken);
+          if (seedMatch?.slug) meta.hiddenSlugs.add(seedMatch.slug);
 
-        const dto = formatProductDto(updated, true);
-        return {
-          ok: true,
-          data: { product: dto, item: dto } as unknown as T,
-        };
-      }
+          await firestoreDeleteDoc('products', canonicalId, idToken);
+          await saveClientCatalogVisibilityMeta(meta, idToken);
+          removeClientProductOverride(canonicalId);
 
-      if (cleanPath.startsWith('/api/admin/products/') && upperMethod === 'DELETE') {
-        const productId = decodeURIComponent(cleanPath.slice('/api/admin/products/'.length));
-        const allDocs = await getMergedProductDocs(idToken);
-        const existing = allDocs.find((d) => d.id === productId);
-        if (!existing) {
+          await writeProductAuditLog(idToken, {
+            productId: canonicalId,
+            productTitle: existing.title,
+            actorUserId: session.uid,
+            actorEmail: session.email,
+            action: 'delete',
+            summary: `Permanently deleted "${existing.title}" (${existing.sku})`,
+            before: { status: existing.status, sku: existing.sku },
+            createdAt: now,
+          });
+
           return {
-            ok: false,
-            status: 404,
-            code: 'PRODUCT_NOT_FOUND',
-            error: 'Product not found.',
+            ok: true,
+            data: {
+              deleted: true,
+              deletedId: canonicalId,
+              archivedInsteadOfDeleted: false,
+              id: canonicalId,
+              message: `Deleted "${existing.title}".`,
+            } as unknown as T,
           };
         }
-        const meta = await getClientCatalogVisibilityMeta(idToken);
-        meta.deletedIds.add(productId);
-        meta.hiddenIds.add(productId);
-        meta.hiddenSlugs.add(existing.slug);
-        await saveClientCatalogVisibilityMeta(meta, idToken);
-        await firestoreDeleteDoc('products', productId, idToken);
-        return {
-          ok: true,
-          data: {
-            deleted: true,
-            archivedInsteadOfDeleted: false,
-            id: productId,
-            message: `Deleted "${existing.title}".`,
-          } as unknown as T,
-        };
       }
 
       if (cleanPath === '/api/admin/categories' && upperMethod === 'POST') {
@@ -3181,29 +4564,23 @@ export async function handleClientlessApiRequest<T>(
           created_at: now,
           updated_at: now,
         };
-        const saved = await firestoreSetDoc('categories', id, record, idToken);
-        if (!saved) {
-          return {
-            ok: false,
-            status: 500,
-            code: 'WRITE_FAILED',
-            error: 'Failed to save category to Firestore.',
-          };
-        }
+        await firestoreSetDoc('categories', id, record, idToken);
+        const catDto = {
+          id: record.id,
+          name: record.name,
+          slug: record.slug,
+          subtitle: record.subtitle,
+          imageUrl: record.image_url,
+          altText: record.alt_text,
+          position: record.position,
+          createdAt: now,
+          updatedAt: now,
+        };
         return {
           ok: true,
           data: {
-            item: {
-              id: record.id,
-              name: record.name,
-              slug: record.slug,
-              subtitle: record.subtitle,
-              imageUrl: record.image_url,
-              altText: record.alt_text,
-              position: record.position,
-              createdAt: now,
-              updatedAt: now,
-            },
+            category: catDto,
+            item: catDto,
           } as unknown as T,
         };
       }
@@ -3212,9 +4589,9 @@ export async function handleClientlessApiRequest<T>(
         const catId = decodeURIComponent(cleanPath.slice('/api/admin/categories/'.length));
         if (upperMethod === 'DELETE') {
           await firestoreDeleteDoc('categories', catId, idToken);
-          return { ok: true, data: { deleted: true, id: catId } as unknown as T };
+          return { ok: true, data: { deleted: true, deletedId: catId, id: catId } as unknown as T };
         }
-        if (upperMethod === 'PATCH') {
+        if (upperMethod === 'PATCH' || upperMethod === 'PUT') {
           const existing = await firestoreGetDoc<Record<string, unknown>>(
             'categories',
             catId,
@@ -3231,20 +4608,22 @@ export async function handleClientlessApiRequest<T>(
             updated_at: now,
           };
           await firestoreSetDoc('categories', catId, updated, idToken);
+          const catDto = {
+            id: String(updated.id || catId),
+            name: String(updated.name || ''),
+            slug: String(updated.slug || catId),
+            subtitle: String(updated.subtitle || ''),
+            imageUrl: String(updated.image_url || ''),
+            altText: String(updated.alt_text || ''),
+            position: Number(updated.position || 0),
+            createdAt: Number(updated.created_at || now),
+            updatedAt: now,
+          };
           return {
             ok: true,
             data: {
-              item: {
-                id: String(updated.id || catId),
-                name: String(updated.name || ''),
-                slug: String(updated.slug || catId),
-                subtitle: String(updated.subtitle || ''),
-                imageUrl: String(updated.image_url || ''),
-                altText: String(updated.alt_text || ''),
-                position: Number(updated.position || 0),
-                createdAt: Number(updated.created_at || now),
-                updatedAt: now,
-              },
+              category: catDto,
+              item: catDto,
             } as unknown as T,
           };
         }
@@ -3254,9 +4633,9 @@ export async function handleClientlessApiRequest<T>(
         const msgId = decodeURIComponent(cleanPath.slice('/api/admin/messages/'.length));
         if (upperMethod === 'DELETE') {
           await firestoreDeleteDoc('contact_messages', msgId, idToken);
-          return { ok: true, data: { deleted: true, id: msgId } as unknown as T };
+          return { ok: true, data: { deleted: true, deletedId: msgId, id: msgId } as unknown as T };
         }
-        if (upperMethod === 'PATCH') {
+        if (upperMethod === 'PATCH' || upperMethod === 'PUT') {
           const existing = await firestoreGetDoc<Record<string, unknown>>(
             'contact_messages',
             msgId,
@@ -3271,37 +4650,57 @@ export async function handleClientlessApiRequest<T>(
             };
           }
           const now = Date.now();
+          const nextNote =
+            typeof body.adminNote === 'string'
+              ? body.adminNote
+              : typeof body.adminNotes === 'string'
+                ? body.adminNotes
+                : String(existing.admin_note ?? existing.admin_notes ?? '');
+          const nextStatus =
+            typeof body.status === 'string'
+              ? body.status === 'new'
+                ? 'unread'
+                : body.status
+              : String(existing.status || 'unread');
           const updated: Record<string, unknown> = {
             ...existing,
-            ...(typeof body.status === 'string' ? { status: body.status } : {}),
-            ...(typeof body.adminNotes === 'string'
-              ? { admin_notes: body.adminNotes }
-              : {}),
+            status: nextStatus,
+            admin_note: nextNote,
             updated_at: now,
           };
           await firestoreSetDoc('contact_messages', msgId, updated, idToken);
+          const msgDto = {
+            id: msgId,
+            senderName: String(updated.sender_name || updated.full_name || 'Guest'),
+            fullName: String(updated.sender_name || updated.full_name || 'Guest'),
+            senderPhone: String(updated.sender_phone || updated.phone || ''),
+            phone: String(updated.sender_phone || updated.phone || ''),
+            senderEmail: String(updated.sender_email || updated.email || ''),
+            email: (updated.sender_email || updated.email || null) as string | null,
+            subject: String(updated.subject || updated.product_interest || 'Boutique Enquiry'),
+            productInterest: (updated.product_interest || updated.subject || null) as string | null,
+            message: String(updated.message || ''),
+            status: nextStatus,
+            adminNote: nextNote,
+            adminNotes: nextNote,
+            createdAt: Number(updated.created_at || now),
+            updatedAt: now,
+          };
           return {
             ok: true,
             data: {
-              item: {
-                id: msgId,
-                fullName: String(updated.full_name || ''),
-                phone: String(updated.phone || ''),
-                email: (updated.email as string | null) ?? null,
-                productInterest: (updated.product_interest as string | null) ?? null,
-                message: String(updated.message || ''),
-                status: String(updated.status || 'new'),
-                adminNotes: String(updated.admin_notes || ''),
-                createdAt: Number(updated.created_at || now),
-                updatedAt: now,
-              },
+              message: msgDto,
+              item: msgDto,
             } as unknown as T,
           };
         }
       }
 
-      if (cleanPath.startsWith('/api/admin/orders/') && upperMethod === 'PATCH') {
-        const orderId = decodeURIComponent(cleanPath.slice('/api/admin/orders/'.length));
+      if (cleanPath.startsWith('/api/admin/orders/') && (upperMethod === 'PATCH' || upperMethod === 'POST')) {
+        const rawSub = cleanPath.slice('/api/admin/orders/'.length).replace(/\/+$/, '');
+        const orderId = decodeURIComponent(
+          rawSub.endsWith('/status') ? rawSub.slice(0, -'/status'.length) : rawSub
+        );
         const existing = await firestoreGetDoc<Record<string, unknown>>(
           'orders',
           orderId,
@@ -3315,17 +4714,14 @@ export async function handleClientlessApiRequest<T>(
             error: 'Order not found.',
           };
         }
-        const now = Date.now();
         const updated = {
           ...existing,
           ...(typeof body.status === 'string' ? { status: body.status } : {}),
-          ...(typeof body.notes === 'string' ? { notes: body.notes } : {}),
-          updated_at: now,
         };
         await firestoreSetDoc('orders', orderId, updated, idToken);
         return {
           ok: true,
-          data: { item: updated } as unknown as T,
+          data: { order: updated, item: updated } as unknown as T,
         };
       }
     }
@@ -3343,6 +4739,7 @@ export async function handleClientlessApiRequest<T>(
         status: err.httpStatus,
         code: err.code,
         error: err.message,
+        ...(err.fieldErrors ? { fieldErrors: err.fieldErrors } : {}),
       };
     }
     return {

@@ -9,7 +9,7 @@ export default defineConfig(({ mode }) => {
     // Vercel hosts this project's static output; Express runs only in server deployments.
     define: {
       'import.meta.env.VITE_API_TRANSPORT': JSON.stringify(
-        mode === 'static' ? 'firebase' : 'server'
+        mode === 'static' ? 'firebase' : ''
       ),
     },
     resolve: {

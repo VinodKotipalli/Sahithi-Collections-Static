@@ -38,8 +38,9 @@ test('Firestore rows preserve recent records and map dashboard names', () => {
   assert.equal(result.metrics.totalAuditEvents, 1);
 });
 
-test('actual Firebase overview endpoint supplies all arrays and renders an empty store', async () => {
+test('actual Firebase overview endpoint supplies all arrays and renders merged catalog with empty Firestore activity', async () => {
   const { handleClientlessApiRequest, clearClientFirebaseSession, AUTHORIZED_OWNER_EMAIL } = await import('../src/services/firebaseClientApi.ts');
+  const { PRODUCTS } = await import('../src/config/products.ts');
   const originalFetch = globalThis.fetch;
   clearClientFirebaseSession();
   globalThis.fetch = async (input, options) => {
@@ -60,8 +61,31 @@ test('actual Firebase overview endpoint supplies all arrays and renders an empty
     assert.equal(response.ok,true);
     if (!response.ok) return;
     for (const key of ['recentOrders','recentMessages','lowStockItems','recentAuditLogs']) assert.deepEqual(response.data[key],[]);
-    assert.equal(response.data.metrics.publishedProducts,0);
+    assert.equal(response.data.metrics.publishedProducts,PRODUCTS.length);
     assert.equal(response.data.metrics.totalAuditEvents,0);
     assert.doesNotThrow(() => renderToStaticMarkup(React.createElement(AdminOverviewSection,{...props,overview:response.data})));
+
+    // Verify clientless POST /api/admin/products/sc-101/unpublish and publish succeed
+    const unpubRes = await handleClientlessApiRequest<any>(
+      '/api/admin/products/sc-101/unpublish',
+      'POST',
+      JSON.stringify({ expectedVersion: 1 })
+    );
+    assert.equal(unpubRes.ok, true);
+    if (unpubRes.ok) {
+      assert.equal(unpubRes.data.product.id, 'sc-101');
+      assert.equal(unpubRes.data.product.status, 'draft');
+    }
+
+    const pubRes = await handleClientlessApiRequest<any>(
+      '/api/admin/products/sc-101/publish',
+      'POST',
+      JSON.stringify({ expectedVersion: 2 })
+    );
+    assert.equal(pubRes.ok, true);
+    if (pubRes.ok) {
+      assert.equal(pubRes.data.product.id, 'sc-101');
+      assert.equal(pubRes.data.product.status, 'published');
+    }
   } finally { globalThis.fetch = originalFetch; clearClientFirebaseSession(); }
 });

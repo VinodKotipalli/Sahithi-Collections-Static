@@ -1630,6 +1630,70 @@ export function registerCatalogAndAdminRoutes(params: {
         }
 
         const existing = existingFound.data.product;
+
+        // Support status-only PATCH updates (e.g. { status: 'draft' | 'published' | 'archived' })
+        if (
+          req.body &&
+          typeof req.body.status === 'string' &&
+          ['published', 'draft', 'archived'].includes(req.body.status) &&
+          req.body.title === undefined &&
+          req.body.name === undefined
+        ) {
+          const targetStatus = req.body.status as ProductStatus;
+          const actionName: 'publish' | 'unpublish' | 'archive' | 'restore' =
+            targetStatus === 'published'
+              ? 'publish'
+              : targetStatus === 'archived'
+                ? 'archive'
+                : existing.status === 'archived'
+                  ? 'restore'
+                  : 'unpublish';
+          let transitionResult = await store.transitionProductStatus({
+            productId: existing.id,
+            expectedVersion:
+              typeof req.body.expectedVersion === 'number'
+                ? req.body.expectedVersion
+                : existing.version,
+            targetStatus,
+            actionName,
+            actorUserId: req.authUser!.id,
+          });
+          if (!transitionResult.ok && transitionResult.code === 'VERSION_CONFLICT') {
+            const refreshed = await store.getAdminProduct(existing.id);
+            if (refreshed) {
+              transitionResult = await store.transitionProductStatus({
+                productId: existing.id,
+                expectedVersion: refreshed.data.product.version,
+                targetStatus,
+                actionName,
+                actorUserId: req.authUser!.id,
+              });
+            }
+          }
+          if (!transitionResult.ok) {
+            if (transitionResult.code === 'PRODUCT_NOT_FOUND') {
+              return sendJsonError(req, res, 404, 'PRODUCT_NOT_FOUND', 'Product not found.');
+            }
+            if (transitionResult.code === 'NO_IMAGES') {
+              return sendJsonError(
+                req,
+                res,
+                400,
+                'VALIDATION_ERROR',
+                'Add at least one photo before publishing this product to the storefront.'
+              );
+            }
+            return sendJsonError(
+              req,
+              res,
+              409,
+              'VERSION_CONFLICT',
+              'Product version changed concurrently. Refresh and retry.'
+            );
+          }
+          return res.json({ product: serializeAdminProduct(transitionResult.product) });
+        }
+
         const expectedVersion =
           typeof req.body?.expectedVersion === 'number'
             ? req.body.expectedVersion
@@ -1804,18 +1868,32 @@ export function registerCatalogAndAdminRoutes(params: {
         if (!existingFound) {
           return sendJsonError(req, res, 404, 'PRODUCT_NOT_FOUND', 'Product not found.');
         }
+        const canonicalId = existingFound.data.product.id;
         const expectedVersion =
           typeof req.body?.expectedVersion === 'number'
             ? req.body.expectedVersion
             : existingFound.data.product.version;
 
-        const result = await store.transitionProductStatus({
-          productId: id,
+        let result = await store.transitionProductStatus({
+          productId: canonicalId,
           expectedVersion,
           targetStatus,
           actionName,
           actorUserId: req.authUser!.id,
         });
+
+        if (!result.ok && result.code === 'VERSION_CONFLICT') {
+          const refreshed = await store.getAdminProduct(canonicalId);
+          if (refreshed) {
+            result = await store.transitionProductStatus({
+              productId: canonicalId,
+              expectedVersion: refreshed.data.product.version,
+              targetStatus,
+              actionName,
+              actorUserId: req.authUser!.id,
+            });
+          }
+        }
 
         if (!result.ok) {
           if (result.code === 'PRODUCT_NOT_FOUND') {
@@ -1846,26 +1924,28 @@ export function registerCatalogAndAdminRoutes(params: {
     };
   };
 
-  app.post(
-    '/api/admin/products/:id/publish',
-    requireOwner,
-    handleLifecycleTransition('published', 'publish')
-  );
-  app.post(
-    '/api/admin/products/:id/unpublish',
-    requireOwner,
-    handleLifecycleTransition('draft', 'unpublish')
-  );
-  app.post(
-    '/api/admin/products/:id/archive',
-    requireOwner,
-    handleLifecycleTransition('archived', 'archive')
-  );
-  app.post(
-    '/api/admin/products/:id/restore',
-    requireOwner,
-    handleLifecycleTransition('draft', 'restore')
-  );
+  for (const method of ['post', 'patch', 'put'] as const) {
+    app[method](
+      '/api/admin/products/:id/publish',
+      requireOwner,
+      handleLifecycleTransition('published', 'publish')
+    );
+    app[method](
+      '/api/admin/products/:id/unpublish',
+      requireOwner,
+      handleLifecycleTransition('draft', 'unpublish')
+    );
+    app[method](
+      '/api/admin/products/:id/archive',
+      requireOwner,
+      handleLifecycleTransition('archived', 'archive')
+    );
+    app[method](
+      '/api/admin/products/:id/restore',
+      requireOwner,
+      handleLifecycleTransition('draft', 'restore')
+    );
+  }
 
   app.delete(
     '/api/admin/products/:id',

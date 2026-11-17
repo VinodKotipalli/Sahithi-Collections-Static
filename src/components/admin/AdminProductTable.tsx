@@ -115,7 +115,11 @@ export function AdminProductTable({
           </div>
 
           <p className="text-xs font-medium text-[#242124]/65 tabular-nums">
-            Showing {products.length} of {total} product{total === 1 ? '' : 's'}
+            Showing {products.length} of{' '}
+            {typeof total === 'number' && !Number.isNaN(total) ? total : products.length} product
+            {(typeof total === 'number' && !Number.isNaN(total) ? total : products.length) === 1
+              ? ''
+              : 's'}
           </p>
         </div>
 

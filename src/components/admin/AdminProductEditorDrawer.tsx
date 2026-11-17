@@ -378,8 +378,46 @@ export function AdminProductEditorDrawer({
 
     setUploading(true);
     try {
+      const optimizeImageForCatalog = async (file: File): Promise<File> => {
+        if (
+          file.size <= 350 * 1024 ||
+          typeof createImageBitmap !== 'function' ||
+          typeof document === 'undefined'
+        ) {
+          return file;
+        }
+        try {
+          const bitmap = await createImageBitmap(file);
+          const maxDim = 1400;
+          const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+          const width = Math.max(1, Math.round(bitmap.width * scale));
+          const height = Math.max(1, Math.round(bitmap.height * scale));
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            bitmap.close();
+            return file;
+          }
+          ctx.drawImage(bitmap, 0, 0, width, height);
+          bitmap.close();
+          const targetMime = file.type === 'image/png' ? 'image/jpeg' : file.type;
+          const blob = await new Promise<Blob | null>((resolve) =>
+            canvas.toBlob(resolve, targetMime, 0.82)
+          );
+          if (!blob || blob.size >= file.size) return file;
+          const ext = targetMime === 'image/webp' ? 'webp' : 'jpg';
+          const baseName = file.name.replace(/\.[^.]+$/, '') || 'product-photo';
+          return new File([blob], `${baseName}.${ext}`, { type: targetMime });
+        } catch {
+          return file;
+        }
+      };
+
+      const preparedFiles = await Promise.all(files.map((f) => optimizeImageForCatalog(f)));
       const fd = new FormData();
-      files.forEach((f) => fd.append('files', f));
+      preparedFiles.forEach((f) => fd.append('files', f));
 
       const res = await apiRequest<{
         files: Array<{ id: string; url: string; filename: string; byteSize: number }>;
@@ -742,7 +780,9 @@ export function AdminProductEditorDrawer({
 
     setSaving(true);
     try {
-      const endpoint = product ? `/api/admin/products/${product.id}` : '/api/admin/products';
+      const endpoint = product
+        ? `/api/admin/products/${encodeURIComponent(product.id)}`
+        : '/api/admin/products';
       const method = product ? 'PATCH' : 'POST';
       const res = await apiRequest<{ product: AdminProduct }>(endpoint, {
         method,
