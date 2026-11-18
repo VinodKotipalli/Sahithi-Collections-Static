@@ -1950,12 +1950,15 @@ export function registerCatalogAndAdminRoutes(params: {
     requireCustomerAuth,
     async (_req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
       try {
-        // Honest Saved Cards & Wallet availability: standard Razorpay Checkout handles UPI, cards, and wallets securely per payment without storing PANs locally.
+        const tokenizationEnabled =
+          process.env.RAZORPAY_TOKENIZATION_ENABLED === 'true' ||
+          process.env.RAZORPAY_CUSTOMER_VAULT_ENABLED === 'true';
         return res.json({
-          enabled: false,
+          enabled: tokenizationEnabled,
           provider: 'razorpay',
-          reason:
-            'Sahithi Collections uses PCI-compliant Razorpay Standard Checkout. Saved card tokens require Razorpay Customer Vault configuration; all UPI, Cards, Wallets, and NetBanking options remain available at checkout.',
+          reason: tokenizationEnabled
+            ? 'Razorpay Customer Vault tokenization is enabled on this merchant account. All card entry stays inside PCI-compliant Razorpay Checkout.'
+            : 'Saved card tokenization is pending merchant activation of Razorpay Customer Vault / TokenHQ. All UPI, Credit & Debit Cards, Wallets, and NetBanking options remain available inside Razorpay Checkout.',
           methods: [],
         });
       } catch (err) {

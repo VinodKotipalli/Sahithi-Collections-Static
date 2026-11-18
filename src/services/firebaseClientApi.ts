@@ -746,9 +746,16 @@ async function firestoreSetDoc(
   collectionName: string,
   docId: string,
   data: Record<string, unknown>,
-  idToken?: string
+  idToken?: string,
+  updateMaskFields?: string[]
 ): Promise<void> {
-  const url = `${firestoreBaseUrl()}/${collectionName}/${encodeURIComponent(docId)}`;
+  const maskQuery =
+    Array.isArray(updateMaskFields) && updateMaskFields.length > 0
+      ? `?${updateMaskFields
+          .map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`)
+          .join('&')}`
+      : '';
+  const url = `${firestoreBaseUrl()}/${collectionName}/${encodeURIComponent(docId)}${maskQuery}`;
   const fields: Record<string, FirestoreFieldValue> = {};
   for (const [k, v] of Object.entries(data)) {
     if (v !== undefined) fields[k] = toFirestoreValue(v);
@@ -2209,17 +2216,20 @@ async function ensureCompletedClientSignIn(params: {
 
   const now = Date.now();
   const isOwner = account.email === AUTHORIZED_OWNER_EMAIL && account.emailVerified;
-  const fullName =
-    account.displayName ||
-    signIn.displayName ||
-    (isOwner ? 'Store Owner' : 'Member');
 
   // Sync user profile in Firestore using rules-compliant schema (boolean email_verified, no password_hash)
   const existingUserDoc = await firestoreGetDoc<{
+    full_name?: string;
     created_at?: number;
     phone_e164?: string | null;
     phone_verified?: boolean;
   }>('users', account.uid, signIn.idToken).catch(() => null);
+
+  const fullName =
+    account.displayName ||
+    signIn.displayName ||
+    existingUserDoc?.full_name ||
+    (isOwner ? 'Store Owner' : 'Member');
 
   await firestoreSetDoc(
     'users',
@@ -2912,18 +2922,13 @@ export async function handleClientlessApiRequest<T>(
           idToken: session.idToken,
           displayName: fullName,
           returnSecureToken: false,
-        }).catch(() => undefined);
+        });
         const now = Date.now();
         const existingUserDoc = await firestoreGetDoc<{
           created_at?: number;
           phone_e164?: string | null;
           phone_verified?: boolean;
         }>('users', session.uid, session.idToken).catch(() => null);
-        const updatedSession: ClientFirebaseSession = {
-          ...session,
-          fullName,
-        };
-        saveStoredSession(updatedSession);
         await firestoreSetDoc(
           'users',
           session.uid,
@@ -2941,7 +2946,12 @@ export async function handleClientlessApiRequest<T>(
             updated_at: now,
           },
           session.idToken
-        ).catch(() => undefined);
+        );
+        const updatedSession: ClientFirebaseSession = {
+          ...session,
+          fullName,
+        };
+        saveStoredSession(updatedSession);
         return {
           ok: true,
           data: { user: buildPublicAuthUser(updatedSession) } as unknown as T,
@@ -3295,11 +3305,28 @@ export async function handleClientlessApiRequest<T>(
       }
       const addrId = decodeURIComponent(cleanPath.slice('/api/account/addresses/'.length));
       if (upperMethod === 'DELETE') {
-        await firestoreDeleteDoc(
-          `users/${encodeURIComponent(session.uid)}/addresses`,
-          addrId,
+        const colPath = `users/${encodeURIComponent(session.uid)}/addresses`;
+        await firestoreDeleteDoc(colPath, addrId, session.idToken);
+        const remaining = await firestoreListDocs<Record<string, unknown>>(
+          colPath,
           session.idToken
         );
+        const hasDefault = remaining.some((a) => a.is_default === true || a.is_default === 1);
+        if (remaining.length > 0 && !hasDefault) {
+          const sortedRemaining = [...remaining].sort(
+            (a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0)
+          );
+          const candidate = sortedRemaining[0];
+          const cid = String(candidate.id || '');
+          if (cid) {
+            await firestoreSetDoc(
+              colPath,
+              cid,
+              { ...candidate, is_default: true, updated_at: Date.now() },
+              session.idToken
+            ).catch(() => undefined);
+          }
+        }
         return { ok: true, data: { deletedId: addrId, ok: true } as unknown as T };
       }
       if (upperMethod === 'PATCH' || upperMethod === 'PUT') {
@@ -3472,9 +3499,10 @@ export async function handleClientlessApiRequest<T>(
           await firestoreSetDoc(
             `users/${encodeURIComponent(session.uid)}/notifications`,
             n.id,
-            { ...n, is_read: 1, read: true, read_at: now },
-            session.idToken
-          ).catch(() => undefined);
+            { is_read: 1, read: true, read_at: now },
+            session.idToken,
+            ['is_read', 'read', 'read_at']
+          );
         }
       }
       return { ok: true, data: { ok: true } as unknown as T };
@@ -3513,8 +3541,9 @@ export async function handleClientlessApiRequest<T>(
       await firestoreSetDoc(
         `users/${encodeURIComponent(session.uid)}/notifications`,
         notifId,
-        { ...existing, is_read: 1, read: true, read_at: Date.now() },
-        session.idToken
+        { is_read: 1, read: true, read_at: Date.now() },
+        session.idToken,
+        ['is_read', 'read', 'read_at']
       );
       return { ok: true, data: { ok: true, id: notifId } as unknown as T };
     }
@@ -3530,21 +3559,24 @@ export async function handleClientlessApiRequest<T>(
         };
       }
       const now = Date.now();
-      const activeNumDocs = await firestoreRunQuery<Record<string, unknown>>(
-        'coupons',
-        [{ field: 'active', value: 1 }],
-        session.idToken
-      );
-      const activeBoolDocs =
-        activeNumDocs.length > 0
-          ? []
-          : await firestoreRunQuery<Record<string, unknown>>(
-              'coupons',
-              [{ field: 'active', value: true }],
-              session.idToken
-            );
-      const merged = [...activeNumDocs, ...activeBoolDocs].map((c) => serializeClientCouponDoc(c));
-      const available = merged.filter(
+      const [activeNumDocs, activeBoolDocs] = await Promise.all([
+        firestoreRunQuery<Record<string, unknown>>(
+          'coupons',
+          [{ field: 'active', value: 1 }],
+          session.idToken
+        ),
+        firestoreRunQuery<Record<string, unknown>>(
+          'coupons',
+          [{ field: 'active', value: true }],
+          session.idToken
+        ),
+      ]);
+      const deduped = new Map<string, ReturnType<typeof serializeClientCouponDoc>>();
+      for (const rawDoc of [...activeNumDocs, ...activeBoolDocs]) {
+        const serialized = serializeClientCouponDoc(rawDoc);
+        if (serialized.id) deduped.set(serialized.id, serialized);
+      }
+      const available = Array.from(deduped.values()).filter(
         (c) =>
           c.active &&
           (!c.startsAt || now >= c.startsAt) &&

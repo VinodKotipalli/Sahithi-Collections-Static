@@ -2034,9 +2034,24 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
   }
 
   async deleteCustomerAddress(userId: string, addressId: string): Promise<boolean> {
+    const existing = this.db
+      .prepare(`SELECT is_default FROM customer_addresses WHERE id = ? AND user_id = ? LIMIT 1`)
+      .get(addressId, userId) as { is_default?: number } | undefined;
     const res = this.db
       .prepare(`DELETE FROM customer_addresses WHERE id = ? AND user_id = ?`)
       .run(addressId, userId);
+    if (res.changes > 0 && Number(existing?.is_default || 0) === 1) {
+      const next = this.db
+        .prepare(
+          `SELECT id FROM customer_addresses WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1`
+        )
+        .get(userId) as { id?: string } | undefined;
+      if (next?.id) {
+        this.db
+          .prepare(`UPDATE customer_addresses SET is_default = 1, updated_at = ? WHERE id = ? AND user_id = ?`)
+          .run(Date.now(), next.id, userId);
+      }
+    }
     return res.changes > 0;
   }
 

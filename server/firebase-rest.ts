@@ -3459,7 +3459,22 @@ export class FirestoreRestStore implements BoutiqueStore {
   async deleteCustomerAddress(userId: string, addressId: string): Promise<boolean> {
     const existing = await this.getDoc(`users/${userId}/addresses/${addressId}`);
     if (!existing) return false;
+    const wasDefault = Boolean(existing.data.is_default);
     await this.deleteDoc(`users/${userId}/addresses/${addressId}`);
+    if (wasDefault) {
+      const remaining = await this.listCustomerAddresses(userId);
+      if (remaining.length > 0 && !remaining.some((a) => Boolean(a.is_default))) {
+        const sorted = [...remaining].sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0));
+        const nextDefault = sorted[0];
+        if (nextDefault) {
+          await this.setDoc(`users/${userId}/addresses/${nextDefault.id}`, {
+            ...nextDefault,
+            is_default: 1,
+            updated_at: Date.now(),
+          });
+        }
+      }
+    }
     return true;
   }
 

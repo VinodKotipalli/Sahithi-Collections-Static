@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { parseAccountSection, type AccountSectionId } from '../config/accountMenu';
 
 export type BoutiqueRoute =
   | '/'
@@ -37,6 +38,7 @@ interface ParsedLocation {
   queryMode: string;
   nextPath: string;
   productSlug: string;
+  accountSection: AccountSectionId;
 }
 
 function readLocation(): ParsedLocation {
@@ -48,6 +50,7 @@ function readLocation(): ParsedLocation {
       queryMode: '',
       nextPath: '/account',
       productSlug: '',
+      accountSection: 'profile',
     };
   }
   const pathname = window.location.pathname.replace(/\/+$/, '') || '/';
@@ -63,11 +66,12 @@ function readLocation(): ParsedLocation {
   const token = params.get('token') || params.get('oobCode') || '';
   const queryMode = params.get('mode') || '';
   const nextPath = sanitizeNextPath(params.get('next'), '');
+  const accountSection = parseAccountSection(params.get('section'));
   const pathProductSlug = isProductPath
     ? decodeURIComponent(pathname.slice('/products/'.length)).replace(/\/+$/, '')
     : '';
   const productSlug = pathProductSlug || (params.get('product') || '').trim();
-  return { route, adminSubPath, token, queryMode, nextPath, productSlug };
+  return { route, adminSubPath, token, queryMode, nextPath, productSlug, accountSection };
 }
 
 export function useBoutiqueRouter() {
@@ -134,6 +138,7 @@ export function useBoutiqueRouter() {
     queryMode: locationState.queryMode,
     nextPath: locationState.nextPath,
     productSlug: locationState.productSlug,
+    accountSection: locationState.accountSection,
     navigate,
     navigateToSection,
   };

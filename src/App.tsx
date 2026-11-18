@@ -23,7 +23,11 @@ import type { WhatsAppStylistProductContext } from './services/whatsappStylist';
 import { PRODUCTS } from './config/products';
 import { AuthProvider, useAuth, type AuthUser } from './context/AuthContext';
 import { StorefrontProvider, useStorefront } from './context/StorefrontContext';
-import { useBoutiqueRouter } from './hooks/useBoutiqueRouter';
+import {
+  buildAccountSectionPath,
+  ACCOUNT_MENU_ITEMS,
+} from './config/accountMenu';
+import { useBoutiqueRouter, sanitizeNextPath } from './hooks/useBoutiqueRouter';
 import { usePrefersReducedMotion } from './hooks/usePrefersReducedMotion';
 import { useShoppingBag } from './hooks/useShoppingBag';
 import { useWishlist } from './hooks/useWishlist';
@@ -96,6 +100,7 @@ function BoutiqueShell() {
     queryMode,
     nextPath,
     productSlug,
+    accountSection,
     navigate,
     navigateToSection,
   } = useBoutiqueRouter();
@@ -201,10 +206,14 @@ function BoutiqueShell() {
         adminSubPath === '/login'
           ? `Owner Sign-In — ${brand}`
           : `Atelier Studio — ${brand}`;
+    } else if (route === '/account') {
+      const sectionLabel =
+        ACCOUNT_MENU_ITEMS.find((item) => item.id === accountSection)?.label || 'Your Account';
+      document.title = `${sectionLabel} — Your Account — ${brand}`;
     } else {
       document.title = `${brand} — ${cleanTagline}`;
     }
-  }, [route, adminSubPath, settings.brandName, settings.tagline]);
+  }, [route, adminSubPath, accountSection, settings.brandName, settings.tagline]);
 
   const {
     wishlistIds,
@@ -273,7 +282,12 @@ function BoutiqueShell() {
 
   useEffect(() => {
     if (!isLoadingSession && route === '/account' && !user) {
-      navigate('/login?next=%2Faccount', { replace: true });
+      const intendedPath =
+        typeof window !== 'undefined'
+          ? `${window.location.pathname}${window.location.search}`
+          : '/account';
+      const safeIntended = sanitizeNextPath(intendedPath, '/account');
+      navigate(`/login?next=${encodeURIComponent(safeIntended)}`, { replace: true });
     }
   }, [isLoadingSession, route, user, navigate]);
 
@@ -374,6 +388,8 @@ function BoutiqueShell() {
           </div>
         ) : user ? (
           <AccountDashboard
+            activeSection={accountSection}
+            onSelectSection={(section) => navigate(buildAccountSectionPath(section))}
             wishlistCount={wishlistCount}
             wishlistProducts={wishlistProducts}
             onRemoveWishlistItem={removeFromWishlist}
@@ -475,8 +491,8 @@ function BoutiqueShell() {
           </main>
 
           <ContactAndFooter
-            onNavigateAuth={() => navigate(user ? '/account' : '/login')}
-            accountLabel={user ? 'My Account' : 'Login / Sign Up'}
+            onNavigateAuth={() => navigate(user ? '/account?section=profile' : '/login')}
+            accountLabel={user ? 'Your Account' : 'Sign In / Sign Up'}
             onOpenStylist={() => {
               setStylistProductContext(null);
               setStylistOpen(true);

@@ -121,16 +121,45 @@ export function BagDrawer({
   );
 
   const codAttemptRef = useRef<{ signature: string; key: string } | null>(null);
+  const lastAuthUserIdRef = useRef<string | null>(user?.id ?? null);
 
   useFocusTrap(isOpen, drawerRef, onClose);
 
   useEffect(() => {
+    const nextUserId = user?.id ?? null;
+    const prevUserId = lastAuthUserIdRef.current;
+
+    if (prevUserId !== nextUserId) {
+      lastAuthUserIdRef.current = nextUserId;
+      codAttemptRef.current = null;
+      setSavedAddresses([]);
+      setSelectedAddressId('');
+      setReceipt(null);
+      setPendingConfirmation(null);
+      setErrorText(null);
+      setPaymentErrorText(null);
+      setCustomerPhone('');
+      setShippingAddress('');
+      setCouponInput('');
+      setGiftCardInput('');
+      setAppliedCouponCode(null);
+      setAppliedGiftCardCode(null);
+      setDiscountPaise(0);
+      setGiftCardPaise(0);
+      setPromoFeedback(null);
+      if (user) {
+        setCustomerName(user.fullName || '');
+        setCustomerEmail(user.email || '');
+      } else {
+        setCustomerName('');
+        setCustomerEmail('');
+      }
+      return;
+    }
+
     if (user) {
       setCustomerName((prev) => prev || user.fullName || '');
       setCustomerEmail((prev) => prev || user.email || '');
-    } else {
-      setSavedAddresses([]);
-      setSelectedAddressId('');
     }
   }, [user]);
 
@@ -143,10 +172,16 @@ export function BagDrawer({
       setSavedAddresses(list);
       if (list.length > 0) {
         const defaultAddr = list.find((a) => a.isDefault) || list[0];
-        setSelectedAddressId((prev) => prev || defaultAddr.id);
+        setSelectedAddressId((prev) => {
+          if (prev === '__custom__') return prev;
+          if (prev && list.some((a) => a.id === prev)) return prev;
+          return defaultAddr.id;
+        });
         setCustomerName((prev) => prev || defaultAddr.fullName || user.fullName || '');
         setCustomerPhone((prev) => prev || defaultAddr.phone || '');
         setShippingAddress((prev) => prev || formatSavedAddressText(defaultAddr));
+      } else {
+        setSelectedAddressId('');
       }
     });
     return () => {
@@ -306,6 +341,12 @@ export function BagDrawer({
 
   const handleSelectSavedAddress = (addrId: string) => {
     setSelectedAddressId(addrId);
+    if (addrId === '__custom__') {
+      setCustomerName(user?.fullName || '');
+      setCustomerPhone('');
+      setShippingAddress('');
+      return;
+    }
     const picked = savedAddresses.find((a) => a.id === addrId);
     if (!picked) return;
     setCustomerName(picked.fullName || user?.fullName || '');
@@ -417,43 +458,84 @@ export function BagDrawer({
         }
 
         const idToken = await getValidClientIdToken().catch(() => null);
-        const codRes = await apiRequest<{ order?: PlacedOrderReceipt; duplicate?: boolean }>(
-          '/api/orders',
-          {
-            method: 'POST',
-            headers: idToken ? { Authorization: `Bearer ${idToken}` } : undefined,
-            body: JSON.stringify({
-              ...customerDetails,
-              customer: customerDetails,
-              paymentMethod: 'cod',
-              couponCode: appliedCouponCode || undefined,
-              giftCardCode: appliedGiftCardCode || undefined,
-              idempotencyKey: codAttemptRef.current.key,
-              items: payloadItems,
-            }),
+        const codRequestBody = JSON.stringify({
+          ...customerDetails,
+          customer: customerDetails,
+          paymentMethod: 'cod',
+          couponCode: appliedCouponCode || undefined,
+          giftCardCode: appliedGiftCardCode || undefined,
+          idempotencyKey: codAttemptRef.current.key,
+          items: payloadItems,
+        });
+
+        let codResOk = false;
+        let codStatus = 500;
+        let codOrder: PlacedOrderReceipt | undefined;
+        let codError = 'Could not confirm your Cash on Delivery order. Please try again.';
+
+        // Prefer real server /api/orders endpoint (Vercel Function / Express server) so stock, coupons & gift cards execute atomically with admin credentials.
+        const serverResponse = await fetch('/api/orders', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
+          body: codRequestBody,
+        }).catch(() => null);
+
+        const serverContentType = (serverResponse?.headers.get('content-type') || '').toLowerCase();
+        const hitStaticFallback =
+          !serverResponse ||
+          ((serverResponse.status === 404 || serverResponse.status === 405) &&
+            !serverContentType.includes('application/json'));
+
+        if (!hitStaticFallback && serverResponse) {
+          const parsed = (await serverResponse.json().catch(() => ({}))) as {
+            order?: PlacedOrderReceipt;
+            error?: string;
+          };
+          codStatus = serverResponse.status;
+          codResOk = serverResponse.ok && Boolean(parsed.order?.orderNumber);
+          codOrder = parsed.order;
+          if (!codResOk && typeof parsed.error === 'string' && parsed.error) {
+            codError = parsed.error;
           }
-        );
+        } else {
+          const fallbackRes = await apiRequest<{ order?: PlacedOrderReceipt; duplicate?: boolean }>(
+            '/api/orders',
+            {
+              method: 'POST',
+              headers: idToken ? { Authorization: `Bearer ${idToken}` } : undefined,
+              body: codRequestBody,
+            }
+          );
+          codStatus = fallbackRes.ok ? 200 : fallbackRes.status;
+          codResOk = fallbackRes.ok && Boolean(fallbackRes.data?.order?.orderNumber);
+          codOrder = fallbackRes.ok ? fallbackRes.data?.order : undefined;
+          if (!fallbackRes.ok) {
+            codError = fallbackRes.error;
+          }
+        }
 
         checkoutInFlightRef.current = false;
         setSubmitting(false);
 
-        if (!codRes.ok || !codRes.data?.order?.orderNumber) {
-          setPaymentErrorText(
-            !codRes.ok
-              ? codRes.error
-              : 'Could not confirm your Cash on Delivery order. Please try again.'
-          );
-          if (!codRes.ok && codRes.status === 409) {
+        if (!codResOk || !codOrder?.orderNumber) {
+          setPaymentErrorText(codError);
+          if (codStatus === 409) {
             void revalidateBag();
           }
           return;
         }
 
         codAttemptRef.current = null;
-        setReceipt(codRes.data.order);
+        setReceipt(codOrder);
         setCheckoutOpen(false);
         onClearBag();
         onOrderCompleted();
+        window.dispatchEvent(new Event('sahithi:notifications-updated'));
         return;
       }
 
@@ -570,6 +652,7 @@ export function BagDrawer({
           setCheckoutOpen(false);
           onClearBag();
           onOrderCompleted();
+          window.dispatchEvent(new Event('sahithi:notifications-updated'));
         },
       });
 
@@ -989,6 +1072,7 @@ export function BagDrawer({
                                 {addr.isDefault ? ' [Default]' : ''}
                               </option>
                             ))}
+                            <option value="__custom__">Enter a custom delivery address</option>
                           </select>
                         </div>
                       )}

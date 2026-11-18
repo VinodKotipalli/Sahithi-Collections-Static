@@ -65,7 +65,12 @@ export function AuthPage({
         : nextMode === 'forgot'
           ? '/forgot-password'
           : '/login';
-    onNavigate(targetPath);
+    const nextParam =
+      typeof window !== 'undefined'
+        ? new URLSearchParams(window.location.search).get('next')
+        : null;
+    const suffix = nextParam ? `?next=${encodeURIComponent(nextParam)}` : '';
+    onNavigate(`${targetPath}${suffix}`);
   };
 
   const initialNotice =

@@ -10,22 +10,19 @@ import {
 import {
   AlertCircle,
   ArrowLeft,
-  Award,
+  Banknote,
   Bell,
   Check,
   CheckCircle2,
   Copy,
   CreditCard,
-  Crown,
   Edit3,
   Eye,
   EyeOff,
-  Gift,
   Heart,
   KeyRound,
   LayoutDashboard,
   Loader2,
-  LogOut,
   Mail,
   MapPin,
   Menu,
@@ -39,6 +36,11 @@ import {
   User,
   X,
 } from 'lucide-react';
+import {
+  ACCOUNT_LOGOUT_ITEM,
+  ACCOUNT_MENU_ITEMS,
+  type AccountSectionId,
+} from '../../config/accountMenu';
 import { useAuth } from '../../context/AuthContext';
 import { SITE_CONFIG } from '../../config/site';
 import type {
@@ -55,19 +57,11 @@ import type {
 import { formatINR, formatPaiseINR, formatTimestamp } from '../../utils/format';
 import { BoutiqueImage } from '../BoutiqueImage';
 
-export type AccountSectionId =
-  | 'profile'
-  | 'orders'
-  | 'coupons'
-  | 'rewards'
-  | 'plus'
-  | 'payments'
-  | 'addresses'
-  | 'wishlist'
-  | 'gift-cards'
-  | 'notifications';
+export type { AccountSectionId };
 
 interface AccountDashboardProps {
+  activeSection?: AccountSectionId;
+  onSelectSection?: (section: AccountSectionId) => void;
   wishlistCount: number;
   wishlistProducts: Product[];
   onRemoveWishlistItem: (productId: string) => void;
@@ -76,24 +70,6 @@ interface AccountDashboardProps {
   onOpenWishlist: () => void;
   onNavigate: (target: string, options?: { replace?: boolean }) => void;
 }
-
-const MENU_ITEMS: Array<{
-  id: AccountSectionId;
-  label: string;
-  subtitle: string;
-  icon: typeof User;
-}> = [
-  { id: 'profile', label: 'My Profile', subtitle: 'Name, email & security', icon: User },
-  { id: 'orders', label: 'Orders', subtitle: 'Track & manage requests', icon: Package },
-  { id: 'coupons', label: 'Coupons', subtitle: 'Active atelier offers', icon: Tag },
-  { id: 'rewards', label: 'Sahithi Rewards', subtitle: 'Earned points balance', icon: Award },
-  { id: 'plus', label: 'Sahithi Plus', subtitle: 'Membership progress', icon: Crown },
-  { id: 'payments', label: 'Saved Cards & Wallet', subtitle: 'Razorpay checkout options', icon: CreditCard },
-  { id: 'addresses', label: 'Saved Addresses', subtitle: 'Delivery locations', icon: MapPin },
-  { id: 'wishlist', label: 'Wishlist', subtitle: 'Cloud-synced favorites', icon: Heart },
-  { id: 'gift-cards', label: 'Gift Cards', subtitle: 'Check card balance', icon: Gift },
-  { id: 'notifications', label: 'Notifications', subtitle: 'Order & studio alerts', icon: Bell },
-];
 
 const EMPTY_ADDRESS_FORM = {
   id: '',
@@ -110,6 +86,8 @@ const EMPTY_ADDRESS_FORM = {
 };
 
 export function AccountDashboard({
+  activeSection: controlledSection,
+  onSelectSection,
   wishlistCount,
   wishlistProducts,
   onRemoveWishlistItem,
@@ -136,7 +114,20 @@ export function AccountDashboard({
   const confirmNewPassId = useId();
   const giftLookupId = useId();
 
-  const [activeSection, setActiveSection] = useState<AccountSectionId>('profile');
+  const [internalSection, setInternalSection] = useState<AccountSectionId>(controlledSection || 'profile');
+  const activeSection = controlledSection ?? internalSection;
+  const selectSection = useCallback(
+    (next: AccountSectionId) => {
+      if (onSelectSection) {
+        onSelectSection(next);
+      } else {
+        setInternalSection(next);
+      }
+      setMobileMenuOpen(false);
+    },
+    [onSelectSection]
+  );
+
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const navButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
@@ -576,22 +567,24 @@ export function AccountDashboard({
   ) => {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      const next = (idx + 1) % MENU_ITEMS.length;
+      const next = (idx + 1) % ACCOUNT_MENU_ITEMS.length;
       navButtonRefs.current[next]?.focus();
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      const prev = (idx - 1 + MENU_ITEMS.length) % MENU_ITEMS.length;
+      const prev = (idx - 1 + ACCOUNT_MENU_ITEMS.length) % ACCOUNT_MENU_ITEMS.length;
       navButtonRefs.current[prev]?.focus();
     } else if (e.key === 'Home') {
       e.preventDefault();
       navButtonRefs.current[0]?.focus();
     } else if (e.key === 'End') {
       e.preventDefault();
-      navButtonRefs.current[MENU_ITEMS.length - 1]?.focus();
+      navButtonRefs.current[ACCOUNT_MENU_ITEMS.length - 1]?.focus();
     }
   };
 
-  const activeMeta = MENU_ITEMS.find((m) => m.id === activeSection) || MENU_ITEMS[0];
+  const activeMeta =
+    ACCOUNT_MENU_ITEMS.find((m) => m.id === activeSection) || ACCOUNT_MENU_ITEMS[0];
+  const LogoutIcon = ACCOUNT_LOGOUT_ITEM.icon;
 
   const SidebarList = (
     <div className="flex h-full flex-col justify-between p-4 sm:p-5">
@@ -607,7 +600,7 @@ export function AccountDashboard({
         </div>
 
         <nav aria-label="Your Account menu" className="mt-4 space-y-1">
-          {MENU_ITEMS.map((item, idx) => {
+          {ACCOUNT_MENU_ITEMS.map((item, idx) => {
             const Icon = item.icon;
             const isActive = activeSection === item.id;
             const countText =
@@ -626,11 +619,8 @@ export function AccountDashboard({
                 type="button"
                 aria-current={isActive ? 'page' : undefined}
                 onKeyDown={(e) => handleSidebarKeyDown(e, idx)}
-                onClick={() => {
-                  setActiveSection(item.id);
-                  setMobileMenuOpen(false);
-                }}
-                className={`flex min-h-[44px] w-full items-center justify-between gap-2.5 rounded-xl px-3.5 py-2 text-left text-sm font-medium transition-colors ${
+                onClick={() => selectSection(item.id)}
+                className={`flex min-h-[44px] w-full items-center justify-between gap-2.5 rounded-xl px-3.5 py-2 text-left text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#49243E] ${
                   isActive
                     ? 'bg-[#49243E] text-[#FFF9F5]'
                     : 'text-[#49243E]/85 hover:bg-[#F3D5DF]/40 hover:text-[#49243E]'
@@ -665,7 +655,7 @@ export function AccountDashboard({
             setMobileMenuOpen(false);
             onOpenBag();
           }}
-          className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl border border-[#49243E]/18 bg-[#FFF9F5] px-3 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/35"
+          className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl border border-[#49243E]/18 bg-[#FFF9F5] px-3 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#49243E]"
         >
           <ShoppingBag className="h-4 w-4 text-[#B76E79]" aria-hidden="true" />
           <span>Open Boutique Bag</span>
@@ -674,14 +664,14 @@ export function AccountDashboard({
           type="button"
           disabled={loggingOut}
           onClick={() => void handleLogout()}
-          className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl border border-[#B76E79]/35 bg-white px-3 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/35 disabled:opacity-60"
+          className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl border border-[#B76E79]/35 bg-white px-3 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/35 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#49243E]"
         >
           {loggingOut ? (
             <Loader2 className="h-4 w-4 animate-spin text-[#B76E79]" aria-hidden="true" />
           ) : (
-            <LogOut className="h-4 w-4 text-[#B76E79]" aria-hidden="true" />
+            <LogoutIcon className="h-4 w-4 text-[#B76E79]" aria-hidden="true" />
           )}
-          <span>{loggingOut ? 'Logging out…' : 'Logout'}</span>
+          <span>{loggingOut ? 'Logging out…' : ACCOUNT_LOGOUT_ITEM.label}</span>
         </button>
       </div>
     </div>
@@ -744,14 +734,14 @@ export function AccountDashboard({
               type="button"
               disabled={loggingOut}
               onClick={() => void handleLogout()}
-              className="hidden min-h-[44px] items-center gap-1.5 whitespace-nowrap rounded-xl bg-[#49243E] px-3.5 text-xs font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31] disabled:opacity-60 sm:inline-flex"
+              className="hidden min-h-[44px] items-center gap-1.5 whitespace-nowrap rounded-xl bg-[#49243E] px-3.5 text-xs font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31] disabled:opacity-60 sm:inline-flex focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#49243E]"
             >
               {loggingOut ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
               ) : (
-                <LogOut className="h-4 w-4" aria-hidden="true" />
+                <LogoutIcon className="h-4 w-4" aria-hidden="true" />
               )}
-              <span>{loggingOut ? 'Logging out…' : 'Logout'}</span>
+              <span>{loggingOut ? 'Logging out…' : ACCOUNT_LOGOUT_ITEM.label}</span>
             </button>
           </div>
         </div>
@@ -1443,26 +1433,47 @@ export function AccountDashboard({
                           </p>
                         </div>
 
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            try {
-                              await navigator.clipboard.writeText(c.code);
-                              setCopiedCoupon(c.code);
-                              window.setTimeout(() => setCopiedCoupon(null), 2000);
-                            } catch {
-                              setCopiedCoupon(c.code);
-                            }
-                          }}
-                          className="inline-flex min-h-[42px] items-center justify-center gap-2 rounded-xl border border-[#49243E]/20 bg-[#FFF9F5] px-4 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/40"
-                        >
-                          {isCopied ? (
-                            <Check className="h-3.5 w-3.5 text-[#166534]" aria-hidden="true" />
-                          ) : (
-                            <Copy className="h-3.5 w-3.5 text-[#B76E79]" aria-hidden="true" />
-                          )}
-                          <span>{isCopied ? 'Code Copied' : 'Copy Code for Bag'}</span>
-                        </button>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                if (navigator.clipboard?.writeText) {
+                                  await navigator.clipboard.writeText(c.code);
+                                } else {
+                                  const el = document.createElement('textarea');
+                                  el.value = c.code;
+                                  el.setAttribute('readonly', '');
+                                  el.style.position = 'absolute';
+                                  el.style.left = '-9999px';
+                                  document.body.appendChild(el);
+                                  el.select();
+                                  document.execCommand('copy');
+                                  document.body.removeChild(el);
+                                }
+                                setCopiedCoupon(c.code);
+                                window.setTimeout(() => setCopiedCoupon(null), 2000);
+                              } catch {
+                                setCopiedCoupon(c.code);
+                              }
+                            }}
+                            className="inline-flex min-h-[42px] flex-1 items-center justify-center gap-2 rounded-xl border border-[#49243E]/20 bg-[#FFF9F5] px-4 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#49243E]"
+                          >
+                            {isCopied ? (
+                              <Check className="h-3.5 w-3.5 text-[#166534]" aria-hidden="true" />
+                            ) : (
+                              <Copy className="h-3.5 w-3.5 text-[#B76E79]" aria-hidden="true" />
+                            )}
+                            <span>{isCopied ? 'Code Copied' : 'Copy Code'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={onOpenBag}
+                            className="inline-flex min-h-[42px] items-center justify-center rounded-xl bg-[#49243E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#49243E]"
+                          >
+                            Apply in Bag
+                          </button>
+                        </div>
                       </div>
                     );
                   })}
@@ -1519,7 +1530,7 @@ export function AccountDashboard({
 
                   {rewards.lifetimeSpendPaise === 0 && (
                     <div className="rounded-3xl border border-[#49243E]/12 bg-white p-6 text-sm text-[#242124]/75">
-                      You have no qualifying paid orders yet. Completed Razorpay purchases automatically accrue Sahithi Rewards points according to active store settings.
+                      You have no qualifying paid orders yet. Paid Razorpay orders and Cash on Delivery orders once payment is collected automatically earn Sahithi Rewards points under your active loyalty tier.
                     </div>
                   )}
                 </div>
@@ -1591,28 +1602,95 @@ export function AccountDashboard({
 
           {/* 6. SAVED CARDS & WALLET */}
           {activeSection === 'payments' && (
-            <section className="rounded-3xl border border-[#49243E]/12 bg-white p-6 space-y-4">
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#F3D5DF]/45 text-[#49243E]">
-                  <CreditCard className="h-5 w-5" aria-hidden="true" />
+            <section className="space-y-4">
+              <div className="rounded-3xl border border-[#49243E]/12 bg-white p-6 space-y-5">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#49243E]/10 pb-4">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#F3D5DF]/45 text-[#49243E]">
+                      <CreditCard className="h-5 w-5" aria-hidden="true" />
+                    </div>
+                    <div>
+                      <h2 className="font-serif text-xl font-semibold text-[#49243E]">
+                        Checkout Methods &amp; Saved Cards
+                      </h2>
+                      <p className="text-xs text-[#242124]/65">
+                        PCI-compliant payments via Razorpay Checkout &amp; Cash on Delivery
+                      </p>
+                    </div>
+                  </div>
+                  <span className="rounded-lg border border-[#49243E]/18 bg-[#FFF9F5] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider text-[#49243E]">
+                    {paymentSummary?.enabled ? 'Vault Enabled' : 'Razorpay Standard'}
+                  </span>
                 </div>
-                <div>
-                  <h2 className="font-serif text-xl font-semibold text-[#49243E]">
-                    Razorpay Checkout Availability
-                  </h2>
-                  <p className="text-xs text-[#242124]/65">
-                    PCI-compliant payment handling
-                  </p>
-                </div>
+
+                {paymentLoading ? (
+                  <div className="h-28 animate-pulse rounded-2xl bg-[#FFF9F5]" />
+                ) : (
+                  <>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <div className="rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5]/80 p-4">
+                        <div className="flex items-center gap-2 text-sm font-semibold text-[#49243E]">
+                          <CreditCard className="h-4 w-4 text-[#B76E79]" aria-hidden="true" />
+                          <span>Online Checkout (Razorpay)</span>
+                        </div>
+                        <p className="mt-1.5 text-xs leading-relaxed text-[#242124]/75">
+                          UPI (GPay, PhonePe, BHIM), Credit &amp; Debit Cards, NetBanking, and supported Wallets open directly inside encrypted Razorpay Checkout at payment time.
+                        </p>
+                      </div>
+                      <div className="rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5]/80 p-4">
+                        <div className="flex items-center gap-2 text-sm font-semibold text-[#49243E]">
+                          <Banknote className="h-4 w-4 text-[#B76E79]" aria-hidden="true" />
+                          <span>Cash on Delivery (COD)</span>
+                        </div>
+                        <p className="mt-1.5 text-xs leading-relaxed text-[#242124]/75">
+                          Available directly inside your Boutique Bag with complimentary delivery and ₹0 COD fee. Pay when your order arrives.
+                        </p>
+                      </div>
+                    </div>
+
+                    {paymentSummary?.enabled && paymentSummary.methods.length > 0 ? (
+                      <div className="space-y-2.5">
+                        <h3 className="text-xs font-semibold uppercase tracking-wider text-[#49243E]/75">
+                          Tokenized Saved Methods
+                        </h3>
+                        <ul className="space-y-2">
+                          {paymentSummary.methods.map((method) => (
+                            <li
+                              key={method.id}
+                              className="flex items-center justify-between rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5] px-4 py-3 text-xs"
+                            >
+                              <div>
+                                <p className="font-semibold text-[#49243E]">
+                                  {method.label}
+                                  {method.last4 ? ` · •••• ${method.last4}` : ''}
+                                </p>
+                                <p className="text-[#242124]/65">
+                                  {[method.network, method.expiry ? `Exp ${method.expiry}` : '']
+                                    .filter(Boolean)
+                                    .join(' · ') || method.methodType.toUpperCase()}
+                                </p>
+                              </div>
+                              <span className="font-medium text-[#166534]">Tokenized via Razorpay</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : (
+                      <div className="rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5] p-4 space-y-1.5">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-[#B76E79]">
+                          {paymentSummary?.enabled
+                            ? 'No Saved Cards on File Yet'
+                            : 'Saved Card Tokenization · Pending Merchant Activation'}
+                        </p>
+                        <p className="text-sm leading-relaxed text-[#242124]/80">
+                          {paymentSummary?.reason ||
+                            'Sahithi Collections processes all cards inside PCI-compliant Razorpay Checkout without collecting raw card details on this site. Tokenized saved-card vaulting will activate here once Razorpay Customer Vault is enabled on the merchant account.'}
+                        </p>
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
-              {paymentLoading ? (
-                <div className="h-20 animate-pulse rounded-2xl bg-[#FFF9F5]" />
-              ) : (
-                <p className="rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5] p-4 text-sm leading-relaxed text-[#242124]/80">
-                  {paymentSummary?.reason ||
-                    'Sahithi Collections uses PCI-compliant Razorpay Standard Checkout. Saved card tokens require Razorpay Customer Vault configuration; all UPI, Cards, Wallets, and NetBanking options remain available at checkout.'}
-                </p>
-              )}
             </section>
           )}
 

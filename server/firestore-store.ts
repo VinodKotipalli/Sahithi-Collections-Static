@@ -2317,7 +2317,20 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     const ref = this.addressesCol(userId).doc(addressId);
     const snap = await ref.get();
     if (!snap.exists) return false;
+    const wasDefault = Boolean((snap.data() as { is_default?: unknown } | undefined)?.is_default);
     await ref.delete();
+    if (wasDefault) {
+      const remaining = await this.addressesCol(userId).get();
+      if (!remaining.empty) {
+        const sorted = remaining.docs.sort(
+          (a, b) => Number((b.data()?.updated_at as number) || 0) - Number((a.data()?.updated_at as number) || 0)
+        );
+        const alreadyDefault = sorted.some((d) => Boolean(d.data()?.is_default));
+        if (!alreadyDefault && sorted[0]) {
+          await sorted[0].ref.set({ is_default: 1, updated_at: Date.now() }, { merge: true });
+        }
+      }
+    }
     return true;
   }
 
