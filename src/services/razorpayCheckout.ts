@@ -398,9 +398,9 @@ export async function checkRazorpayOrderStatus(params: {
     }
     return {
       ok: true,
-      confirmed: Boolean(body.confirmed && body.order),
+      confirmed: Boolean((body.confirmed || body.verified || body.success) && body.order),
       pendingConfirmation: Boolean(body.pending_confirmation || res.status === 202),
-      status: String(body.status || (body.confirmed ? 'confirmed' : 'pending')),
+      status: String(body.status || (body.confirmed || body.order ? 'confirmed' : 'pending')),
       message: typeof body.message === 'string' ? body.message : undefined,
       order: body.order ? (body.order as PlacedOrderReceipt) : undefined,
       razorpayOrderId: String(body.order_id || params.razorpayOrderId),

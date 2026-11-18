@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   handlePlaceCodOrderRequest,
@@ -109,12 +110,17 @@ export function createOrdersHandler(options?: {
       return;
     }
 
+    const rawReqId = req.headers['x-vercel-id'] || req.headers['x-request-id'];
+    const requestId =
+      (Array.isArray(rawReqId) ? rawReqId[0] : rawReqId)?.trim() || crypto.randomUUID();
+
     const result = await handlePlaceCodOrderRequest({
       body,
       store: options?.store ?? null,
       customerUserId: authResult.uid,
       customerIdToken: authResult.rawToken,
       requireDurablePersistence: options?.requireDurablePersistence ?? true,
+      requestId,
     });
     sendJson(res, result.status, result.body);
   };

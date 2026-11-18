@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   handleVerifyPaymentRequest,
@@ -117,6 +118,10 @@ export function createVerifyPaymentHandler(options?: {
       return;
     }
 
+    const rawReqId = req.headers['x-vercel-id'] || req.headers['x-request-id'];
+    const requestId =
+      (Array.isArray(rawReqId) ? rawReqId[0] : rawReqId)?.trim() || crypto.randomUUID();
+
     const result = await handleVerifyPaymentRequest({
       body,
       store: options?.store ?? null,
@@ -124,6 +129,7 @@ export function createVerifyPaymentHandler(options?: {
       customerIdToken: authResult.rawToken,
       razorpayClientFactory: options?.razorpayClientFactory,
       strictPersistence: options?.strictPersistence,
+      requestId,
     });
     sendJson(res, result.status, result.body);
   };

@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   handleCreateOrderRequest,
@@ -111,6 +112,10 @@ export function createCreateOrderHandler(options?: {
       return;
     }
 
+    const rawReqId = req.headers['x-vercel-id'] || req.headers['x-request-id'];
+    const requestId =
+      (Array.isArray(rawReqId) ? rawReqId[0] : rawReqId)?.trim() || crypto.randomUUID();
+
     const result = await handleCreateOrderRequest({
       body,
       store: options?.store ?? null,
@@ -118,6 +123,7 @@ export function createCreateOrderHandler(options?: {
       customerIdToken: authResult.rawToken,
       razorpayClientFactory: options?.razorpayClientFactory,
       requireDurablePersistence: options?.requireDurablePersistence,
+      requestId,
     });
     sendJson(res, result.status, result.body);
   };

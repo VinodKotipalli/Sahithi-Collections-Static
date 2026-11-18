@@ -213,7 +213,11 @@ const completedCheckoutsMemory = new Map<
 >();
 const inFlightVerifications = new Map<string, Promise<CheckoutHandlerResponse>>();
 
-let cachedGoogleAccessToken: { token: string; expiresAtMs: number } | null = null;
+let cachedGoogleAccessToken: {
+  token: string;
+  expiresAtMs: number;
+  clientEmail: string;
+} | null = null;
 
 function defaultRazorpayFactory(keyId: string, keySecret: string): RazorpayClientLike {
   return new Razorpay({
@@ -288,16 +292,17 @@ function resolveServerFirestoreNamespace(): string {
     return explicitTarget;
   }
 
+  // On Vercel deployments (both Preview *.vercel.app and Production custom domain),
+  // the client SPA reads environments/production (firebaseClientApi.ts).
+  if (process.env.VERCEL === '1') {
+    return 'production';
+  }
+
   const kService = (process.env.K_SERVICE || '').trim().toLowerCase();
   if (kService.startsWith('ais-pre-')) return 'shared-preview';
   if (kService.startsWith('ais-dev-')) return 'development';
 
-  // On Vercel deployments (both Preview *.vercel.app and Production custom domain),
-  // the client SPA reads environments/production (firebaseClientApi.ts).
-  if (
-    process.env.VERCEL === '1' ||
-    (process.env.NODE_ENV || '').trim().toLowerCase() === 'production'
-  ) {
+  if ((process.env.NODE_ENV || '').trim().toLowerCase() === 'production') {
     return 'production';
   }
 
@@ -305,69 +310,233 @@ function resolveServerFirestoreNamespace(): string {
 }
 
 interface ServiceAccountCreds {
+  project_id?: string;
   client_email: string;
   private_key: string;
   token_uri?: string;
 }
 
-function parseServiceAccountCredentials(): ServiceAccountCreds | null {
-  const rawEnv = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
-  let jsonText = rawEnv;
+type ServiceAccountParseResult =
+  | { ok: true; creds: ServiceAccountCreds }
+  | {
+      ok: false;
+      reasonCode: 'MISSING' | 'MALFORMED' | 'PROJECT_MISMATCH';
+      detail: string;
+    };
 
-  if (!jsonText) {
+type ServerBearerResult =
+  | { ok: true; token: string }
+  | {
+      ok: false;
+      status: number;
+      reasonCode: string;
+      detail: string;
+    };
+
+function logCheckoutPersistenceFailure(params: {
+  operation: string;
+  projectId: string;
+  databaseId: string;
+  namespace: string;
+  path?: string;
+  status: number | string;
+  code: string;
+  requestId?: string;
+  reason: string;
+}) {
+  const safeReason = params.reason.replace(/\s+/g, ' ').slice(0, 220);
+  console.error(
+    `[checkout-persistence] op=${params.operation} status=${params.status} code=${params.code} project=${params.projectId} db=${params.databaseId} env=${params.namespace} path=${params.path || '-'} req=${params.requestId || '-'} reason=${safeReason}`
+  );
+}
+
+function unwrapJsonStringCandidate(raw: string): string {
+  let val = raw.replace(/^\uFEFF/, '').trim();
+  if (
+    (val.startsWith('"') && val.endsWith('"')) ||
+    (val.startsWith("'") && val.endsWith("'"))
+  ) {
+    val = val.slice(1, -1).trim();
+  }
+  return val;
+}
+
+function parseServiceAccountCredentialsDetailed(expectedProjectId?: string): ServiceAccountParseResult {
+  let rawText = unwrapJsonStringCandidate(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '');
+
+  if (!rawText) {
     const gacPath = (process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
     if (gacPath && fs.existsSync(gacPath)) {
       try {
-        jsonText = fs.readFileSync(gacPath, 'utf8').trim();
+        rawText = unwrapJsonStringCandidate(fs.readFileSync(gacPath, 'utf8'));
       } catch {
-        return null;
+        return {
+          ok: false,
+          reasonCode: 'MALFORMED',
+          detail: 'Unable to read GOOGLE_APPLICATION_CREDENTIALS file.',
+        };
       }
     }
   }
 
-  if (!jsonText) return null;
+  if (!rawText) {
+    return {
+      ok: false,
+      reasonCode: 'MISSING',
+      detail: 'FIREBASE_SERVICE_ACCOUNT_JSON is not set on the server.',
+    };
+  }
 
+  let jsonText = rawText;
   if (!jsonText.startsWith('{')) {
     try {
-      const decoded = Buffer.from(jsonText, 'base64').toString('utf8').trim();
+      const decoded = unwrapJsonStringCandidate(
+        Buffer.from(jsonText.replace(/\s+/g, ''), 'base64').toString('utf8')
+      );
       if (decoded.startsWith('{')) jsonText = decoded;
     } catch {
-      return null;
-    }
-  }
-
-  try {
-    const parsed = JSON.parse(jsonText) as Partial<ServiceAccountCreds>;
-    if (
-      typeof parsed.client_email === 'string' &&
-      parsed.client_email &&
-      typeof parsed.private_key === 'string' &&
-      parsed.private_key
-    ) {
       return {
-        client_email: parsed.client_email,
-        private_key: parsed.private_key.replace(/\\n/g, '\n'),
-        token_uri:
-          typeof parsed.token_uri === 'string' && parsed.token_uri
-            ? parsed.token_uri
-            : 'https://oauth2.googleapis.com/token',
+        ok: false,
+        reasonCode: 'MALFORMED',
+        detail: 'FIREBASE_SERVICE_ACCOUNT_JSON is neither valid JSON nor valid base64 JSON.',
       };
     }
-  } catch {
-    return null;
   }
-  return null;
+
+  let parsedUnknown: unknown;
+  try {
+    parsedUnknown = JSON.parse(jsonText);
+    if (typeof parsedUnknown === 'string') {
+      parsedUnknown = JSON.parse(parsedUnknown);
+    }
+  } catch {
+    return {
+      ok: false,
+      reasonCode: 'MALFORMED',
+      detail: 'FIREBASE_SERVICE_ACCOUNT_JSON could not be parsed as JSON.',
+    };
+  }
+
+  if (!parsedUnknown || typeof parsedUnknown !== 'object') {
+    return {
+      ok: false,
+      reasonCode: 'MALFORMED',
+      detail: 'FIREBASE_SERVICE_ACCOUNT_JSON parsed value is not an object.',
+    };
+  }
+
+  const parsed = parsedUnknown as Partial<ServiceAccountCreds>;
+  const projectId = typeof parsed.project_id === 'string' ? parsed.project_id.trim() : '';
+  const clientEmail = typeof parsed.client_email === 'string' ? parsed.client_email.trim() : '';
+  const privateKey =
+    typeof parsed.private_key === 'string'
+      ? parsed.private_key.replace(/\\n/g, '\n').trim()
+      : '';
+
+  if (!clientEmail || !clientEmail.includes('@') || !privateKey || !privateKey.includes('PRIVATE KEY')) {
+    return {
+      ok: false,
+      reasonCode: 'MALFORMED',
+      detail: 'Service-account JSON is missing required client_email or private_key fields.',
+    };
+  }
+
+  if (expectedProjectId && projectId && projectId !== expectedProjectId) {
+    return {
+      ok: false,
+      reasonCode: 'PROJECT_MISMATCH',
+      detail: `Service-account project_id (${projectId}) does not match configured Firebase project (${expectedProjectId}).`,
+    };
+  }
+
+  return {
+    ok: true,
+    creds: {
+      project_id: projectId || undefined,
+      client_email: clientEmail,
+      private_key: privateKey,
+      token_uri:
+        typeof parsed.token_uri === 'string' && parsed.token_uri.trim()
+          ? parsed.token_uri.trim()
+          : 'https://oauth2.googleapis.com/token',
+    },
+  };
 }
 
-async function getFirestoreAdminBearerToken(): Promise<string | null> {
+function parseServiceAccountCredentials(): ServiceAccountCreds | null {
+  const cfg = loadFirebaseConfig();
+  const parsed = parseServiceAccountCredentialsDetailed(cfg?.projectId);
+  return parsed.ok ? parsed.creds : null;
+}
+
+async function resolveFirestoreServerBearerToken(options?: {
+  operation?: string;
+  requestId?: string;
+  ctx?: {
+    projectId: string;
+    databaseId: string;
+    namespace: string;
+  } | null;
+}): Promise<ServerBearerResult> {
   const now = Date.now();
-  if (cachedGoogleAccessToken && now < cachedGoogleAccessToken.expiresAtMs - 60_000) {
-    return cachedGoogleAccessToken.token;
+  const cfg = loadFirebaseConfig();
+  const expectedProjectId = options?.ctx?.projectId || cfg?.projectId;
+  const parsed = parseServiceAccountCredentialsDetailed(expectedProjectId);
+
+  if (!parsed.ok) {
+    // Allow Cloud Run / GCE ADC metadata token only when not on Vercel and service-account env is absent
+    const isCloudRunOrGce =
+      process.env.VERCEL !== '1' &&
+      Boolean((process.env.K_SERVICE || process.env.GOOGLE_RUNTIME || '').trim());
+    if (parsed.reasonCode === 'MISSING' && isCloudRunOrGce) {
+      if (
+        cachedGoogleAccessToken &&
+        cachedGoogleAccessToken.clientEmail === '__metadata__' &&
+        now < cachedGoogleAccessToken.expiresAtMs - 60_000
+      ) {
+        return { ok: true, token: cachedGoogleAccessToken.token };
+      }
+      try {
+        const metaRes = await fetch(
+          'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+          { headers: { 'Metadata-Flavor': 'Google' } }
+        );
+        if (metaRes.ok) {
+          const metaJson = (await metaRes.json()) as {
+            access_token?: string;
+            expires_in?: number;
+          };
+          if (typeof metaJson.access_token === 'string' && metaJson.access_token) {
+            cachedGoogleAccessToken = {
+              token: metaJson.access_token,
+              expiresAtMs: now + Number(metaJson.expires_in || 3600) * 1000,
+              clientEmail: '__metadata__',
+            };
+            return { ok: true, token: metaJson.access_token };
+          }
+        }
+      } catch {
+        // Fall through to structured error
+      }
+    }
+    return {
+      ok: false,
+      status: 503,
+      reasonCode: `CREDENTIAL_${parsed.reasonCode}`,
+      detail: parsed.detail,
+    };
   }
 
-  const creds = parseServiceAccountCredentials();
-  if (!creds) return null;
+  const creds = parsed.creds;
+  if (
+    cachedGoogleAccessToken &&
+    cachedGoogleAccessToken.clientEmail === creds.client_email &&
+    now < cachedGoogleAccessToken.expiresAtMs - 60_000
+  ) {
+    return { ok: true, token: cachedGoogleAccessToken.token };
+  }
 
+  let assertion: string;
   try {
     const iatSec = Math.floor(now / 1000);
     const expSec = iatSec + 3600;
@@ -386,8 +555,20 @@ async function getFirestoreAdminBearerToken(): Promise<string | null> {
     const signer = crypto.createSign('RSA-SHA256');
     signer.update(signingInput);
     const signature = signer.sign(creds.private_key).toString('base64url');
-    const assertion = `${signingInput}.${signature}`;
+    assertion = `${signingInput}.${signature}`;
+  } catch (err) {
+    return {
+      ok: false,
+      status: 503,
+      reasonCode: 'PRIVATE_KEY_INVALID',
+      detail:
+        err instanceof Error
+          ? `Failed to sign Google OAuth assertion: ${err.message}`
+          : 'Failed to sign Google OAuth assertion.',
+    };
+  }
 
+  try {
     const res = await fetch(creds.token_uri || 'https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -396,20 +577,53 @@ async function getFirestoreAdminBearerToken(): Promise<string | null> {
         assertion,
       }).toString(),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        error_description?: string;
+      };
+      return {
+        ok: false,
+        status: res.status || 401,
+        reasonCode: 'OAUTH_EXCHANGE_FAILED',
+        detail: `Google OAuth token exchange returned HTTP ${res.status} (${errBody.error || 'unknown_error'})`,
+      };
+    }
     const tokenPayload = (await res.json()) as { access_token?: string; expires_in?: number };
     if (typeof tokenPayload.access_token === 'string' && tokenPayload.access_token) {
       const expiresInMs = Number(tokenPayload.expires_in || 3600) * 1000;
       cachedGoogleAccessToken = {
         token: tokenPayload.access_token,
         expiresAtMs: now + expiresInMs,
+        clientEmail: creds.client_email,
       };
-      return tokenPayload.access_token;
+      return { ok: true, token: tokenPayload.access_token };
     }
-  } catch {
-    return null;
+    return {
+      ok: false,
+      status: 502,
+      reasonCode: 'OAUTH_EMPTY_TOKEN',
+      detail: 'Google OAuth response did not contain an access_token.',
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 503,
+      reasonCode: 'OAUTH_NETWORK_ERROR',
+      detail:
+        err instanceof Error
+          ? `Google OAuth exchange network failure: ${err.message}`
+          : 'Google OAuth exchange network failure.',
+    };
   }
-  return null;
+}
+
+async function getFirestoreAdminBearerToken(options?: {
+  operation?: string;
+  requestId?: string;
+}): Promise<string | null> {
+  const res = await resolveFirestoreServerBearerToken(options);
+  return res.ok ? res.token : null;
 }
 
 export async function verifyBearerFirebaseTokenFromHeader(
@@ -654,7 +868,8 @@ function shouldRequireDurablePersistence(params: {
   }
   if (params.store) return true;
   if (process.env.VERCEL === '1') return true;
-  if (parseServiceAccountCredentials() !== null) return true;
+  if (Boolean((process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim())) return true;
+  if (Boolean((process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim())) return true;
   return false;
 }
 
@@ -672,7 +887,7 @@ export async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, 
   const bearerToken = await getFirestoreAdminBearerToken();
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
-  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
+  const keyParam = !bearerToken && ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
 
   const hiddenIds = new Set<string>();
   const hiddenSlugs = new Set<string>();
@@ -791,13 +1006,22 @@ export async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, 
   return byId;
 }
 
-async function fetchCouponFromFirestoreByCode(code: string): Promise<CouponRow | null> {
+async function fetchCouponFromFirestoreByCode(
+  code: string,
+  options?: { bearerToken?: string | null; requestId?: string }
+): Promise<CouponRow | null> {
   const ctx = getFirestoreContext();
   if (!ctx) return null;
-  const bearerToken = await getFirestoreAdminBearerToken();
+  const bearerToken =
+    options?.bearerToken !== undefined
+      ? options.bearerToken
+      : await getFirestoreAdminBearerToken({
+          operation: 'fetch_coupon',
+          requestId: options?.requestId,
+        });
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
-  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
+  const keyParam = !bearerToken && ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
   const queryUrl = `${ctx.docBaseUrl}/environments/${ctx.namespace}:runQuery${keyParam}`;
   try {
     const res = await fetch(queryUrl, {
@@ -846,13 +1070,22 @@ async function fetchCouponFromFirestoreByCode(code: string): Promise<CouponRow |
   }
 }
 
-async function fetchGiftCardFromFirestoreByCode(code: string): Promise<GiftCardRow | null> {
+async function fetchGiftCardFromFirestoreByCode(
+  code: string,
+  options?: { bearerToken?: string | null; requestId?: string }
+): Promise<GiftCardRow | null> {
   const ctx = getFirestoreContext();
   if (!ctx) return null;
-  const bearerToken = await getFirestoreAdminBearerToken();
+  const bearerToken =
+    options?.bearerToken !== undefined
+      ? options.bearerToken
+      : await getFirestoreAdminBearerToken({
+          operation: 'fetch_gift_card',
+          requestId: options?.requestId,
+        });
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
-  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
+  const keyParam = !bearerToken && ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
   const queryUrl = `${ctx.docBaseUrl}/environments/${ctx.namespace}:runQuery${keyParam}`;
   try {
     const res = await fetch(queryUrl, {
@@ -1258,77 +1491,133 @@ function fromPendingCheckoutRow(row: PendingCheckoutRow): PendingCheckoutRecord 
 
 async function savePendingCheckoutToFirestore(
   record: PendingCheckoutRecord,
-  options?: { strict?: boolean; customerIdToken?: string | null }
+  options?: { strict?: boolean; requestId?: string; bearerToken?: string | null }
 ): Promise<boolean> {
   const ctx = getFirestoreContext();
   if (!ctx) {
     if (options?.strict) {
+      logCheckoutPersistenceFailure({
+        operation: 'save_pending_checkout',
+        projectId: 'unknown',
+        databaseId: 'unknown',
+        namespace: resolveServerFirestoreNamespace(),
+        path: `pending_checkouts/${record.razorpayOrderId}`,
+        status: 503,
+        code: 'FIREBASE_CONFIG_MISSING',
+        requestId: options.requestId,
+        reason: 'firebase-applet-config.json is missing or invalid.',
+      });
       throw new StoreHttpError(
         503,
         'CHECKOUT_PERSISTENCE_FAILED',
-        'Checkout configuration is missing Firebase project details.'
+        'Unable to initialize payment checkout right now. Please try again in a moment.'
       );
     }
     return false;
   }
 
-  const adminBearer = await getFirestoreAdminBearerToken();
-  const effectiveBearer = adminBearer || options?.customerIdToken || null;
-  if (!effectiveBearer) {
-    if (options?.strict && process.env.VERCEL === '1') {
-      // If unauthenticated guest without service account on Vercel, check if firestore.rules permits pending_checkout create
-      // Attempt without bearer (firestore.rules allows valid guest pending_checkout write), but check res.ok!
-    } else if (options?.strict) {
-      throw new StoreHttpError(
-        503,
-        'CHECKOUT_PERSISTENCE_FAILED',
-        'Server database credentials are unavailable to save checkout state.'
-      );
+  const docPath = `environments/${ctx.namespace}/pending_checkouts/${record.razorpayOrderId}`;
+  const tokenRes: ServerBearerResult = options?.bearerToken
+    ? { ok: true, token: options.bearerToken }
+    : await resolveFirestoreServerBearerToken({
+        operation: 'save_pending_checkout',
+        requestId: options?.requestId,
+        ctx,
+      });
+
+  if (!tokenRes.ok) {
+    if (!options?.strict) {
+      return false;
     }
+    logCheckoutPersistenceFailure({
+      operation: 'save_pending_checkout',
+      projectId: ctx.projectId,
+      databaseId: ctx.databaseId,
+      namespace: ctx.namespace,
+      path: docPath,
+      status: tokenRes.status,
+      code: tokenRes.reasonCode,
+      requestId: options?.requestId,
+      reason: tokenRes.detail,
+    });
+    throw new StoreHttpError(
+      503,
+      'CHECKOUT_PERSISTENCE_FAILED',
+      'Unable to initialize payment checkout right now. Please try again in a moment.'
+    );
   }
 
-  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
-  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/pending_checkouts/${encodeURIComponent(record.razorpayOrderId)}${keyParam}`;
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (effectiveBearer) {
-    headers.Authorization = `Bearer ${effectiveBearer}`;
-  }
-
-  const res = await fetch(url, {
-    method: 'PATCH',
-    headers,
-    body: JSON.stringify({
-      fields: toFsFields({
-        id: record.razorpayOrderId,
-        razorpay_order_id: record.razorpayOrderId,
-        amount_paise: record.amountPaise,
-        subtotal_paise: record.subtotalPaise,
-        discount_paise: record.discountPaise,
-        gift_card_paise: record.giftCardPaise,
-        coupon_code: record.couponCode,
-        gift_card_code: record.giftCardCode,
-        currency: record.currency,
-        receipt: record.receipt,
-        items: record.items,
-        customer: record.customer,
-        customer_user_id: record.customerUserId,
-        status: record.status,
-        created_at: record.createdAt,
-        updated_at: Date.now(),
-        expires_at: record.expiresAt,
-        ...(record.razorpayPaymentId ? { razorpay_payment_id: record.razorpayPaymentId } : {}),
-        ...(record.confirmedOrder ? { confirmed_order: record.confirmedOrder } : {}),
+  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/pending_checkouts/${encodeURIComponent(record.razorpayOrderId)}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenRes.token}`,
+      },
+      body: JSON.stringify({
+        fields: toFsFields({
+          id: record.razorpayOrderId,
+          razorpay_order_id: record.razorpayOrderId,
+          amount_paise: record.amountPaise,
+          subtotal_paise: record.subtotalPaise,
+          discount_paise: record.discountPaise,
+          gift_card_paise: record.giftCardPaise,
+          coupon_code: record.couponCode,
+          gift_card_code: record.giftCardCode,
+          currency: record.currency,
+          receipt: record.receipt,
+          items: record.items,
+          customer: record.customer,
+          customer_user_id: record.customerUserId,
+          status: record.status,
+          created_at: record.createdAt,
+          updated_at: Date.now(),
+          expires_at: record.expiresAt,
+          ...(record.razorpayPaymentId ? { razorpay_payment_id: record.razorpayPaymentId } : {}),
+          ...(record.confirmedOrder ? { confirmed_order: record.confirmedOrder } : {}),
+        }),
       }),
-    }),
-  });
+    });
+  } catch (err) {
+    if (!options?.strict) return false;
+    logCheckoutPersistenceFailure({
+      operation: 'save_pending_checkout',
+      projectId: ctx.projectId,
+      databaseId: ctx.databaseId,
+      namespace: ctx.namespace,
+      path: docPath,
+      status: 503,
+      code: 'FIRESTORE_NETWORK_ERROR',
+      requestId: options?.requestId,
+      reason: err instanceof Error ? err.message : 'Network error calling Firestore REST API.',
+    });
+    throw new StoreHttpError(
+      503,
+      'CHECKOUT_PERSISTENCE_FAILED',
+      'Unable to initialize payment checkout right now. Please try again in a moment.'
+    );
+  }
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
+    logCheckoutPersistenceFailure({
+      operation: 'save_pending_checkout',
+      projectId: ctx.projectId,
+      databaseId: ctx.databaseId,
+      namespace: ctx.namespace,
+      path: docPath,
+      status: res.status,
+      code: res.status === 403 ? 'FIRESTORE_PERMISSION_DENIED' : 'FIRESTORE_WRITE_FAILED',
+      requestId: options?.requestId,
+      reason: errText || res.statusText || `HTTP ${res.status}`,
+    });
     if (options?.strict) {
       throw new StoreHttpError(
         503,
         'CHECKOUT_PERSISTENCE_FAILED',
-        `Unable to save durable checkout record (${res.status}): ${errText.slice(0, 140)}`
+        'Unable to initialize payment checkout right now. Please try again in a moment.'
       );
     }
     return false;
@@ -1337,21 +1626,42 @@ async function savePendingCheckoutToFirestore(
 }
 
 async function loadPendingCheckoutFromFirestore(
-  razorpayOrderId: string
+  razorpayOrderId: string,
+  options?: { requestId?: string }
 ): Promise<PendingCheckoutRecord | null> {
   const ctx = getFirestoreContext();
   if (!ctx) return null;
-  const bearerToken = await getFirestoreAdminBearerToken();
-  if (!bearerToken) return null;
+  const tokenRes = await resolveFirestoreServerBearerToken({
+    operation: 'load_pending_checkout',
+    requestId: options?.requestId,
+    ctx,
+  });
+  if (!tokenRes.ok) return null;
 
-  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
-  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/pending_checkouts/${encodeURIComponent(razorpayOrderId)}${keyParam}`;
+  const docPath = `environments/${ctx.namespace}/pending_checkouts/${razorpayOrderId}`;
+  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/pending_checkouts/${encodeURIComponent(razorpayOrderId)}`;
   try {
     const res = await fetch(url, {
       method: 'GET',
-      headers: { Authorization: `Bearer ${bearerToken}` },
+      headers: { Authorization: `Bearer ${tokenRes.token}` },
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      if (res.status !== 404) {
+        const errText = await res.text().catch(() => '');
+        logCheckoutPersistenceFailure({
+          operation: 'load_pending_checkout',
+          projectId: ctx.projectId,
+          databaseId: ctx.databaseId,
+          namespace: ctx.namespace,
+          path: docPath,
+          status: res.status,
+          code: 'FIRESTORE_READ_FAILED',
+          requestId: options?.requestId,
+          reason: errText || res.statusText || `HTTP ${res.status}`,
+        });
+      }
+      return null;
+    }
     const json = (await res.json()) as { fields?: Record<string, FsFieldValue> };
     const data = fromFsFields(json.fields);
     if (typeof data.razorpay_order_id !== 'string') return null;
@@ -1414,25 +1724,48 @@ function parseStatusHistorySafe(raw: unknown): OrderStatusHistoryEntry[] {
 async function fetchExistingFirestoreOrder(
   orderDocId: string,
   razorpayOrderId: string,
-  razorpayPaymentId: string
+  razorpayPaymentId: string,
+  options?: { requestId?: string; bearerToken?: string | null }
 ): Promise<SerializedOrderReceipt | null> {
   const ctx = getFirestoreContext();
   if (!ctx) return null;
-  const bearerToken = await getFirestoreAdminBearerToken();
-  if (!bearerToken) return null;
+  const tokenRes: ServerBearerResult = options?.bearerToken
+    ? { ok: true, token: options.bearerToken }
+    : await resolveFirestoreServerBearerToken({
+        operation: 'fetch_existing_order',
+        requestId: options?.requestId,
+        ctx,
+      });
+  if (!tokenRes.ok) return null;
 
-  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
-  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/orders/${encodeURIComponent(orderDocId)}${keyParam}`;
+  const docPath = `environments/${ctx.namespace}/orders/${orderDocId}`;
+  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/orders/${encodeURIComponent(orderDocId)}`;
   try {
     const res = await fetch(url, {
       method: 'GET',
-      headers: { Authorization: `Bearer ${bearerToken}` },
+      headers: { Authorization: `Bearer ${tokenRes.token}` },
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      if (res.status !== 404) {
+        const errText = await res.text().catch(() => '');
+        logCheckoutPersistenceFailure({
+          operation: 'fetch_existing_order',
+          projectId: ctx.projectId,
+          databaseId: ctx.databaseId,
+          namespace: ctx.namespace,
+          path: docPath,
+          status: res.status,
+          code: 'FIRESTORE_READ_FAILED',
+          requestId: options?.requestId,
+          reason: errText || res.statusText || `HTTP ${res.status}`,
+        });
+      }
+      return null;
+    }
     const doc = (await res.json()) as { fields?: Record<string, FsFieldValue> };
     const data = fromFsFields(doc.fields);
     if (typeof data.id !== 'string') return null;
-      const rawItems = Array.isArray(data.items) ? data.items : [];
+    const rawItems = Array.isArray(data.items) ? data.items : [];
     const createdAt = Number(data.created_at || Date.now());
     const paymentMethodRaw = typeof data.payment_method === 'string' ? data.payment_method : '';
     const rzpOid = typeof data.razorpay_order_id === 'string' && data.razorpay_order_id ? data.razorpay_order_id : null;
@@ -1500,8 +1833,8 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
   couponCode: string | null;
   giftCardCode: string | null;
   totalPaise: number;
-  customerIdToken?: string | null;
   strictPersistence?: boolean;
+  requestId?: string;
 }): Promise<SerializedOrderReceipt> {
   const {
     razorpayOrderId,
@@ -1515,8 +1848,8 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
     couponCode,
     giftCardCode,
     totalPaise,
-    customerIdToken,
     strictPersistence = false,
+    requestId,
   } = params;
   const ctx = getFirestoreContext();
   const orderDocId = buildDeterministicOrderId(razorpayOrderId);
@@ -1584,74 +1917,89 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
 
   if (!ctx) {
     if (strictPersistence) {
+      logCheckoutPersistenceFailure({
+        operation: 'commit_confirmed_order',
+        projectId: 'unknown',
+        databaseId: 'unknown',
+        namespace: resolveServerFirestoreNamespace(),
+        path: `orders/${orderDocId}`,
+        status: 503,
+        code: 'FIREBASE_CONFIG_MISSING',
+        requestId,
+        reason: 'firebase-applet-config.json is missing or invalid.',
+      });
       throw new StoreHttpError(
         503,
         'ORDER_CONFIRMATION_PENDING',
-        'Payment received. Order persistence configuration is unavailable.'
+        'Payment received. Order confirmation is delayed and will complete shortly.'
       );
     }
     return receipt;
   }
 
-  const adminBearer = await getFirestoreAdminBearerToken();
-  const effectiveBearer = adminBearer || customerIdToken || null;
-  if (!adminBearer && strictPersistence && process.env.VERCEL === '1' && !customerIdToken) {
-    // Allow unauthenticated guest rule path only if Firestore accepts it
+  const orderPath = `environments/${ctx.namespace}/orders/${orderDocId}`;
+  const tokenRes = await resolveFirestoreServerBearerToken({
+    operation: 'commit_confirmed_order',
+    requestId,
+    ctx,
+  });
+  if (!tokenRes.ok) {
+    if (!strictPersistence) {
+      return receipt;
+    }
+    logCheckoutPersistenceFailure({
+      operation: 'commit_confirmed_order',
+      projectId: ctx.projectId,
+      databaseId: ctx.databaseId,
+      namespace: ctx.namespace,
+      path: orderPath,
+      status: tokenRes.status,
+      code: tokenRes.reasonCode,
+      requestId,
+      reason: tokenRes.detail,
+    });
+    throw new StoreHttpError(
+      503,
+      'ORDER_CONFIRMATION_PENDING',
+      'Payment received. Order confirmation is delayed and will complete shortly.'
+    );
   }
 
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (effectiveBearer) headers.Authorization = `Bearer ${effectiveBearer}`;
-  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
-
+  const adminBearer = tokenRes.token;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${adminBearer}`,
+  };
   const productIds = Array.from(new Set(lines.map((l) => l.productId)));
 
-  // Use admin fields if we have service account bearer token OR authenticated matching customer UID
-  const canUseRichFields = Boolean(adminBearer || (customerIdToken && customerUserId));
-  const docFields = canUseRichFields
-    ? {
-        id: orderDocId,
-        order_number: orderNumber,
-        customer_user_id: customerUserId,
-        customer_name: customer.customerName,
-        customer_email: customer.customerEmail,
-        customer_phone: customer.customerPhone,
-        shipping_address: customer.shippingAddress,
-        status: 'confirmed',
-        payment_status: 'paid',
-        fulfillment_status: 'confirmed',
-        payment_method: 'razorpay',
-        razorpay_order_id: razorpayOrderId,
-        razorpay_payment_id: razorpayPaymentId,
-        coupon_code: couponCode,
-        gift_card_code: giftCardCode,
-        discount_paise: discountPaise,
-        gift_card_paise: giftCardPaise,
-        status_history_json: statusHistoryJson,
-        return_request_json: null,
-        subtotal_paise: subtotalPaise,
-        total_paise: totalPaise,
-        currency: 'INR',
-        created_at: now,
-        updated_at: now,
-        product_ids: productIds,
-        items: firestoreItems,
-      }
-    : {
-        id: orderDocId,
-        order_number: orderNumber,
-        customer_user_id: null,
-        customer_name: customer.customerName,
-        customer_email: customer.customerEmail,
-        customer_phone: customer.customerPhone,
-        shipping_address: customer.shippingAddress,
-        status: 'pending',
-        subtotal_paise: subtotalPaise,
-        total_paise: totalPaise,
-        currency: 'INR',
-        created_at: now,
-        product_ids: productIds,
-        items: firestoreItems,
-      };
+  const docFields = {
+    id: orderDocId,
+    order_number: orderNumber,
+    customer_user_id: customerUserId,
+    customer_name: customer.customerName,
+    customer_email: customer.customerEmail,
+    customer_phone: customer.customerPhone,
+    shipping_address: customer.shippingAddress,
+    status: 'confirmed',
+    payment_status: 'paid',
+    fulfillment_status: 'confirmed',
+    payment_method: 'razorpay',
+    razorpay_order_id: razorpayOrderId,
+    razorpay_payment_id: razorpayPaymentId,
+    coupon_code: couponCode,
+    gift_card_code: giftCardCode,
+    discount_paise: discountPaise,
+    gift_card_paise: giftCardPaise,
+    status_history_json: statusHistoryJson,
+    return_request_json: null,
+    subtotal_paise: subtotalPaise,
+    total_paise: totalPaise,
+    currency: 'INR',
+    created_at: now,
+    updated_at: now,
+    product_ids: productIds,
+    items: firestoreItems,
+  };
 
   const docName = `${ctx.dbRootResource}/environments/${ctx.namespace}/orders/${orderDocId}`;
   const writes: Array<Record<string, unknown>> = [
@@ -1664,8 +2012,7 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
     },
   ];
 
-  // If authenticated matching customer or admin, also write 1 placed notification atomically!
-  if (customerUserId && canUseRichFields) {
+  if (customerUserId) {
     const notifId = `notif_placed_${orderDocId}`;
     writes.push({
       currentDocument: { exists: false },
@@ -1688,128 +2035,154 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
     });
   }
 
-  // Note: Stock deduction, coupon usage increment, and gift card deduction require admin service account
-  // because Firestore security rules restrict customer writes on products/coupons/gift_cards.
-  if (adminBearer) {
-    for (const pid of productIds) {
-      try {
-        const prodRes = await fetch(
-          `${ctx.docBaseUrl}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}${keyParam}`,
-          { headers }
+  for (const pid of productIds) {
+    try {
+      const prodRes = await fetch(
+        `${ctx.docBaseUrl}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}`,
+        { headers }
+      );
+      if (prodRes.ok) {
+        const prodDoc = (await prodRes.json()) as {
+          updateTime?: string;
+          fields?: Record<string, FsFieldValue>;
+        };
+        const prodData = fromFsFields(prodDoc.fields);
+        const rawVariants = Array.isArray(prodData.variants) ? prodData.variants : [];
+        const nextVariants = rawVariants.map((v) => {
+          if (!v || typeof v !== 'object') return v;
+          const rec = { ...(v as Record<string, unknown>) };
+          const qtyOrdered = lines
+            .filter((l) => l.productId === pid && l.variantId === String(rec.id || ''))
+            .reduce((s, l) => s + l.quantity, 0);
+          if (qtyOrdered > 0) {
+            rec.stock_qty = Math.max(0, Number(rec.stock_qty || 0) - qtyOrdered);
+          }
+          return rec;
+        });
+        const nextTotalStock = nextVariants.reduce(
+          (sum, v) =>
+            sum + (v && typeof v === 'object' ? Number((v as Record<string, unknown>).stock_qty || 0) : 0),
+          0
         );
-        if (prodRes.ok) {
-          const prodDoc = (await prodRes.json()) as {
-            updateTime?: string;
-            fields?: Record<string, FsFieldValue>;
-          };
-          const prodData = fromFsFields(prodDoc.fields);
-          const rawVariants = Array.isArray(prodData.variants) ? prodData.variants : [];
-          const nextVariants = rawVariants.map((v) => {
-            if (!v || typeof v !== 'object') return v;
-            const rec = { ...(v as Record<string, unknown>) };
-            const qtyOrdered = lines
-              .filter((l) => l.productId === pid && l.variantId === String(rec.id || ''))
-              .reduce((s, l) => s + l.quantity, 0);
-            if (qtyOrdered > 0) {
-              rec.stock_qty = Math.max(0, Number(rec.stock_qty || 0) - qtyOrdered);
-            }
-            return rec;
-          });
-          const nextTotalStock = nextVariants.reduce(
-            (sum, v) =>
-              sum + (v && typeof v === 'object' ? Number((v as Record<string, unknown>).stock_qty || 0) : 0),
-            0
-          );
-          writes.push({
-            ...(prodDoc.updateTime ? { currentDocument: { updateTime: prodDoc.updateTime } } : {}),
-            update: {
-              name: `${ctx.dbRootResource}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}`,
-              fields: toFsFields({
-                ...prodData,
-                variants: nextVariants,
-                stock_qty: nextTotalStock,
-                updated_at: now,
-              }),
-            },
-          });
-        }
-      } catch {
-        // Skip best-effort stock read failure if product is seed-only
-      }
-    }
-
-    if (couponCode) {
-      const cpn = await fetchCouponFromFirestoreByCode(couponCode);
-      if (cpn) {
         writes.push({
+          ...(prodDoc.updateTime ? { currentDocument: { updateTime: prodDoc.updateTime } } : {}),
           update: {
-            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/coupons/${encodeURIComponent(cpn.id)}`,
+            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}`,
             fields: toFsFields({
-              ...cpn,
-              used_count: Number(cpn.used_count || 0) + 1,
+              ...prodData,
+              variants: nextVariants,
+              stock_qty: nextTotalStock,
               updated_at: now,
             }),
           },
         });
       }
-    }
-
-    if (giftCardCode && giftCardPaise > 0) {
-      const gc = await fetchGiftCardFromFirestoreByCode(giftCardCode);
-      if (gc) {
-        writes.push({
-          update: {
-            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/gift_cards/${encodeURIComponent(gc.id)}`,
-            fields: toFsFields({
-              ...gc,
-              balance_paise: Math.max(0, Number(gc.balance_paise || 0) - giftCardPaise),
-              last_used_at: now,
-              updated_at: now,
-            }),
-          },
-        });
-      }
+    } catch {
+      // Skip best-effort stock read failure if product is seed-only
     }
   }
 
-  const commitRes = await fetch(`${ctx.docBaseUrl}:commit${keyParam}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ writes }),
-  });
+  if (couponCode) {
+    const cpn = await fetchCouponFromFirestoreByCode(couponCode, {
+      bearerToken: adminBearer,
+      requestId,
+    });
+    if (cpn) {
+      writes.push({
+        update: {
+          name: `${ctx.dbRootResource}/environments/${ctx.namespace}/coupons/${encodeURIComponent(cpn.id)}`,
+          fields: toFsFields({
+            ...cpn,
+            used_count: Number(cpn.used_count || 0) + 1,
+            updated_at: now,
+          }),
+        },
+      });
+    }
+  }
+
+  if (giftCardCode && giftCardPaise > 0) {
+    const gc = await fetchGiftCardFromFirestoreByCode(giftCardCode, {
+      bearerToken: adminBearer,
+      requestId,
+    });
+    if (gc) {
+      writes.push({
+        update: {
+          name: `${ctx.dbRootResource}/environments/${ctx.namespace}/gift_cards/${encodeURIComponent(gc.id)}`,
+          fields: toFsFields({
+            ...gc,
+            balance_paise: Math.max(0, Number(gc.balance_paise || 0) - giftCardPaise),
+            last_used_at: now,
+            updated_at: now,
+          }),
+        },
+      });
+    }
+  }
+
+  let commitRes: Response;
+  try {
+    commitRes = await fetch(`${ctx.docBaseUrl}:commit`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ writes }),
+    });
+  } catch (err) {
+    logCheckoutPersistenceFailure({
+      operation: 'commit_confirmed_order',
+      projectId: ctx.projectId,
+      databaseId: ctx.databaseId,
+      namespace: ctx.namespace,
+      path: orderPath,
+      status: 503,
+      code: 'FIRESTORE_NETWORK_ERROR',
+      requestId,
+      reason: err instanceof Error ? err.message : 'Network error during Firestore commit.',
+    });
+    throw new StoreHttpError(
+      503,
+      'ORDER_CONFIRMATION_PENDING',
+      'Payment received. Order confirmation is delayed and will complete shortly.'
+    );
+  }
 
   if (commitRes.ok) {
     return receipt;
   }
 
-  if (commitRes.status === 409 || commitRes.status === 412 || commitRes.status === 400) {
-    const errText = await commitRes.text().catch(() => '');
-    if (
-      errText.includes('ALREADY_EXISTS') ||
-      errText.includes('FAILED_PRECONDITION') ||
-      commitRes.status === 409 ||
-      commitRes.status === 412
-    ) {
-      const existing = await fetchExistingFirestoreOrder(
-        orderDocId,
-        razorpayOrderId,
-        razorpayPaymentId
-      );
-      if (existing) return existing;
-      return receipt;
-    }
-    throw new StoreHttpError(
-      502,
-      'ORDER_RECORD_FAILED',
-      `Failed to save confirmed order to Firestore: ${errText.slice(0, 180)}`
+  const errText = await commitRes.text().catch(() => '');
+  if (
+    commitRes.status === 409 ||
+    commitRes.status === 412 ||
+    errText.includes('ALREADY_EXISTS') ||
+    errText.includes('FAILED_PRECONDITION')
+  ) {
+    const existing = await fetchExistingFirestoreOrder(
+      orderDocId,
+      razorpayOrderId,
+      razorpayPaymentId,
+      { requestId, bearerToken: adminBearer }
     );
+    if (existing) return existing;
   }
 
-  const errText = await commitRes.text().catch(() => '');
+  logCheckoutPersistenceFailure({
+    operation: 'commit_confirmed_order',
+    projectId: ctx.projectId,
+    databaseId: ctx.databaseId,
+    namespace: ctx.namespace,
+    path: orderPath,
+    status: commitRes.status,
+    code: commitRes.status === 403 ? 'FIRESTORE_PERMISSION_DENIED' : 'FIRESTORE_COMMIT_FAILED',
+    requestId,
+    reason: errText || commitRes.statusText || `HTTP ${commitRes.status}`,
+  });
+
   throw new StoreHttpError(
-    commitRes.status >= 400 ? commitRes.status : 500,
-    'ORDER_RECORD_FAILED',
-    `Failed to persist order record (${commitRes.status}): ${errText.slice(0, 180)}`
+    503,
+    'ORDER_CONFIRMATION_PENDING',
+    'Payment received. Order confirmation is delayed and will complete shortly.'
   );
 }
 
@@ -1990,9 +2363,10 @@ async function persistPendingCheckoutRecord(params: {
   record: PendingCheckoutRecord;
   store?: BoutiqueStore | null;
   strictPersistence: boolean;
-  customerIdToken?: string | null;
+  requestId?: string;
+  bearerToken?: string | null;
 }): Promise<void> {
-  const { record, store, strictPersistence, customerIdToken } = params;
+  const { record, store, strictPersistence, requestId, bearerToken } = params;
   pendingCheckoutsMemory.set(record.razorpayOrderId, record);
 
   if (store) {
@@ -2012,13 +2386,15 @@ async function persistPendingCheckoutRecord(params: {
 
   await savePendingCheckoutToFirestore(record, {
     strict: strictPersistence,
-    customerIdToken,
+    requestId,
+    bearerToken,
   });
 }
 
 async function loadPendingCheckoutRecord(
   razorpayOrderId: string,
-  store?: BoutiqueStore | null
+  store?: BoutiqueStore | null,
+  requestId?: string
 ): Promise<PendingCheckoutRecord | null> {
   const mem = pendingCheckoutsMemory.get(razorpayOrderId);
   if (mem) return mem;
@@ -2028,7 +2404,7 @@ async function loadPendingCheckoutRecord(
     if (row) return fromPendingCheckoutRow(row);
   }
 
-  return loadPendingCheckoutFromFirestore(razorpayOrderId);
+  return loadPendingCheckoutFromFirestore(razorpayOrderId, { requestId });
 }
 
 export async function handleCreateOrderRequest(params: {
@@ -2038,14 +2414,15 @@ export async function handleCreateOrderRequest(params: {
   customerIdToken?: string | null;
   razorpayClientFactory?: RazorpayClientFactory;
   requireDurablePersistence?: boolean;
+  requestId?: string;
 }): Promise<CheckoutHandlerResponse> {
   const {
     body,
     store = null,
     customerUserId = null,
-    customerIdToken = null,
     razorpayClientFactory,
     requireDurablePersistence,
+    requestId,
   } = params;
 
   const creds = resolveRazorpayCredentials();
@@ -2180,6 +2557,61 @@ export async function handleCreateOrderRequest(params: {
     requireDurablePersistence,
   });
 
+  // Resolve and validate server Firestore credential BEFORE creating a Razorpay order
+  let precheckedServerBearer: string | null = null;
+  if (!store && strictPersistence) {
+    const ctx = getFirestoreContext();
+    if (!ctx) {
+      logCheckoutPersistenceFailure({
+        operation: 'precheck_checkout_persistence',
+        projectId: 'unknown',
+        databaseId: 'unknown',
+        namespace: resolveServerFirestoreNamespace(),
+        path: 'pending_checkouts',
+        status: 503,
+        code: 'FIREBASE_CONFIG_MISSING',
+        requestId,
+        reason: 'firebase-applet-config.json is missing or invalid.',
+      });
+      return {
+        status: 503,
+        body: {
+          status: 503,
+          code: 'CHECKOUT_PERSISTENCE_FAILED',
+          error: 'Unable to initialize payment checkout right now. Please try again in a moment.',
+        },
+      };
+    }
+
+    const tokenRes = await resolveFirestoreServerBearerToken({
+      operation: 'precheck_checkout_persistence',
+      requestId,
+      ctx,
+    });
+    if (!tokenRes.ok) {
+      logCheckoutPersistenceFailure({
+        operation: 'precheck_checkout_persistence',
+        projectId: ctx.projectId,
+        databaseId: ctx.databaseId,
+        namespace: ctx.namespace,
+        path: `environments/${ctx.namespace}/pending_checkouts`,
+        status: tokenRes.status,
+        code: tokenRes.reasonCode,
+        requestId,
+        reason: tokenRes.detail,
+      });
+      return {
+        status: 503,
+        body: {
+          status: 503,
+          code: 'CHECKOUT_PERSISTENCE_FAILED',
+          error: 'Unable to initialize payment checkout right now. Please try again in a moment.',
+        },
+      };
+    }
+    precheckedServerBearer = tokenRes.token;
+  }
+
   try {
     const razorpay = (razorpayClientFactory || defaultRazorpayFactory)(keyId, keySecret);
     const notes: Record<string, string> = {};
@@ -2228,7 +2660,8 @@ export async function handleCreateOrderRequest(params: {
         record: pendingRecord,
         store,
         strictPersistence,
-        customerIdToken,
+        requestId,
+        bearerToken: precheckedServerBearer,
       });
     } catch (persistErr) {
       pendingCheckoutsMemory.delete(order.id);
@@ -2247,10 +2680,7 @@ export async function handleCreateOrderRequest(params: {
         body: {
           status: 503,
           code: 'CHECKOUT_PERSISTENCE_FAILED',
-          error:
-            persistErr instanceof Error
-              ? persistErr.message
-              : 'Unable to save checkout state before opening payment.',
+          error: 'Unable to initialize payment checkout right now. Please try again in a moment.',
         },
       };
     }
@@ -2355,6 +2785,7 @@ async function finalizePaidRazorpayOrder(params: {
   fetchedPaymentPreloaded?: RazorpayPaymentEntity | null;
   source: 'verify' | 'webhook' | 'status' | 'recover';
   strictPersistence?: boolean;
+  requestId?: string;
 }): Promise<CheckoutHandlerResponse> {
   const {
     razorpayOrderId,
@@ -2363,11 +2794,11 @@ async function finalizePaidRazorpayOrder(params: {
     keySecret,
     keyMode,
     store,
-    customerIdToken = null,
     verifiedToken = null,
     razorpayClientFactory,
     source,
     strictPersistence = false,
+    requestId,
   } = params;
 
   const existingInFlight = inFlightVerifications.get(razorpayOrderId);
@@ -2444,7 +2875,7 @@ async function finalizePaidRazorpayOrder(params: {
       }
     }
 
-    let pendingRecord = await loadPendingCheckoutRecord(razorpayOrderId, store);
+    let pendingRecord = await loadPendingCheckoutRecord(razorpayOrderId, store, requestId);
 
     if (pendingRecord?.status === 'confirmed' && pendingRecord.confirmedOrder) {
       const responseBody: Record<string, unknown> = {
@@ -2468,7 +2899,8 @@ async function finalizePaidRazorpayOrder(params: {
       const existingFsOrder = await fetchExistingFirestoreOrder(
         orderDocId,
         razorpayOrderId,
-        razorpayPaymentId
+        razorpayPaymentId,
+        { requestId }
       );
       if (existingFsOrder) {
         const responseBody: Record<string, unknown> = {
@@ -2742,8 +3174,8 @@ async function finalizePaidRazorpayOrder(params: {
             couponCode: finalCouponCode,
             giftCardCode: finalGiftCardCode,
             totalPaise: finalTotalPaise,
-            customerIdToken,
             strictPersistence,
+            requestId,
           });
         }
 
@@ -2760,7 +3192,7 @@ async function finalizePaidRazorpayOrder(params: {
             record: pendingRecord,
             store,
             strictPersistence: false,
-            customerIdToken,
+            requestId,
           }).catch(() => {});
         }
 
@@ -2780,6 +3212,22 @@ async function finalizePaidRazorpayOrder(params: {
 
         return { status: 200, body: responseBody };
       } catch (persistErr) {
+        const ctx = getFirestoreContext();
+        logCheckoutPersistenceFailure({
+          operation: 'finalize_paid_order',
+          projectId: ctx?.projectId || 'unknown',
+          databaseId: ctx?.databaseId || 'unknown',
+          namespace: ctx?.namespace || resolveServerFirestoreNamespace(),
+          path: `orders/${orderDocId}`,
+          status: 202,
+          code: 'ORDER_CONFIRMATION_PENDING',
+          requestId,
+          reason:
+            persistErr instanceof Error
+              ? persistErr.message
+              : 'Deferred order confirmation after payment capture.',
+        });
+
         // Payment WAS verified and captured, but saving the order to the DB failed/delayed.
         // Return 202 pending confirmation so client does NOT charge again or lose reference.
         if (pendingRecord) {
@@ -2794,7 +3242,7 @@ async function finalizePaidRazorpayOrder(params: {
             record: pendingRecord,
             store,
             strictPersistence: false,
-            customerIdToken,
+            requestId,
           }).catch(() => {});
         }
 
@@ -2810,9 +3258,9 @@ async function finalizePaidRazorpayOrder(params: {
             payment_id: razorpayPaymentId,
             message: 'Payment received. We’re confirming your order',
             error:
-              persistErr instanceof Error
+              persistErr instanceof StoreHttpError
                 ? persistErr.message
-                : 'Order confirmation is delayed.',
+                : 'Order confirmation is delayed and will complete shortly.',
           },
         };
       }
@@ -2847,6 +3295,7 @@ export async function handleVerifyPaymentRequest(params: {
   customerIdToken?: string | null;
   razorpayClientFactory?: RazorpayClientFactory;
   strictPersistence?: boolean;
+  requestId?: string;
 }): Promise<CheckoutHandlerResponse> {
   const {
     body,
@@ -2854,8 +3303,12 @@ export async function handleVerifyPaymentRequest(params: {
     customerUserId = null,
     customerIdToken = null,
     razorpayClientFactory,
-    strictPersistence = false,
+    requestId,
   } = params;
+  const strictPersistence = shouldRequireDurablePersistence({
+    store,
+    requireDurablePersistence: params.strictPersistence,
+  });
 
   const razorpayOrderId =
     typeof body.razorpay_order_id === 'string'
@@ -2996,7 +3449,7 @@ export async function handleVerifyPaymentRequest(params: {
     }
   }
 
-  const pendingRecord = await loadPendingCheckoutRecord(razorpayOrderId, store);
+  const pendingRecord = await loadPendingCheckoutRecord(razorpayOrderId, store, requestId);
   const expectedAmount =
     pendingRecord?.amountPaise ?? verifiedToken?.amt ?? null;
   const effectiveSubtotal = catalogValidatedForOrder?.totalPaise ?? null;
@@ -3033,6 +3486,7 @@ export async function handleVerifyPaymentRequest(params: {
     razorpayClientFactory,
     source: 'verify',
     strictPersistence,
+    requestId,
   });
 }
 
@@ -3041,8 +3495,9 @@ export async function handleRazorpayWebhookRequest(params: {
   signatureHeader: string | string[] | undefined;
   store?: BoutiqueStore | null;
   razorpayClientFactory?: RazorpayClientFactory;
+  requestId?: string;
 }): Promise<CheckoutHandlerResponse> {
-  const { rawBody, signatureHeader, store = null, razorpayClientFactory } = params;
+  const { rawBody, signatureHeader, store = null, razorpayClientFactory, requestId } = params;
   const sig = (Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader || '').trim();
   const webhookSecret = sanitizeEnvCredential(process.env.RAZORPAY_WEBHOOK_SECRET);
 
@@ -3161,6 +3616,7 @@ export async function handleRazorpayWebhookRequest(params: {
     razorpayClientFactory,
     source: 'webhook',
     strictPersistence: shouldRequireDurablePersistence({ store }),
+    requestId,
   });
 }
 
@@ -3171,6 +3627,7 @@ export async function handleOrderStatusRequest(params: {
   customerUserId?: string | null;
   customerIdToken?: string | null;
   razorpayClientFactory?: RazorpayClientFactory;
+  requestId?: string;
 }): Promise<CheckoutHandlerResponse> {
   const {
     razorpayOrderId,
@@ -3179,6 +3636,7 @@ export async function handleOrderStatusRequest(params: {
     customerUserId = null,
     customerIdToken = null,
     razorpayClientFactory,
+    requestId,
   } = params;
 
   const cleanOid = razorpayOrderId.trim();
@@ -3247,7 +3705,8 @@ export async function handleOrderStatusRequest(params: {
     const existingFs = await fetchExistingFirestoreOrder(
       orderDocId,
       cleanOid,
-      razorpayPaymentId || ''
+      razorpayPaymentId || '',
+      { requestId }
     );
     if (existingFs) {
       return {
@@ -3263,7 +3722,7 @@ export async function handleOrderStatusRequest(params: {
     }
   }
 
-  const pendingRecord = await loadPendingCheckoutRecord(cleanOid, store);
+  const pendingRecord = await loadPendingCheckoutRecord(cleanOid, store, requestId);
   const pid = razorpayPaymentId?.trim() || pendingRecord?.razorpayPaymentId || '';
   if (!pid) {
     return {
@@ -3291,7 +3750,7 @@ export async function handleOrderStatusRequest(params: {
     };
   }
 
-  return finalizePaidRazorpayOrder({
+  const finalRes = await finalizePaidRazorpayOrder({
     razorpayOrderId: cleanOid,
     razorpayPaymentId: pid,
     keyId: creds.keyId,
@@ -3302,7 +3761,21 @@ export async function handleOrderStatusRequest(params: {
     customerIdToken,
     razorpayClientFactory,
     source: 'status',
+    strictPersistence: shouldRequireDurablePersistence({ store }),
+    requestId,
   });
+
+  if (finalRes.status === 200 && finalRes.body.order) {
+    return {
+      status: 200,
+      body: {
+        confirmed: true,
+        pending_confirmation: false,
+        ...finalRes.body,
+      },
+    };
+  }
+  return finalRes;
 }
 
 export async function handleRecoverRazorpayOrder(params: {
@@ -3311,6 +3784,7 @@ export async function handleRecoverRazorpayOrder(params: {
   customerFallback?: OrderCustomerDetails | null;
   store?: BoutiqueStore | null;
   razorpayClientFactory?: RazorpayClientFactory;
+  requestId?: string;
 }): Promise<CheckoutHandlerResponse> {
   const {
     razorpayOrderId,
@@ -3318,6 +3792,7 @@ export async function handleRecoverRazorpayOrder(params: {
     customerFallback = null,
     store = null,
     razorpayClientFactory,
+    requestId,
   } = params;
 
   const cleanOid = razorpayOrderId.trim();
@@ -3338,7 +3813,7 @@ export async function handleRecoverRazorpayOrder(params: {
 
   let pid = (razorpayPaymentId || '').trim();
   if (!pid) {
-    const pending = await loadPendingCheckoutRecord(cleanOid, store);
+    const pending = await loadPendingCheckoutRecord(cleanOid, store, requestId);
     pid = pending?.razorpayPaymentId || '';
   }
 
@@ -3377,6 +3852,8 @@ export async function handleRecoverRazorpayOrder(params: {
     customerOverride: customerFallback,
     razorpayClientFactory,
     source: 'recover',
+    strictPersistence: shouldRequireDurablePersistence({ store }),
+    requestId,
   });
 }
 
@@ -3398,8 +3875,8 @@ async function persistCodOrderToFirestoreOnce(params: {
   couponCode: string | null;
   giftCardCode: string | null;
   totalPaise: number;
-  customerIdToken?: string | null;
   strictPersistence?: boolean;
+  requestId?: string;
 }): Promise<{ receipt: SerializedOrderReceipt; duplicate: boolean }> {
   const {
     orderDocId,
@@ -3414,13 +3891,24 @@ async function persistCodOrderToFirestoreOnce(params: {
     couponCode,
     giftCardCode,
     totalPaise,
-    customerIdToken,
     strictPersistence = false,
+    requestId,
   } = params;
 
   const ctx = getFirestoreContext();
   if (!ctx) {
     if (strictPersistence) {
+      logCheckoutPersistenceFailure({
+        operation: 'place_cod_order',
+        projectId: 'unknown',
+        databaseId: 'unknown',
+        namespace: resolveServerFirestoreNamespace(),
+        path: `orders/${orderDocId}`,
+        status: 503,
+        code: 'FIREBASE_CONFIG_MISSING',
+        requestId,
+        reason: 'firebase-applet-config.json is missing or invalid.',
+      });
       throw new StoreHttpError(
         503,
         'ORDER_PERSISTENCE_UNAVAILABLE',
@@ -3474,24 +3962,90 @@ async function persistCodOrderToFirestoreOnce(params: {
     };
   }
 
+  const orderPath = `environments/${ctx.namespace}/orders/${orderDocId}`;
+  const tokenRes = await resolveFirestoreServerBearerToken({
+    operation: 'place_cod_order',
+    requestId,
+    ctx,
+  });
+
+  if (!tokenRes.ok) {
+    if (strictPersistence) {
+      logCheckoutPersistenceFailure({
+        operation: 'place_cod_order',
+        projectId: ctx.projectId,
+        databaseId: ctx.databaseId,
+        namespace: ctx.namespace,
+        path: orderPath,
+        status: tokenRes.status,
+        code: tokenRes.reasonCode,
+        requestId,
+        reason: tokenRes.detail,
+      });
+      throw new StoreHttpError(
+        503,
+        'ORDER_PERSISTENCE_UNAVAILABLE',
+        'Unable to save your order right now. Please try again in a moment.'
+      );
+    }
+    const now = Date.now();
+    const statusHistory: OrderStatusHistoryEntry[] = [
+      {
+        status: 'placed',
+        note: 'Cash on Delivery order placed · Payment due on delivery',
+        actor: customerUserId ? 'customer' : 'system',
+        at: now,
+      },
+    ];
+    return {
+      duplicate: false,
+      receipt: {
+        id: orderDocId,
+        orderNumber,
+        customerUserId,
+        status: 'placed',
+        paymentStatus: 'unpaid',
+        fulfillmentStatus: 'placed',
+        subtotalPaise,
+        discountPaise,
+        giftCardPaise,
+        couponCode,
+        giftCardCode,
+        totalPaise,
+        currency: 'INR',
+        createdAt: now,
+        updatedAt: now,
+        paymentCollectedAt: null,
+        idempotencyKey,
+        paymentMethod: 'cod',
+        razorpayOrderId: null,
+        razorpayPaymentId: null,
+        statusHistory,
+        items: lines.map((l) => ({
+          productId: l.productId,
+          variantId: l.variantId,
+          productTitle: l.productTitle,
+          variantLabel: l.variantLabel,
+          sku: l.sku,
+          unitPricePaise: l.unitPricePaise,
+          quantity: l.quantity,
+          lineTotalPaise: l.lineTotalPaise,
+        })),
+      },
+    };
+  }
+
+  const adminBearer = tokenRes.token;
+
   // Fast idempotency lookup before mutating inventory
   if (idempotencyKey) {
-    const existing = await fetchExistingFirestoreOrder(orderDocId, '', '');
+    const existing = await fetchExistingFirestoreOrder(orderDocId, '', '', {
+      requestId,
+      bearerToken: adminBearer,
+    });
     if (existing) {
       return { receipt: existing, duplicate: true };
     }
-  }
-
-  const adminBearer = await getFirestoreAdminBearerToken();
-  const effectiveBearer = adminBearer || customerIdToken || null;
-  if (!adminBearer && strictPersistence && !customerIdToken && process.env.VERCEL === '1') {
-    // Attempt guest rule path only if Firestore security rules allow public order create
-  } else if (!adminBearer && strictPersistence && !customerIdToken) {
-    throw new StoreHttpError(
-      503,
-      'ORDER_PERSISTENCE_UNAVAILABLE',
-      'Server database credentials are unavailable to record your COD order.'
-    );
   }
 
   const now = Date.now();
@@ -3551,70 +4105,43 @@ async function persistCodOrderToFirestoreOnce(params: {
     })),
   };
 
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (effectiveBearer) headers.Authorization = `Bearer ${effectiveBearer}`;
-  const keyParam = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${adminBearer}`,
+  };
   const productIds = Array.from(new Set(lines.map((l) => l.productId)));
-  const canUseRichFields = Boolean(adminBearer || (customerIdToken && customerUserId));
 
-  const docFields = canUseRichFields
-    ? {
-        id: orderDocId,
-        order_number: orderNumber,
-        customer_user_id: customerUserId,
-        customer_name: customer.customerName,
-        customer_email: customer.customerEmail,
-        customer_phone: customer.customerPhone,
-        shipping_address: customer.shippingAddress,
-        status: 'placed',
-        payment_status: 'unpaid',
-        fulfillment_status: 'placed',
-        payment_method: 'cod',
-        razorpay_order_id: null,
-        razorpay_payment_id: null,
-        coupon_code: couponCode,
-        gift_card_code: giftCardCode,
-        discount_paise: discountPaise,
-        gift_card_paise: giftCardPaise,
-        status_history_json: statusHistoryJson,
-        return_request_json: null,
-        idempotency_key: idempotencyKey,
-        payment_collected_at: null,
-        payment_collected_by: null,
-        subtotal_paise: subtotalPaise,
-        total_paise: totalPaise,
-        currency: 'INR',
-        created_at: now,
-        updated_at: now,
-        product_ids: productIds,
-        items: firestoreItems,
-      }
-    : {
-        id: orderDocId,
-        order_number: orderNumber,
-        customer_user_id: null,
-        customer_name: customer.customerName,
-        customer_email: customer.customerEmail,
-        customer_phone: customer.customerPhone,
-        shipping_address: customer.shippingAddress,
-        status: 'placed',
-        payment_status: 'unpaid',
-        fulfillment_status: 'placed',
-        payment_method: 'cod',
-        status_history_json: statusHistoryJson,
-        idempotency_key: idempotencyKey,
-        coupon_code: couponCode,
-        gift_card_code: giftCardCode,
-        discount_paise: discountPaise,
-        gift_card_paise: giftCardPaise,
-        subtotal_paise: subtotalPaise,
-        total_paise: totalPaise,
-        currency: 'INR',
-        created_at: now,
-        updated_at: now,
-        product_ids: productIds,
-        items: firestoreItems,
-      };
+  const docFields = {
+    id: orderDocId,
+    order_number: orderNumber,
+    customer_user_id: customerUserId,
+    customer_name: customer.customerName,
+    customer_email: customer.customerEmail,
+    customer_phone: customer.customerPhone,
+    shipping_address: customer.shippingAddress,
+    status: 'placed',
+    payment_status: 'unpaid',
+    fulfillment_status: 'placed',
+    payment_method: 'cod',
+    razorpay_order_id: null,
+    razorpay_payment_id: null,
+    coupon_code: couponCode,
+    gift_card_code: giftCardCode,
+    discount_paise: discountPaise,
+    gift_card_paise: giftCardPaise,
+    status_history_json: statusHistoryJson,
+    return_request_json: null,
+    idempotency_key: idempotencyKey,
+    payment_collected_at: null,
+    payment_collected_by: null,
+    subtotal_paise: subtotalPaise,
+    total_paise: totalPaise,
+    currency: 'INR',
+    created_at: now,
+    updated_at: now,
+    product_ids: productIds,
+    items: firestoreItems,
+  };
 
   const docName = `${ctx.dbRootResource}/environments/${ctx.namespace}/orders/${orderDocId}`;
   const writes: Array<Record<string, unknown>> = [
@@ -3627,7 +4154,7 @@ async function persistCodOrderToFirestoreOnce(params: {
     },
   ];
 
-  if (customerUserId && canUseRichFields) {
+  if (customerUserId) {
     const notifId = `notif_placed_${orderDocId}`;
     writes.push({
       currentDocument: { exists: false },
@@ -3650,100 +4177,123 @@ async function persistCodOrderToFirestoreOnce(params: {
     });
   }
 
-  // Re-verify live stock & atomically deduct stock + coupon/gift-card balances when admin service account is configured
-  if (adminBearer) {
-    for (const pid of productIds) {
-      const prodRes = await fetch(
-        `${ctx.docBaseUrl}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}${keyParam}`,
-        { headers }
-      );
-      if (prodRes.ok) {
-        const prodDoc = (await prodRes.json()) as {
-          updateTime?: string;
-          fields?: Record<string, FsFieldValue>;
-        };
-        const prodData = fromFsFields(prodDoc.fields);
-        const rawVariants = Array.isArray(prodData.variants) ? prodData.variants : [];
-        const nextVariants = rawVariants.map((v) => {
-          if (!v || typeof v !== 'object') return v;
-          const rec = { ...(v as Record<string, unknown>) };
-          const qtyOrdered = lines
-            .filter((l) => l.productId === pid && l.variantId === String(rec.id || ''))
-            .reduce((s, l) => s + l.quantity, 0);
-          if (qtyOrdered > 0) {
-            const currentQty = Number(rec.stock_qty || 0);
-            if (currentQty < qtyOrdered) {
-              throw new StoreHttpError(
-                409,
-                'INSUFFICIENT_STOCK',
-                currentQty <= 0
-                  ? `"${String(prodData.title || 'This piece')}" is currently out of stock.`
-                  : `Only ${currentQty} piece(s) left for "${String(prodData.title || 'this piece')}".`
-              );
-            }
-            rec.stock_qty = currentQty - qtyOrdered;
+  for (const pid of productIds) {
+    const prodRes = await fetch(
+      `${ctx.docBaseUrl}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}`,
+      { headers }
+    );
+    if (prodRes.ok) {
+      const prodDoc = (await prodRes.json()) as {
+        updateTime?: string;
+        fields?: Record<string, FsFieldValue>;
+      };
+      const prodData = fromFsFields(prodDoc.fields);
+      const rawVariants = Array.isArray(prodData.variants) ? prodData.variants : [];
+      const nextVariants = rawVariants.map((v) => {
+        if (!v || typeof v !== 'object') return v;
+        const rec = { ...(v as Record<string, unknown>) };
+        const qtyOrdered = lines
+          .filter((l) => l.productId === pid && l.variantId === String(rec.id || ''))
+          .reduce((s, l) => s + l.quantity, 0);
+        if (qtyOrdered > 0) {
+          const currentQty = Number(rec.stock_qty || 0);
+          if (currentQty < qtyOrdered) {
+            throw new StoreHttpError(
+              409,
+              'INSUFFICIENT_STOCK',
+              currentQty <= 0
+                ? `"${String(prodData.title || 'This piece')}" is currently out of stock.`
+                : `Only ${currentQty} piece(s) left for "${String(prodData.title || 'this piece')}".`
+            );
           }
-          return rec;
-        });
-        const nextTotalStock = nextVariants.reduce(
-          (sum, v) =>
-            sum + (v && typeof v === 'object' ? Number((v as Record<string, unknown>).stock_qty || 0) : 0),
-          0
-        );
-        writes.push({
-          ...(prodDoc.updateTime ? { currentDocument: { updateTime: prodDoc.updateTime } } : {}),
-          update: {
-            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}`,
-            fields: toFsFields({
-              ...prodData,
-              variants: nextVariants,
-              stock_qty: nextTotalStock,
-              updated_at: now,
-            }),
-          },
-        });
-      }
-    }
-
-    if (couponCode) {
-      const cpn = await fetchCouponFromFirestoreByCode(couponCode);
-      if (cpn) {
-        writes.push({
-          update: {
-            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/coupons/${encodeURIComponent(cpn.id)}`,
-            fields: toFsFields({
-              ...cpn,
-              used_count: Number(cpn.used_count || 0) + 1,
-              updated_at: now,
-            }),
-          },
-        });
-      }
-    }
-
-    if (giftCardCode && giftCardPaise > 0) {
-      const gc = await fetchGiftCardFromFirestoreByCode(giftCardCode);
-      if (gc) {
-        writes.push({
-          update: {
-            name: `${ctx.dbRootResource}/environments/${ctx.namespace}/gift_cards/${encodeURIComponent(gc.id)}`,
-            fields: toFsFields({
-              ...gc,
-              balance_paise: Math.max(0, Number(gc.balance_paise || 0) - giftCardPaise),
-              last_used_at: now,
-              updated_at: now,
-            }),
-          },
-        });
-      }
+          rec.stock_qty = currentQty - qtyOrdered;
+        }
+        return rec;
+      });
+      const nextTotalStock = nextVariants.reduce(
+        (sum, v) =>
+          sum + (v && typeof v === 'object' ? Number((v as Record<string, unknown>).stock_qty || 0) : 0),
+        0
+      );
+      writes.push({
+        ...(prodDoc.updateTime ? { currentDocument: { updateTime: prodDoc.updateTime } } : {}),
+        update: {
+          name: `${ctx.dbRootResource}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}`,
+          fields: toFsFields({
+            ...prodData,
+            variants: nextVariants,
+            stock_qty: nextTotalStock,
+            updated_at: now,
+          }),
+        },
+      });
     }
   }
 
-  const commitRes = await fetch(`${ctx.docBaseUrl}:commit${keyParam}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ writes }),
-  });
+  if (couponCode) {
+    const cpn = await fetchCouponFromFirestoreByCode(couponCode, {
+      bearerToken: adminBearer,
+      requestId,
+    });
+    if (cpn) {
+      writes.push({
+        update: {
+          name: `${ctx.dbRootResource}/environments/${ctx.namespace}/coupons/${encodeURIComponent(cpn.id)}`,
+          fields: toFsFields({
+            ...cpn,
+            used_count: Number(cpn.used_count || 0) + 1,
+            updated_at: now,
+          }),
+        },
+      });
+    }
+  }
+
+  if (giftCardCode && giftCardPaise > 0) {
+    const gc = await fetchGiftCardFromFirestoreByCode(giftCardCode, {
+      bearerToken: adminBearer,
+      requestId,
+    });
+    if (gc) {
+      writes.push({
+        update: {
+          name: `${ctx.dbRootResource}/environments/${ctx.namespace}/gift_cards/${encodeURIComponent(gc.id)}`,
+          fields: toFsFields({
+            ...gc,
+            balance_paise: Math.max(0, Number(gc.balance_paise || 0) - giftCardPaise),
+            last_used_at: now,
+            updated_at: now,
+          }),
+        },
+      });
+    }
+  }
+
+  let commitRes: Response;
+  try {
+    commitRes = await fetch(`${ctx.docBaseUrl}:commit`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ writes }),
+    });
+  } catch (err) {
+    logCheckoutPersistenceFailure({
+      operation: 'place_cod_order',
+      projectId: ctx.projectId,
+      databaseId: ctx.databaseId,
+      namespace: ctx.namespace,
+      path: orderPath,
+      status: 503,
+      code: 'FIRESTORE_NETWORK_ERROR',
+      requestId,
+      reason: err instanceof Error ? err.message : 'Network error during COD Firestore commit.',
+    });
+    throw new StoreHttpError(
+      503,
+      'ORDER_RECORD_FAILED',
+      'Unable to save your order right now. Please try again in a moment.'
+    );
+  }
 
   if (commitRes.ok) {
     return { receipt, duplicate: false };
@@ -3757,7 +4307,10 @@ async function persistCodOrderToFirestoreOnce(params: {
     errText.includes('FAILED_PRECONDITION')
   ) {
     if (idempotencyKey) {
-      const existing = await fetchExistingFirestoreOrder(orderDocId, '', '');
+      const existing = await fetchExistingFirestoreOrder(orderDocId, '', '', {
+        requestId,
+        bearerToken: adminBearer,
+      });
       if (existing) {
         return { receipt: existing, duplicate: true };
       }
@@ -3769,10 +4322,22 @@ async function persistCodOrderToFirestoreOnce(params: {
     );
   }
 
+  logCheckoutPersistenceFailure({
+    operation: 'place_cod_order',
+    projectId: ctx.projectId,
+    databaseId: ctx.databaseId,
+    namespace: ctx.namespace,
+    path: orderPath,
+    status: commitRes.status,
+    code: commitRes.status === 403 ? 'FIRESTORE_PERMISSION_DENIED' : 'FIRESTORE_COMMIT_FAILED',
+    requestId,
+    reason: errText || commitRes.statusText || `HTTP ${commitRes.status}`,
+  });
+
   throw new StoreHttpError(
-    commitRes.status >= 400 ? commitRes.status : 502,
+    503,
     'ORDER_RECORD_FAILED',
-    `Unable to save your order (${commitRes.status}): ${errText.slice(0, 180)}`
+    'Unable to save your order right now. Please try again in a moment.'
   );
 }
 
@@ -3782,13 +4347,14 @@ export async function handlePlaceCodOrderRequest(params: {
   customerUserId?: string | null;
   customerIdToken?: string | null;
   requireDurablePersistence?: boolean;
+  requestId?: string;
 }): Promise<CheckoutHandlerResponse> {
   const {
     body,
     store = null,
     customerUserId = null,
-    customerIdToken = null,
     requireDurablePersistence = true,
+    requestId,
   } = params;
 
   const rawMethod =
@@ -3911,7 +4477,9 @@ export async function handlePlaceCodOrderRequest(params: {
         return { status: 200, body: { order: receipt, duplicate: true } };
       }
     } else {
-      const existingFsOrder = await fetchExistingFirestoreOrder(deterministicOrderId, '', '');
+      const existingFsOrder = await fetchExistingFirestoreOrder(deterministicOrderId, '', '', {
+        requestId,
+      });
       if (existingFsOrder) {
         return { status: 200, body: { order: existingFsOrder, duplicate: true } };
       }
@@ -4023,8 +4591,8 @@ export async function handlePlaceCodOrderRequest(params: {
       couponCode: promo.couponCode,
       giftCardCode: promo.giftCardCode,
       totalPaise: promo.finalAmountPaise,
-      customerIdToken,
       strictPersistence: requireDurablePersistence,
+      requestId,
     });
 
     return {
@@ -4056,4 +4624,5 @@ export function clearRazorpayCheckoutCachesForTest() {
   pendingCheckoutsMemory.clear();
   completedCheckoutsMemory.clear();
   inFlightVerifications.clear();
+  cachedGoogleAccessToken = null;
 }

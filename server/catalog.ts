@@ -1386,6 +1386,7 @@ export function registerCatalogAndAdminRoutes(params: {
         store,
         customerUserId: authCtx.customerUserId,
         customerIdToken: authCtx.customerIdToken,
+        requestId: req.requestId,
       });
       return res.status(result.status).json(result.body);
     } catch (err) {
@@ -1433,6 +1434,7 @@ export function registerCatalogAndAdminRoutes(params: {
           customerUserId: authCtx.customerUserId,
           customerIdToken: authCtx.customerIdToken,
           razorpayClientFactory,
+          requestId: req.requestId,
         });
         return res.status(result.status).json(result.body);
       } catch (err) {
@@ -1455,6 +1457,7 @@ export function registerCatalogAndAdminRoutes(params: {
           customerUserId: authCtx.customerUserId,
           customerIdToken: authCtx.customerIdToken,
           razorpayClientFactory,
+          requestId: req.requestId,
         });
         return res.status(result.status).json(result.body);
       } catch (err) {
@@ -1476,6 +1479,7 @@ export function registerCatalogAndAdminRoutes(params: {
           signatureHeader: req.get('x-razorpay-signature'),
           store,
           razorpayClientFactory,
+          requestId: req.requestId,
         });
         return res.status(result.status).json(result.body);
       } catch (err) {
@@ -1527,6 +1531,7 @@ export function registerCatalogAndAdminRoutes(params: {
         customerUserId: authCtx.customerUserId,
         customerIdToken: authCtx.customerIdToken,
         razorpayClientFactory,
+        requestId: req.requestId,
       });
       return res.status(result.status).json(result.body);
     } catch (err) {

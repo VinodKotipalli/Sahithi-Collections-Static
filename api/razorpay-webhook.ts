@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   handleRazorpayWebhookRequest,
@@ -58,12 +59,17 @@ export function createRazorpayWebhookHandler(options?: {
       return;
     }
 
+    const rawReqId = req.headers['x-vercel-id'] || req.headers['x-request-id'];
+    const requestId =
+      (Array.isArray(rawReqId) ? rawReqId[0] : rawReqId)?.trim() || crypto.randomUUID();
+
     const rawBody = await readRawBody(req);
     const result = await handleRazorpayWebhookRequest({
       rawBody,
       signatureHeader: req.headers['x-razorpay-signature'],
       store: options?.store ?? null,
       razorpayClientFactory: options?.razorpayClientFactory,
+      requestId,
     });
     sendJson(res, result.status, result.body);
   };

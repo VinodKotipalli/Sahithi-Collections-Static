@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   handleOrderStatusRequest,
@@ -89,6 +90,10 @@ export function createOrderStatusHandler(options?: {
       (typeof body.razorpay_payment_id === 'string' ? body.razorpay_payment_id : '') ||
       (typeof body.payment_id === 'string' ? body.payment_id : '');
 
+    const rawReqId = req.headers['x-vercel-id'] || req.headers['x-request-id'];
+    const requestId =
+      (Array.isArray(rawReqId) ? rawReqId[0] : rawReqId)?.trim() || crypto.randomUUID();
+
     const result = await handleOrderStatusRequest({
       razorpayOrderId,
       razorpayPaymentId: razorpayPaymentId || undefined,
@@ -96,6 +101,7 @@ export function createOrderStatusHandler(options?: {
       customerUserId: authResult.uid,
       customerIdToken: authResult.rawToken,
       razorpayClientFactory: options?.razorpayClientFactory,
+      requestId,
     });
     sendJson(res, result.status, result.body);
   };
