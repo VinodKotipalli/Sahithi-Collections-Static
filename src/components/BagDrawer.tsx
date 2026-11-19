@@ -526,17 +526,29 @@ export function BagDrawer({
         }).catch(() => null);
 
         const serverContentType = (serverResponse?.headers.get('content-type') || '').toLowerCase();
+        const parsedServerBody =
+          serverResponse && serverContentType.includes('application/json')
+            ? ((await serverResponse.json().catch(() => ({}))) as {
+                order?: PlacedOrderReceipt;
+                code?: string;
+                error?: string;
+                support_reference?: string;
+              })
+            : null;
+        const isServerPersistence503 =
+          serverResponse?.status === 503 &&
+          (!parsedServerBody?.code ||
+            parsedServerBody.code === 'ORDER_RECORD_FAILED' ||
+            parsedServerBody.code === 'ORDER_PERSISTENCE_UNAVAILABLE' ||
+            parsedServerBody.code === 'CHECKOUT_PERSISTENCE_FAILED');
         const hitStaticFallback =
           !serverResponse ||
+          isServerPersistence503 ||
           ((serverResponse.status === 404 || serverResponse.status === 405) &&
             !serverContentType.includes('application/json'));
 
         if (!hitStaticFallback && serverResponse) {
-          const parsed = (await serverResponse.json().catch(() => ({}))) as {
-            order?: PlacedOrderReceipt;
-            error?: string;
-            support_reference?: string;
-          };
+          const parsed = parsedServerBody || {};
           codStatus = serverResponse.status;
           codResOk = serverResponse.ok && Boolean(parsed.order?.orderNumber);
           codOrder = parsed.order;

@@ -941,6 +941,127 @@ function serializeClientOrderDoc(o: Record<string, unknown>) {
   };
 }
 
+async function verifyRazorpayOrderStatusFromServer(
+  razorpayOrderId: string,
+  razorpayPaymentId: string | null,
+  idToken?: string
+): Promise<{ confirmed: boolean; paymentId?: string } | null> {
+  if (!razorpayOrderId || typeof fetch !== 'function') return null;
+  try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    };
+    if (idToken) headers.Authorization = `Bearer ${idToken}`;
+    const res = await fetch('/api/order-status', {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+      body: JSON.stringify({
+        razorpay_order_id: razorpayOrderId,
+        ...(razorpayPaymentId ? { razorpay_payment_id: razorpayPaymentId } : {}),
+      }),
+    });
+    if (!res.ok) return null;
+    const payload = (await res.json().catch(() => ({}))) as {
+      confirmed?: boolean;
+      order?: { paymentStatus?: string; razorpayPaymentId?: string };
+      payment_id?: string;
+    };
+    if (payload.confirmed && payload.order?.paymentStatus === 'paid') {
+      return {
+        confirmed: true,
+        paymentId: payload.order.razorpayPaymentId || payload.payment_id || razorpayPaymentId || undefined,
+      };
+    }
+    return { confirmed: false };
+  } catch {
+    return null;
+  }
+}
+
+async function reconcilePendingRazorpayOrdersAsOwner(
+  docs: Array<Record<string, unknown>>,
+  ownerIdToken: string
+): Promise<void> {
+  const candidates = docs
+    .filter((d) => {
+      const method = String(d.payment_method || '');
+      const payStatus = String(d.payment_status || '');
+      const orderStatus = String(d.status || '');
+      const rzpOid = typeof d.razorpay_order_id === 'string' ? d.razorpay_order_id : '';
+      return (
+        method === 'razorpay' &&
+        payStatus !== 'paid' &&
+        !['cancelled', 'refunded'].includes(orderStatus) &&
+        rzpOid.length > 0 &&
+        typeof d.id === 'string' &&
+        d.id.length > 0
+      );
+    })
+    .slice(0, 8);
+
+  if (candidates.length === 0) return;
+
+  await Promise.all(
+    candidates.map(async (doc) => {
+      const rzpOid = String(doc.razorpay_order_id || '');
+      const rzpPid = typeof doc.razorpay_payment_id === 'string' ? doc.razorpay_payment_id : null;
+      const check = await verifyRazorpayOrderStatusFromServer(rzpOid, rzpPid, ownerIdToken);
+      if (!check?.confirmed) return;
+
+      const now = Date.now();
+      const existingHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
+        doc.status_history ?? doc.status_history_json,
+        []
+      );
+      const nextHistory: OrderStatusHistoryEntry[] = existingHistory.some(
+        (h) => h.status === 'confirmed'
+      )
+        ? existingHistory
+        : [
+            ...existingHistory,
+            {
+              status: 'confirmed',
+              note: 'Payment verified via Razorpay',
+              actor: 'system',
+              at: now,
+            },
+          ];
+
+      const docId = String(doc.id);
+      await firestoreSetDoc(
+        'orders',
+        docId,
+        {
+          status: 'confirmed',
+          fulfillment_status: 'confirmed',
+          payment_status: 'paid',
+          status_history: nextHistory,
+          status_history_json: JSON.stringify(nextHistory),
+          updated_at: now,
+        },
+        ownerIdToken,
+        [
+          'status',
+          'fulfillment_status',
+          'payment_status',
+          'status_history',
+          'status_history_json',
+          'updated_at',
+        ]
+      ).catch(() => {});
+
+      doc.status = 'confirmed';
+      doc.fulfillment_status = 'confirmed';
+      doc.payment_status = 'paid';
+      doc.status_history = nextHistory;
+      doc.status_history_json = JSON.stringify(nextHistory);
+      doc.updated_at = now;
+    })
+  );
+}
+
 function serializeClientCouponDoc(c: Record<string, unknown>) {
   return {
     id: String(c.id || ''),
@@ -3072,6 +3193,32 @@ export async function handleClientlessApiRequest<T>(
       const items = docs
         .map((d) => serializeClientOrderDoc(d))
         .sort((a, b) => b.createdAt - a.createdAt);
+      const pendingRzpItems = items
+        .filter(
+          (o) =>
+            o.paymentMethod === 'razorpay' &&
+            o.paymentStatus !== 'paid' &&
+            !['cancelled', 'refunded'].includes(o.status) &&
+            Boolean(o.razorpayOrderId)
+        )
+        .slice(0, 6);
+      if (pendingRzpItems.length > 0) {
+        await Promise.all(
+          pendingRzpItems.map(async (item) => {
+            const check = await verifyRazorpayOrderStatusFromServer(
+              item.razorpayOrderId || '',
+              item.razorpayPaymentId || null,
+              session.idToken
+            );
+            if (check?.confirmed) {
+              item.status = 'confirmed';
+              item.paymentStatus = 'paid';
+              item.fulfillmentStatus = 'confirmed';
+              if (check.paymentId) item.razorpayPaymentId = check.paymentId;
+            }
+          })
+        );
+      }
       return { ok: true, data: { items } as unknown as T };
     }
 
@@ -4485,6 +4632,7 @@ export async function handleClientlessApiRequest<T>(
           firestoreListDocs<{ id: string; email_verified?: boolean }>('users', idToken).catch(() => []),
         ]);
 
+        await reconcilePendingRazorpayOrdersAsOwner(orders, idToken).catch(() => {});
         const orderCounts = computeProductOrderCounts(orders as unknown as ClientOrderDoc[]);
         const serializedOrders = orders.map((o) => serializeClientOrderDoc(o));
         const activeCount = products.filter(
@@ -4851,6 +4999,7 @@ export async function handleClientlessApiRequest<T>(
 
       if (cleanPath === '/api/admin/orders' && upperMethod === 'GET') {
         const docs = await firestoreListDocs<Record<string, unknown>>('orders', idToken);
+        await reconcilePendingRazorpayOrdersAsOwner(docs, idToken).catch(() => {});
         const items = docs
           .map((o) => serializeClientOrderDoc(o))
           .sort((a, b) => b.createdAt - a.createdAt);

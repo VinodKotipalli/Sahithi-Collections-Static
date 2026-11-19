@@ -207,6 +207,24 @@ test('Checkout persistence guards: missing/malformed credentials, OAuth failure,
         });
       }
 
+      if (method === 'POST') {
+        const parsedUrl = new URL(urlStr);
+        const docId = parsedUrl.searchParams.get('documentId') || '';
+        const fullDocName = `${docName}/${docId}`;
+        if (firestoreDocs.has(fullDocName)) {
+          return new Response(
+            JSON.stringify({ error: { code: 409, status: 'ALREADY_EXISTS' } }),
+            { status: 409, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        const parsed = JSON.parse(String(init?.body || '{}')) as { fields?: Record<string, unknown> };
+        firestoreDocs.set(fullDocName, { name: fullDocName, fields: parsed.fields || {} });
+        return new Response(JSON.stringify({ name: fullDocName, fields: parsed.fields || {} }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
       if (method === 'GET') {
         if (docName.endsWith('/site_documents/settings')) {
           return new Response(JSON.stringify({ error: { code: 404 } }), { status: 404 });
@@ -231,10 +249,12 @@ test('Checkout persistence guards: missing/malformed credentials, OAuth failure,
   const createHandler = createCreateOrderHandler({
     razorpayClientFactory: mockFactory,
     verifyIdToken,
+    requireDurablePersistence: true,
   });
   const verifyHandler = createVerifyPaymentHandler({
     razorpayClientFactory: mockFactory,
     verifyIdToken,
+    strictPersistence: true,
   });
   const webhookHandler = createRazorpayWebhookHandler({
     razorpayClientFactory: mockFactory,
@@ -527,3 +547,300 @@ test('Checkout persistence guards: missing/malformed credentials, OAuth failure,
     }
   }
 });
+
+test('Vercel Starter-Tier mode (default): checkout, verify-payment, order-status & COD succeed automatically without service-account IAM', async () => {
+  clearRazorpayCheckoutCachesForTest();
+  const cfg = readAppletFirebaseConfig();
+
+  const prevEnv = {
+    VERCEL: process.env.VERCEL,
+    K_SERVICE: process.env.K_SERVICE,
+    FIREBASE_SERVICE_ACCOUNT_JSON: process.env.FIREBASE_SERVICE_ACCOUNT_JSON,
+    GOOGLE_APPLICATION_CREDENTIALS: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID,
+    RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET,
+    SAHITHI_FIRESTORE_NAMESPACE: process.env.SAHITHI_FIRESTORE_NAMESPACE,
+    SAHITHI_TARGET_ENV: process.env.SAHITHI_TARGET_ENV,
+  };
+
+  process.env.VERCEL = '1';
+  delete process.env.K_SERVICE;
+  delete process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  delete process.env.SAHITHI_FIRESTORE_NAMESPACE;
+  delete process.env.SAHITHI_TARGET_ENV;
+  process.env.RAZORPAY_KEY_ID = 'rzp_test_StarterTier1';
+  process.env.RAZORPAY_KEY_SECRET = 'SecretStarterTier999';
+
+  let rzpSeq = 0;
+  const mockFactory: RazorpayClientFactory = () => ({
+    orders: {
+      async create(params) {
+        rzpSeq += 1;
+        return {
+          id: `order_starter_${rzpSeq}`,
+          amount: params.amount,
+          currency: params.currency,
+          receipt: params.receipt,
+          notes: params.notes,
+          status: 'created',
+        };
+      },
+      async fetch(orderId) {
+        return {
+          id: orderId,
+          amount: 74900,
+          currency: 'INR',
+          status: 'paid',
+          notes: { customer_user_id: 'uid_priya_1' },
+        };
+      },
+    },
+    payments: {
+      async fetch(paymentId) {
+        return {
+          id: paymentId,
+          order_id: `order_starter_${rzpSeq}`,
+          amount: 74900,
+          currency: 'INR',
+          status: 'captured',
+          captured: true,
+        };
+      },
+      async capture(paymentId, amount, currency) {
+        return {
+          id: paymentId,
+          order_id: `order_starter_${rzpSeq}`,
+          amount,
+          currency,
+          status: 'captured',
+          captured: true,
+        };
+      },
+    },
+  });
+
+  const firestoreDocs = new Map<string, { name: string; fields: Record<string, unknown> }>();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (urlStr.startsWith('https://firestore.googleapis.com/')) {
+      const method = (init?.method || 'GET').toUpperCase();
+      const headers = new Headers(init?.headers);
+      const auth = headers.get('authorization');
+      if (urlStr.includes(':runQuery')) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (urlStr.includes(':commit')) {
+        return new Response(
+          JSON.stringify({ error: { code: 403, status: 'PERMISSION_DENIED' } }),
+          { status: 403, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      const cleanDocUrl = urlStr.split('?')[0]!;
+      const docName = cleanDocUrl.replace('https://firestore.googleapis.com/v1/', '');
+      if (method === 'POST') {
+        const parsedUrl = new URL(urlStr);
+        const docId = parsedUrl.searchParams.get('documentId') || '';
+        const fullDocName = `${docName}/${docId}`;
+        if (firestoreDocs.has(fullDocName)) {
+          return new Response(
+            JSON.stringify({ error: { code: 409, status: 'ALREADY_EXISTS' } }),
+            { status: 409, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        const parsed = JSON.parse(String(init?.body || '{}')) as { fields?: Record<string, unknown> };
+        const fields = parsed.fields || {};
+        // Assert strict compliance with firestore.rules isValidPublicOrder for orders collection creates
+        if (docName.endsWith('/orders')) {
+          assert.ok(fields.status && typeof fields.status === 'object');
+          const statusVal = (fields.status as { stringValue?: string }).stringValue;
+          assert.ok(statusVal === 'placed' || statusVal === 'pending');
+          const payStatusVal = (fields.payment_status as { stringValue?: string } | undefined)?.stringValue;
+          assert.ok(payStatusVal === 'unpaid' || payStatusVal === 'pending');
+          const uidField = fields.customer_user_id as { stringValue?: string; nullValue?: null };
+          if (uidField?.stringValue) {
+            assert.equal(auth, 'Bearer customer-id-token-priya');
+          }
+        }
+        firestoreDocs.set(fullDocName, { name: fullDocName, fields });
+        return new Response(JSON.stringify({ name: fullDocName, fields }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (method === 'GET') {
+        if (docName.endsWith('/site_documents/settings')) {
+          return new Response(JSON.stringify({ error: { code: 404 } }), { status: 404 });
+        }
+        const existing = firestoreDocs.get(docName);
+        if (!existing) {
+          return new Response(JSON.stringify({ error: { code: 404, status: 'NOT_FOUND' } }), { status: 404 });
+        }
+        return new Response(JSON.stringify(existing), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+
+  const verifyIdToken = async (token: string) =>
+    token === 'customer-id-token-priya' ? { uid: 'uid_priya_1', email: 'priya@example.com' } : null;
+
+  const createHandler = createCreateOrderHandler({ razorpayClientFactory: mockFactory, verifyIdToken });
+  const verifyHandler = createVerifyPaymentHandler({ razorpayClientFactory: mockFactory, verifyIdToken });
+  const statusHandler = createOrderStatusHandler({ razorpayClientFactory: mockFactory, verifyIdToken });
+  const ordersHandler = createOrdersHandler({ verifyIdToken });
+
+  const server = http.createServer((req, res) => {
+    if (req.url?.startsWith('/api/create-order')) return void createHandler(req, res);
+    if (req.url?.startsWith('/api/verify-payment')) return void verifyHandler(req, res);
+    if (req.url?.startsWith('/api/order-status')) return void statusHandler(req, res);
+    if (req.url?.startsWith('/api/orders')) return void ordersHandler(req, res);
+    res.statusCode = 404;
+    res.end('Not found');
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const { port } = server.address() as { port: number };
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    const samplePayload = {
+      items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }],
+      customer: {
+        customerName: 'Priya Menon',
+        customerEmail: 'priya@example.com',
+        customerPhone: '+91 98765 00001',
+        shippingAddress: '42 Lavelle Road, Bengaluru 560001',
+      },
+    };
+
+    // 1. Create Razorpay order with ZERO service-account config on Vercel -> 200 OK token_backed
+    const createRes = await originalFetch(`${baseUrl}/api/create-order`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer customer-id-token-priya',
+      },
+      body: JSON.stringify(samplePayload),
+    });
+    assert.equal(createRes.status, 200);
+    const createBody = (await createRes.json()) as {
+      order_id: string;
+      checkout_token: string;
+      persistence_mode: string;
+      key_id: string;
+    };
+    assert.equal(createBody.persistence_mode, 'token_backed');
+    assert.ok(createBody.order_id);
+    assert.ok(createBody.checkout_token);
+
+    // 2. Simulate cold lambda + verify payment -> persists via isValidPublicOrder rule (200 OK)
+    clearRazorpayCheckoutCachesForTest();
+    const payId = 'pay_starter_1';
+    const sig = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
+      .update(`${createBody.order_id}|${payId}`)
+      .digest('hex');
+
+    const verifyRes = await originalFetch(`${baseUrl}/api/verify-payment`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer customer-id-token-priya',
+      },
+      body: JSON.stringify({
+        razorpay_order_id: createBody.order_id,
+        razorpay_payment_id: payId,
+        razorpay_signature: sig,
+        checkout_token: createBody.checkout_token,
+        orderData: { ...samplePayload.customer, items: samplePayload.items },
+      }),
+    });
+    assert.equal(verifyRes.status, 200);
+    const verifyBody = (await verifyRes.json()) as {
+      success?: boolean;
+      persistence_mode?: string;
+      order?: { id?: string; orderNumber?: string; paymentStatus?: string; status?: string };
+    };
+    assert.equal(verifyBody.success, true);
+    assert.equal(verifyBody.persistence_mode, 'public_order_rule');
+    assert.equal(verifyBody.order?.paymentStatus, 'paid');
+    assert.equal(verifyBody.order?.status, 'confirmed');
+    assert.ok(verifyBody.order?.orderNumber);
+
+    const expectedOrderDoc = `projects/${cfg.projectId}/databases/${cfg.firestoreDatabaseId}/documents/environments/production/orders/${verifyBody.order?.id}`;
+    assert.ok(firestoreDocs.has(expectedOrderDoc));
+
+    // 3. /api/order-status on cold cache checks live Razorpay API for the public-rule doc & returns confirmed paid order
+    clearRazorpayCheckoutCachesForTest();
+    const statusRes = await originalFetch(`${baseUrl}/api/order-status`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer customer-id-token-priya',
+      },
+      body: JSON.stringify({ razorpay_order_id: createBody.order_id }),
+    });
+    assert.equal(statusRes.status, 200);
+    const statusBody = (await statusRes.json()) as {
+      confirmed?: boolean;
+      order?: { paymentStatus?: string; status?: string };
+    };
+    assert.equal(statusBody.confirmed, true);
+    assert.equal(statusBody.order?.paymentStatus, 'paid');
+    assert.equal(statusBody.order?.status, 'confirmed');
+
+    // 4. COD /api/orders with ZERO service-account config on Vercel -> 201 Created + idempotent 200 retry
+    const codRes1 = await originalFetch(`${baseUrl}/api/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer customer-id-token-priya',
+      },
+      body: JSON.stringify({
+        ...samplePayload,
+        paymentMethod: 'cod',
+        idempotencyKey: 'cod_starter_tier_1',
+      }),
+    });
+    assert.equal(codRes1.status, 201);
+    const codBody1 = (await codRes1.json()) as { order?: { id?: string; orderNumber?: string }; duplicate?: boolean };
+    assert.equal(codBody1.duplicate, false);
+    assert.ok(codBody1.order?.orderNumber);
+    const expectedCodDoc = `projects/${cfg.projectId}/databases/${cfg.firestoreDatabaseId}/documents/environments/production/orders/${codBody1.order?.id}`;
+    assert.ok(firestoreDocs.has(expectedCodDoc));
+
+    const codRes2 = await originalFetch(`${baseUrl}/api/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer customer-id-token-priya',
+      },
+      body: JSON.stringify({
+        ...samplePayload,
+        paymentMethod: 'cod',
+        idempotencyKey: 'cod_starter_tier_1',
+      }),
+    });
+    assert.equal(codRes2.status, 200);
+    const codBody2 = (await codRes2.json()) as { duplicate?: boolean; order?: { id?: string } };
+    assert.equal(codBody2.duplicate, true);
+    assert.equal(codBody2.order?.id, codBody1.order?.id);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    clearRazorpayCheckoutCachesForTest();
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+

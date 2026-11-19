@@ -963,9 +963,6 @@ function shouldRequireDurablePersistence(params: {
     return params.requireDurablePersistence;
   }
   if (params.store) return true;
-  if (process.env.VERCEL === '1') return true;
-  if (Boolean((process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim())) return true;
-  if (Boolean((process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim())) return true;
   return false;
 }
 
@@ -2045,28 +2042,48 @@ async function fetchExistingFirestoreOrder(
   orderDocId: string,
   razorpayOrderId: string,
   razorpayPaymentId: string,
-  options?: { requestId?: string; bearerToken?: string | null }
+  options?: { requestId?: string; bearerToken?: string | null; customerIdToken?: string | null }
 ): Promise<SerializedOrderReceipt | null> {
   const ctx = getFirestoreContext();
   if (!ctx) return null;
-  const tokenRes: ServerBearerResult = options?.bearerToken
-    ? { ok: true, token: options.bearerToken }
-    : await resolveFirestoreServerBearerToken({
-        operation: 'fetch_existing_order',
-        requestId: options?.requestId,
-        ctx,
-      });
-  if (!tokenRes.ok) return null;
+
+  let authToken = options?.bearerToken || null;
+  let usingCustomerToken = false;
+  if (!authToken) {
+    const tokenRes = await resolveFirestoreServerBearerToken({
+      operation: 'fetch_existing_order',
+      requestId: options?.requestId,
+      ctx,
+    });
+    if (tokenRes.ok) {
+      authToken = tokenRes.token;
+    } else if (options?.customerIdToken) {
+      authToken = options.customerIdToken;
+      usingCustomerToken = true;
+    }
+  }
+  if (!authToken) return null;
 
   const docPath = `environments/${ctx.namespace}/orders/${orderDocId}`;
-  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/orders/${encodeURIComponent(orderDocId)}`;
+  const keyParam = usingCustomerToken && ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
+  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/orders/${encodeURIComponent(orderDocId)}${keyParam}`;
   try {
-    const res = await withTransientRetry(() =>
+    let res = await withTransientRetry(() =>
       fetch(url, {
         method: 'GET',
-        headers: { Authorization: `Bearer ${tokenRes.token}` },
+        headers: { Authorization: `Bearer ${authToken}` },
       })
     );
+    if (res.status === 403 && !usingCustomerToken && options?.customerIdToken) {
+      const fallbackKey = ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
+      const fallbackUrl = `${ctx.docBaseUrl}/environments/${ctx.namespace}/orders/${encodeURIComponent(orderDocId)}${fallbackKey}`;
+      res = await withTransientRetry(() =>
+        fetch(fallbackUrl, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${options.customerIdToken}` },
+        })
+      );
+    }
     if (!res.ok) {
       if (res.status !== 404) {
         const errText = await res.text().catch(() => '');
@@ -2143,10 +2160,174 @@ async function fetchExistingFirestoreOrder(
   }
 }
 
+async function persistOrderViaPublicRule(params: {
+  orderDocId: string;
+  orderNumber: string;
+  paymentMethod: 'razorpay' | 'cod';
+  razorpayOrderId: string | null;
+  razorpayPaymentId: string | null;
+  idempotencyKey?: string | null;
+  customerUserId: string | null;
+  customerIdToken?: string | null;
+  customer: OrderCustomerDetails;
+  lines: ValidatedOrderLine[];
+  subtotalPaise: number;
+  discountPaise: number;
+  giftCardPaise: number;
+  couponCode: string | null;
+  giftCardCode: string | null;
+  totalPaise: number;
+  now: number;
+  statusHistory: OrderStatusHistoryEntry[];
+  requestId?: string;
+}): Promise<{ ok: true; duplicate: boolean } | { ok: false; status: number; reason: string }> {
+  const ctx = getFirestoreContext();
+  if (!ctx) {
+    return { ok: false, status: 503, reason: 'Firebase configuration missing.' };
+  }
+
+  const effectiveRuleUid =
+    params.customerIdToken && params.customerUserId ? params.customerUserId : null;
+  const firestoreItems = params.lines.map((l, idx) => ({
+    id: `item_${params.orderDocId}_${idx + 1}`,
+    order_id: params.orderDocId,
+    product_id: l.productId,
+    variant_id: l.variantId,
+    product_title: l.productTitle,
+    variant_label: l.variantLabel,
+    sku: l.sku,
+    unit_price_paise: l.unitPricePaise,
+    quantity: l.quantity,
+    line_total_paise: l.lineTotalPaise,
+  }));
+  const productIds = Array.from(new Set(params.lines.map((l) => l.productId)));
+
+  // Fields strictly comply with isValidPublicOrder(data, orderId) in firestore.rules
+  const ruleOrderFields: Record<string, unknown> = {
+    id: params.orderDocId,
+    order_number: params.orderNumber,
+    customer_user_id: effectiveRuleUid,
+    customer_name: params.customer.customerName,
+    customer_email: params.customer.customerEmail,
+    customer_phone: params.customer.customerPhone,
+    shipping_address: params.customer.shippingAddress,
+    status: 'placed',
+    payment_status: params.paymentMethod === 'razorpay' ? 'pending' : 'unpaid',
+    fulfillment_status: 'placed',
+    payment_method: params.paymentMethod,
+    razorpay_order_id: params.razorpayOrderId,
+    razorpay_payment_id: params.razorpayPaymentId,
+    coupon_code: params.couponCode,
+    gift_card_code: params.giftCardCode,
+    discount_paise: params.discountPaise,
+    gift_card_paise: params.giftCardPaise,
+    status_history_json: JSON.stringify(params.statusHistory),
+    subtotal_paise: params.subtotalPaise,
+    total_paise: params.totalPaise,
+    currency: 'INR',
+    created_at: params.now,
+    updated_at: params.now,
+    product_ids: productIds,
+    items: firestoreItems,
+  };
+  if (params.idempotencyKey !== undefined && params.idempotencyKey !== null) {
+    ruleOrderFields.idempotency_key = params.idempotencyKey;
+  }
+
+  const queryParams = new URLSearchParams({ documentId: params.orderDocId });
+  if (ctx.apiKey) {
+    queryParams.set('key', ctx.apiKey);
+  }
+  const createUrl = `${ctx.docBaseUrl}/environments/${ctx.namespace}/orders?${queryParams.toString()}`;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (effectiveRuleUid && params.customerIdToken) {
+    headers.Authorization = `Bearer ${params.customerIdToken}`;
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(createUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ fields: toFsFields(ruleOrderFields) }),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      status: 503,
+      reason: err instanceof Error ? err.message : 'Network error calling Firestore REST create.',
+    };
+  }
+
+  if (res.status === 409) {
+    return { ok: true, duplicate: true };
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    if (errText.includes('ALREADY_EXISTS')) {
+      return { ok: true, duplicate: true };
+    }
+    logCheckoutPersistenceFailure({
+      operation: 'public_rule_order_create',
+      projectId: ctx.projectId,
+      databaseId: ctx.databaseId,
+      namespace: ctx.namespace,
+      path: `environments/${ctx.namespace}/orders/${params.orderDocId}`,
+      status: res.status,
+      code: res.status === 403 ? 'FIRESTORE_PERMISSION_DENIED' : 'FIRESTORE_CREATE_FAILED',
+      requestId: params.requestId,
+      reason: errText || res.statusText || `HTTP ${res.status}`,
+    });
+    return {
+      ok: false,
+      status: res.status,
+      reason: errText || res.statusText || `HTTP ${res.status}`,
+    };
+  }
+
+  if (effectiveRuleUid && params.customerIdToken) {
+    const notifId = `notif_placed_${params.orderDocId}`;
+    const notifQuery = new URLSearchParams({ documentId: notifId });
+    if (ctx.apiKey) {
+      notifQuery.set('key', ctx.apiKey);
+    }
+    const notifUrl = `${ctx.docBaseUrl}/environments/${ctx.namespace}/users/${encodeURIComponent(effectiveRuleUid)}/notifications?${notifQuery.toString()}`;
+    await fetch(notifUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${params.customerIdToken}`,
+      },
+      body: JSON.stringify({
+        fields: toFsFields({
+          id: notifId,
+          user_id: effectiveRuleUid,
+          type: 'order_placed',
+          title: `Order ${params.orderNumber} placed`,
+          message:
+            params.paymentMethod === 'razorpay'
+              ? `Payment verified for order ${params.orderNumber} (₹${(params.totalPaise / 100).toLocaleString('en-IN')}).`
+              : `Your Cash on Delivery order ${params.orderNumber} is placed. ₹${(params.totalPaise / 100).toLocaleString('en-IN')} is due on delivery.`,
+          order_id: params.orderDocId,
+          order_number: params.orderNumber,
+          is_read: 0,
+          read: false,
+          read_at: null,
+          created_at: params.now,
+        }),
+      }),
+    }).catch(() => {});
+  }
+
+  return { ok: true, duplicate: false };
+}
+
 async function persistConfirmedOrderToFirestoreOnce(params: {
   razorpayOrderId: string;
   razorpayPaymentId: string;
   customerUserId: string | null;
+  customerIdToken?: string | null;
   customer: OrderCustomerDetails;
   lines: ValidatedOrderLine[];
   subtotalPaise: number;
@@ -2157,11 +2338,12 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
   totalPaise: number;
   strictPersistence?: boolean;
   requestId?: string;
-}): Promise<SerializedOrderReceipt> {
+}): Promise<{ receipt: SerializedOrderReceipt; persistenceMode: 'durable' | 'public_order_rule' }> {
   const {
     razorpayOrderId,
     razorpayPaymentId,
     customerUserId,
+    customerIdToken = null,
     customer,
     lines,
     subtotalPaise,
@@ -2256,8 +2438,42 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
         'Payment received. Order confirmation is delayed and will complete shortly.'
       );
     }
-    return receipt;
+    return { receipt, persistenceMode: 'public_order_rule' };
   }
+
+  const tryPublicFallback = async (): Promise<{
+    receipt: SerializedOrderReceipt;
+    persistenceMode: 'public_order_rule';
+  }> => {
+    const publicRes = await persistOrderViaPublicRule({
+      orderDocId,
+      orderNumber,
+      paymentMethod: 'razorpay',
+      razorpayOrderId,
+      razorpayPaymentId,
+      customerUserId,
+      customerIdToken,
+      customer,
+      lines,
+      subtotalPaise,
+      discountPaise,
+      giftCardPaise,
+      couponCode,
+      giftCardCode,
+      totalPaise,
+      now,
+      statusHistory,
+      requestId,
+    });
+    if (publicRes.ok) {
+      return { receipt, persistenceMode: 'public_order_rule' };
+    }
+    throw new StoreHttpError(
+      503,
+      'ORDER_CONFIRMATION_PENDING',
+      'Payment received. Order confirmation is delayed and will complete shortly.'
+    );
+  };
 
   const orderPath = `environments/${ctx.namespace}/orders/${orderDocId}`;
   const tokenRes = await resolveFirestoreServerBearerToken({
@@ -2267,7 +2483,7 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
   });
   if (!tokenRes.ok) {
     if (!strictPersistence) {
-      return receipt;
+      return tryPublicFallback();
     }
     logCheckoutPersistenceFailure({
       operation: 'commit_confirmed_order',
@@ -2451,6 +2667,9 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
       body: JSON.stringify({ writes }),
     });
   } catch (err) {
+    if (!strictPersistence) {
+      return tryPublicFallback();
+    }
     logCheckoutPersistenceFailure({
       operation: 'commit_confirmed_order',
       projectId: ctx.projectId,
@@ -2470,7 +2689,7 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
   }
 
   if (commitRes.ok) {
-    return receipt;
+    return { receipt, persistenceMode: 'durable' };
   }
 
   const errText = await commitRes.text().catch(() => '');
@@ -2484,9 +2703,15 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
       orderDocId,
       razorpayOrderId,
       razorpayPaymentId,
-      { requestId, bearerToken: adminBearer }
+      { requestId, bearerToken: adminBearer, customerIdToken }
     );
-    if (existing) return existing;
+    if (existing) {
+      return { receipt: existing, persistenceMode: 'durable' };
+    }
+  }
+
+  if (!strictPersistence && commitRes.status === 403) {
+    return tryPublicFallback();
   }
 
   logCheckoutPersistenceFailure({
@@ -2687,7 +2912,7 @@ async function persistPendingCheckoutRecord(params: {
   strictPersistence: boolean;
   requestId?: string;
   bearerToken?: string | null;
-}): Promise<void> {
+}): Promise<boolean> {
   const { record, store, strictPersistence, requestId, bearerToken } = params;
   pendingCheckoutsMemory.set(record.razorpayOrderId, record);
 
@@ -2703,10 +2928,10 @@ async function persistPendingCheckoutRecord(params: {
           : 'Unable to save checkout state before opening payment.'
       );
     }
-    return;
+    return true;
   }
 
-  await savePendingCheckoutToFirestore(record, {
+  return savePendingCheckoutToFirestore(record, {
     strict: strictPersistence,
     requestId,
     bearerToken,
@@ -2948,11 +3173,12 @@ export async function handleCreateOrderRequest(params: {
     requireDurablePersistence,
   });
 
-  // Resolve and validate server Firestore credential BEFORE creating a Razorpay order
+  // Resolve and validate server Firestore credential BEFORE creating a Razorpay order when strict durable persistence is required;
+  // otherwise resolve best-effort so Starter-Tier projects continue cleanly in token_backed mode.
   let precheckedServerBearer: string | null = null;
-  if (!store && strictPersistence) {
+  if (!store) {
     const ctx = getFirestoreContext();
-    if (!ctx) {
+    if (!ctx && strictPersistence) {
       logCheckoutPersistenceFailure({
         operation: 'precheck_checkout_persistence',
         projectId: 'unknown',
@@ -2975,34 +3201,37 @@ export async function handleCreateOrderRequest(params: {
       );
     }
 
-    const tokenRes = await resolveFirestoreServerBearerToken({
-      operation: 'precheck_checkout_persistence',
-      requestId,
-      ctx,
-    });
-    if (!tokenRes.ok) {
-      logCheckoutPersistenceFailure({
+    if (ctx) {
+      const tokenRes = await resolveFirestoreServerBearerToken({
         operation: 'precheck_checkout_persistence',
-        projectId: ctx.projectId,
-        databaseId: ctx.databaseId,
-        namespace: ctx.namespace,
-        path: `environments/${ctx.namespace}/pending_checkouts`,
-        status: tokenRes.status,
-        code: tokenRes.reasonCode,
         requestId,
-        reason: tokenRes.detail,
+        ctx,
       });
-      return withSupportRef(
-        503,
-        {
-          status: 503,
-          code: 'CHECKOUT_PERSISTENCE_FAILED',
-          error: 'Unable to initialize payment checkout right now. Please try again in a moment.',
-        },
-        requestId
-      );
+      if (tokenRes.ok) {
+        precheckedServerBearer = tokenRes.token;
+      } else if (strictPersistence) {
+        logCheckoutPersistenceFailure({
+          operation: 'precheck_checkout_persistence',
+          projectId: ctx.projectId,
+          databaseId: ctx.databaseId,
+          namespace: ctx.namespace,
+          path: `environments/${ctx.namespace}/pending_checkouts`,
+          status: tokenRes.status,
+          code: tokenRes.reasonCode,
+          requestId,
+          reason: tokenRes.detail,
+        });
+        return withSupportRef(
+          503,
+          {
+            status: 503,
+            code: 'CHECKOUT_PERSISTENCE_FAILED',
+            error: 'Unable to initialize payment checkout right now. Please try again in a moment.',
+          },
+          requestId
+        );
+      }
     }
-    precheckedServerBearer = tokenRes.token;
   }
 
   // Deduplicate repeated create-order clicks/retries using idempotencyKey
@@ -3140,8 +3369,9 @@ export async function handleCreateOrderRequest(params: {
     };
 
     pruneMemoryCaches(now);
+    let persistedDurable = false;
     try {
-      await persistPendingCheckoutRecord({
+      persistedDurable = await persistPendingCheckoutRecord({
         record: pendingRecord,
         store,
         strictPersistence,
@@ -3172,7 +3402,7 @@ export async function handleCreateOrderRequest(params: {
       );
     }
 
-    if (cleanIdempotencyKey) {
+    if (cleanIdempotencyKey && persistedDurable) {
       await saveCreateOrderAttempt({
         idempotencyKey: cleanIdempotencyKey,
         payloadHash,
@@ -3182,6 +3412,13 @@ export async function handleCreateOrderRequest(params: {
         store,
         requestId,
         bearerToken: precheckedServerBearer,
+      });
+    } else if (cleanIdempotencyKey) {
+      idempotentOrderAttemptsMemory.set(cleanIdempotencyKey, {
+        payloadHash,
+        razorpayOrderId: order.id,
+        keyId,
+        expiresAt: pendingRecord.expiresAt,
       });
     }
 
@@ -3225,6 +3462,7 @@ export async function handleCreateOrderRequest(params: {
         receipt: pendingRecord.receipt,
         key_id: keyId,
         checkout_token: checkoutToken,
+        persistence_mode: store ? 'store' : persistedDurable ? 'durable' : 'token_backed',
       },
       requestId
     );
@@ -3405,9 +3643,9 @@ async function finalizePaidRazorpayOrder(params: {
         orderDocId,
         razorpayOrderId,
         razorpayPaymentId,
-        { requestId }
+        { requestId, customerIdToken: params.customerIdToken }
       );
-      if (existingFsOrder) {
+      if (existingFsOrder && existingFsOrder.paymentStatus === 'paid') {
         const responseBody: Record<string, unknown> = {
           success: true,
           verified: true,
@@ -3602,7 +3840,32 @@ async function finalizePaidRazorpayOrder(params: {
       };
     }
 
-    const finalLines = params.itemsOverride || pendingRecord?.items || [];
+    let finalLines: ValidatedOrderLine[] = params.itemsOverride || pendingRecord?.items || [];
+    if (finalLines.length === 0 && verifiedToken?.items?.length) {
+      const catalog = store ? null : await fetchPublishedCatalogFromFirestore().catch(() => null);
+      finalLines = await Promise.all(
+        verifiedToken.items.map(async (tokItem) => {
+          const storeProd = store
+            ? await store.getPublicProductByIdOrSlug(tokItem.productId).catch(() => null)
+            : null;
+          const fsProd = store ? null : catalog?.get(tokItem.productId) || null;
+          const variants = storeProd?.variants ?? fsProd?.variants ?? [];
+          const variant = variants.find((v) => v.id === tokItem.variantId) || variants[0];
+          const unitPricePaise = tokItem.unitPricePaise;
+          return {
+            productId: tokItem.productId,
+            variantId: tokItem.variantId || variant?.id || tokItem.productId,
+            productTitle: storeProd?.product.title || fsProd?.title || 'Boutique Piece',
+            variantLabel: variant ? `${variant.size} / ${variant.color_name}` : 'Standard',
+            sku: variant?.sku || storeProd?.product.sku || fsProd?.sku || tokItem.productId.toUpperCase(),
+            unitPricePaise,
+            quantity: tokItem.quantity,
+            lineTotalPaise: unitPricePaise * tokItem.quantity,
+          };
+        })
+      );
+    }
+
     const effectiveCustomer = params.customerOverride || pendingRecord?.customer || null;
     const effectiveUid =
       params.customerUserId ||
@@ -3633,6 +3896,7 @@ async function finalizePaidRazorpayOrder(params: {
     if (effectiveCustomer && finalLines.length > 0) {
       try {
         let confirmedReceipt: SerializedOrderReceipt;
+        let persistenceMode: 'store' | 'durable' | 'public_order_rule' = store ? 'store' : 'durable';
 
         if (store) {
           const suffix = crypto
@@ -3711,10 +3975,11 @@ async function finalizePaidRazorpayOrder(params: {
             })),
           };
         } else {
-          confirmedReceipt = await persistConfirmedOrderToFirestoreOnce({
+          const persisted = await persistConfirmedOrderToFirestoreOnce({
             razorpayOrderId,
             razorpayPaymentId,
             customerUserId: effectiveUid,
+            customerIdToken: params.customerIdToken,
             customer: effectiveCustomer,
             lines: finalLines,
             subtotalPaise: finalSubtotalPaise,
@@ -3726,6 +3991,8 @@ async function finalizePaidRazorpayOrder(params: {
             strictPersistence,
             requestId,
           });
+          confirmedReceipt = persisted.receipt;
+          persistenceMode = persisted.persistenceMode;
         }
 
         if (pendingRecord) {
@@ -3751,6 +4018,7 @@ async function finalizePaidRazorpayOrder(params: {
           order_id: razorpayOrderId,
           internal_order_ref: orderDocId,
           payment_id: razorpayPaymentId,
+          persistence_mode: persistenceMode,
           message: 'Payment verified and order confirmed.',
           order: confirmedReceipt,
           ...(requestId ? { support_reference: requestId } : {}),
@@ -4427,16 +4695,90 @@ export async function handleOrderStatusRequest(params: {
       orderDocId,
       cleanOid,
       razorpayPaymentId || '',
-      { requestId }
+      { requestId, customerIdToken }
     );
     if (existingFs) {
+      if (existingFs.paymentMethod !== 'razorpay' || existingFs.paymentStatus === 'paid') {
+        return withSupportRef(
+          200,
+          {
+            confirmed: true,
+            pending_confirmation: false,
+            failed: false,
+            status: 'confirmed',
+            order_id: cleanOid,
+            internal_order_ref: orderDocId,
+            payment_id: existingFs.razorpayPaymentId || razorpayPaymentId || null,
+            order: existingFs,
+          },
+          requestId
+        );
+      }
+
+      // Public-rule persisted Razorpay order (payment_status='pending'): verify live against Razorpay API
+      const creds = resolveRazorpayCredentials();
+      if (creds.ok) {
+        const rzp = (razorpayClientFactory || defaultRazorpayFactory)(creds.keyId, creds.keySecret);
+        let livePaymentId = razorpayPaymentId?.trim() || existingFs.razorpayPaymentId || '';
+        let fetchedPay: RazorpayPaymentEntity | null = null;
+        if (livePaymentId) {
+          fetchedPay = await withTransientRetry(() => rzp.payments.fetch(livePaymentId)).catch(() => null);
+        }
+        if (!fetchedPay && typeof rzp.orders.fetchPayments === 'function') {
+          const payList = await withTransientRetry(() => rzp.orders.fetchPayments!(cleanOid)).catch(() => null);
+          const match = (payList?.items || []).find(
+            (p) => p.status === 'captured' || p.captured === true || p.status === 'authorized'
+          );
+          if (match) {
+            fetchedPay = match;
+            livePaymentId = match.id;
+          }
+        }
+        if (fetchedPay && fetchedPay.status === 'authorized' && !fetchedPay.captured) {
+          fetchedPay = await rzp.payments
+            .capture(fetchedPay.id, existingFs.totalPaise || Math.round(Number(fetchedPay.amount)), 'INR')
+            .catch(() => fetchedPay);
+        }
+        const paidOk =
+          fetchedPay &&
+          (fetchedPay.status === 'captured' || fetchedPay.captured === true) &&
+          (!fetchedPay.order_id || fetchedPay.order_id === cleanOid) &&
+          String(fetchedPay.currency || '').toUpperCase() === 'INR' &&
+          Math.round(Number(fetchedPay.amount)) === existingFs.totalPaise;
+
+        if (paidOk && livePaymentId) {
+          const confirmedOrder: SerializedOrderReceipt = {
+            ...existingFs,
+            status: 'confirmed',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'confirmed',
+            razorpayOrderId: cleanOid,
+            razorpayPaymentId: livePaymentId,
+          };
+          return withSupportRef(
+            200,
+            {
+              confirmed: true,
+              pending_confirmation: false,
+              failed: false,
+              status: 'confirmed',
+              order_id: cleanOid,
+              internal_order_ref: orderDocId,
+              payment_id: livePaymentId,
+              order: confirmedOrder,
+            },
+            requestId
+          );
+        }
+      }
+
       return withSupportRef(
         200,
         {
-          confirmed: true,
-          pending_confirmation: false,
+          confirmed: false,
+          pending_confirmation: true,
           failed: false,
-          status: 'confirmed',
+          status: existingFs.paymentStatus || 'pending',
           order_id: cleanOid,
           internal_order_ref: orderDocId,
           payment_id: existingFs.razorpayPaymentId || razorpayPaymentId || null,
@@ -4620,6 +4962,7 @@ async function persistCodOrderToFirestoreOnce(params: {
   orderNumber: string;
   idempotencyKey: string | null;
   customerUserId: string | null;
+  customerIdToken?: string | null;
   customer: OrderCustomerDetails;
   lines: ValidatedOrderLine[];
   subtotalPaise: number;
@@ -4636,6 +4979,7 @@ async function persistCodOrderToFirestoreOnce(params: {
     orderNumber,
     idempotencyKey,
     customerUserId,
+    customerIdToken = null,
     customer,
     lines,
     subtotalPaise,
@@ -4715,6 +5059,87 @@ async function persistCodOrderToFirestoreOnce(params: {
     };
   }
 
+  const buildCodReceipt = (nowTs: number, history: OrderStatusHistoryEntry[]): SerializedOrderReceipt => ({
+    id: orderDocId,
+    orderNumber,
+    customerUserId,
+    status: 'placed',
+    paymentStatus: 'unpaid',
+    fulfillmentStatus: 'placed',
+    subtotalPaise,
+    discountPaise,
+    giftCardPaise,
+    couponCode,
+    giftCardCode,
+    totalPaise,
+    currency: 'INR',
+    createdAt: nowTs,
+    updatedAt: nowTs,
+    paymentCollectedAt: null,
+    idempotencyKey,
+    paymentMethod: 'cod',
+    razorpayOrderId: null,
+    razorpayPaymentId: null,
+    statusHistory: history,
+    items: lines.map((l) => ({
+      productId: l.productId,
+      variantId: l.variantId,
+      productTitle: l.productTitle,
+      variantLabel: l.variantLabel,
+      sku: l.sku,
+      unitPricePaise: l.unitPricePaise,
+      quantity: l.quantity,
+      lineTotalPaise: l.lineTotalPaise,
+    })),
+  });
+
+  const tryPublicCodFallback = async (
+    nowTs: number,
+    history: OrderStatusHistoryEntry[]
+  ): Promise<{ receipt: SerializedOrderReceipt; duplicate: boolean }> => {
+    const publicRes = await persistOrderViaPublicRule({
+      orderDocId,
+      orderNumber,
+      paymentMethod: 'cod',
+      razorpayOrderId: null,
+      razorpayPaymentId: null,
+      idempotencyKey,
+      customerUserId,
+      customerIdToken,
+      customer,
+      lines,
+      subtotalPaise,
+      discountPaise,
+      giftCardPaise,
+      couponCode,
+      giftCardCode,
+      totalPaise,
+      now: nowTs,
+      statusHistory: history,
+      requestId,
+    });
+    if (publicRes.ok) {
+      if (publicRes.duplicate) {
+        const existing = await fetchExistingFirestoreOrder(orderDocId, '', '', {
+          requestId,
+          customerIdToken,
+        });
+        if (existing) {
+          return { receipt: existing, duplicate: true };
+        }
+      }
+      return {
+        duplicate: publicRes.duplicate,
+        receipt: buildCodReceipt(nowTs, history),
+      };
+    }
+    throw new StoreHttpError(
+      503,
+      'ORDER_PERSISTENCE_UNAVAILABLE',
+      'Unable to save your order right now. Please try again in a moment.'
+    );
+  };
+
   const orderPath = `environments/${ctx.namespace}/orders/${orderDocId}`;
   const tokenRes = await resolveFirestoreServerBearerToken({
     operation: 'place_cod_order',
@@ -4723,69 +5148,34 @@ async function persistCodOrderToFirestoreOnce(params: {
   });
 
   if (!tokenRes.ok) {
-    if (strictPersistence) {
-      logCheckoutPersistenceFailure({
-        operation: 'place_cod_order',
-        projectId: ctx.projectId,
-        databaseId: ctx.databaseId,
-        namespace: ctx.namespace,
-        path: orderPath,
-        status: tokenRes.status,
-        code: tokenRes.reasonCode,
-        requestId,
-        reason: tokenRes.detail,
-      });
-      throw new StoreHttpError(
-        503,
-        'ORDER_PERSISTENCE_UNAVAILABLE',
-        'Unable to save your order right now. Please try again in a moment.'
-      );
-    }
-    const now = Date.now();
-    const statusHistory: OrderStatusHistoryEntry[] = [
+    const nowFallback = Date.now();
+    const historyFallback: OrderStatusHistoryEntry[] = [
       {
         status: 'placed',
         note: 'Cash on Delivery order placed · Payment due on delivery',
         actor: customerUserId ? 'customer' : 'system',
-        at: now,
+        at: nowFallback,
       },
     ];
-    return {
-      duplicate: false,
-      receipt: {
-        id: orderDocId,
-        orderNumber,
-        customerUserId,
-        status: 'placed',
-        paymentStatus: 'unpaid',
-        fulfillmentStatus: 'placed',
-        subtotalPaise,
-        discountPaise,
-        giftCardPaise,
-        couponCode,
-        giftCardCode,
-        totalPaise,
-        currency: 'INR',
-        createdAt: now,
-        updatedAt: now,
-        paymentCollectedAt: null,
-        idempotencyKey,
-        paymentMethod: 'cod',
-        razorpayOrderId: null,
-        razorpayPaymentId: null,
-        statusHistory,
-        items: lines.map((l) => ({
-          productId: l.productId,
-          variantId: l.variantId,
-          productTitle: l.productTitle,
-          variantLabel: l.variantLabel,
-          sku: l.sku,
-          unitPricePaise: l.unitPricePaise,
-          quantity: l.quantity,
-          lineTotalPaise: l.lineTotalPaise,
-        })),
-      },
-    };
+    if (!strictPersistence) {
+      return tryPublicCodFallback(nowFallback, historyFallback);
+    }
+    logCheckoutPersistenceFailure({
+      operation: 'place_cod_order',
+      projectId: ctx.projectId,
+      databaseId: ctx.databaseId,
+      namespace: ctx.namespace,
+      path: orderPath,
+      status: tokenRes.status,
+      code: tokenRes.reasonCode,
+      requestId,
+      reason: tokenRes.detail,
+    });
+    throw new StoreHttpError(
+      503,
+      'ORDER_PERSISTENCE_UNAVAILABLE',
+      'Unable to save your order right now. Please try again in a moment.'
+    );
   }
 
   const adminBearer = tokenRes.token;
@@ -5063,6 +5453,7 @@ async function persistCodOrderToFirestoreOnce(params: {
       const existing = await fetchExistingFirestoreOrder(orderDocId, '', '', {
         requestId,
         bearerToken: adminBearer,
+        customerIdToken,
       });
       if (existing) {
         return { receipt: existing, duplicate: true };
@@ -5073,6 +5464,10 @@ async function persistCodOrderToFirestoreOnce(params: {
       'ORDER_CONFLICT',
       'Inventory or order state changed while placing your order. Please review your bag and retry.'
     );
+  }
+
+  if (!strictPersistence && commitRes.status === 403) {
+    return tryPublicCodFallback(now, statusHistory);
   }
 
   logCheckoutPersistenceFailure({
@@ -5106,9 +5501,14 @@ export async function handlePlaceCodOrderRequest(params: {
     body,
     store = null,
     customerUserId = null,
-    requireDurablePersistence = true,
+    customerIdToken = null,
+    requireDurablePersistence,
     requestId,
   } = params;
+  const strictPersistence = shouldRequireDurablePersistence({
+    store,
+    requireDurablePersistence,
+  });
 
   const rawMethod =
     typeof body.paymentMethod === 'string' ? body.paymentMethod.trim().toLowerCase() : 'cod';
@@ -5232,6 +5632,7 @@ export async function handlePlaceCodOrderRequest(params: {
     } else {
       const existingFsOrder = await fetchExistingFirestoreOrder(deterministicOrderId, '', '', {
         requestId,
+        customerIdToken,
       });
       if (existingFsOrder) {
         return { status: 200, body: { order: existingFsOrder, duplicate: true } };
@@ -5336,6 +5737,7 @@ export async function handlePlaceCodOrderRequest(params: {
       orderNumber,
       idempotencyKey: cleanIdempotencyKey,
       customerUserId,
+      customerIdToken,
       customer,
       lines: validated.lines,
       subtotalPaise: validated.totalPaise,
@@ -5344,7 +5746,7 @@ export async function handlePlaceCodOrderRequest(params: {
       couponCode: promo.couponCode,
       giftCardCode: promo.giftCardCode,
       totalPaise: promo.finalAmountPaise,
-      strictPersistence: requireDurablePersistence,
+      strictPersistence,
       requestId,
     });
 

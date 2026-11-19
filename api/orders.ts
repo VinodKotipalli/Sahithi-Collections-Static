@@ -146,7 +146,7 @@ export function createOrdersHandler(options?: {
       store: options?.store ?? null,
       customerUserId: authResult.uid,
       customerIdToken: authResult.rawToken,
-      requireDurablePersistence: options?.requireDurablePersistence ?? true,
+      requireDurablePersistence: options?.requireDurablePersistence,
       requestId,
     });
     sendJson(res, result.status, result.body, requestId);
