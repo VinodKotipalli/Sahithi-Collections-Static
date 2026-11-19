@@ -487,8 +487,40 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
 
   app.use(
     helmet({
-      contentSecurityPolicy: false,
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: [
+            "'self'",
+            "'unsafe-inline'",
+            'https://checkout.razorpay.com',
+            'https://apis.google.com',
+          ],
+          styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+          fontSrc: ["'self'", 'data:', 'https://fonts.gstatic.com'],
+          imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+          connectSrc: [
+            "'self'",
+            'https://api.razorpay.com',
+            'https://checkout.razorpay.com',
+            'https://lumberjack.razorpay.com',
+            'https://identitytoolkit.googleapis.com',
+            'https://securetoken.googleapis.com',
+            'https://firestore.googleapis.com',
+            'https://www.googleapis.com',
+          ],
+          frameSrc: [
+            "'self'",
+            'https://api.razorpay.com',
+            'https://checkout.razorpay.com',
+            'https://*.firebaseapp.com',
+          ],
+          objectSrc: ["'none'"],
+          baseUri: ["'self'"],
+        },
+      },
       crossOriginEmbedderPolicy: false,
+      crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
       xFrameOptions: false,
     })
   );

@@ -49,18 +49,30 @@ async function readJsonBody(req: VercelNodeRequest): Promise<Record<string, unkn
   return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
 }
 
-function sendJson(res: VercelNodeResponse, statusCode: number, payload: Record<string, unknown>) {
+function sendJson(
+  res: VercelNodeResponse,
+  statusCode: number,
+  payload: Record<string, unknown>,
+  requestId?: string
+) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  if (requestId) {
+    res.setHeader('X-Request-Id', requestId);
+  }
+  const finalPayload =
+    requestId && statusCode !== 204 && !payload.support_reference
+      ? { ...payload, support_reference: requestId }
+      : payload;
   if (typeof res.status === 'function') {
     const statusRes = res.status(statusCode);
     if (statusRes && typeof statusRes.json === 'function') {
-      statusRes.json(payload);
+      statusRes.json(finalPayload);
       return;
     }
   }
   res.statusCode = statusCode;
-  res.end(JSON.stringify(payload));
+  res.end(JSON.stringify(finalPayload));
 }
 
 export function createOrdersHandler(options?: {
@@ -69,19 +81,28 @@ export function createOrdersHandler(options?: {
   requireDurablePersistence?: boolean;
 }) {
   return async function handler(req: VercelNodeRequest, res: VercelNodeResponse) {
+    const rawReqId = req.headers['x-vercel-id'] || req.headers['x-request-id'];
+    const requestId =
+      (Array.isArray(rawReqId) ? rawReqId[0] : rawReqId)?.trim() || crypto.randomUUID();
+
     const method = (req.method || 'GET').toUpperCase();
     if (method === 'OPTIONS') {
       res.setHeader('Allow', 'POST, OPTIONS');
-      sendJson(res, 204, {});
+      sendJson(res, 204, {}, requestId);
       return;
     }
     if (method !== 'POST') {
       res.setHeader('Allow', 'POST, OPTIONS');
-      sendJson(res, 405, {
-        status: 405,
-        code: 'METHOD_NOT_ALLOWED',
-        error: 'Method not allowed. Use POST /api/orders.',
-      });
+      sendJson(
+        res,
+        405,
+        {
+          status: 405,
+          code: 'METHOD_NOT_ALLOWED',
+          error: 'Method not allowed. Use POST /api/orders.',
+        },
+        requestId
+      );
       return;
     }
 
@@ -90,11 +111,16 @@ export function createOrdersHandler(options?: {
       options?.verifyIdToken
     );
     if (!authResult.ok) {
-      sendJson(res, authResult.status, {
-        status: authResult.status,
-        code: authResult.code,
-        error: authResult.error,
-      });
+      sendJson(
+        res,
+        authResult.status,
+        {
+          status: authResult.status,
+          code: authResult.code,
+          error: authResult.error,
+        },
+        requestId
+      );
       return;
     }
 
@@ -102,17 +128,18 @@ export function createOrdersHandler(options?: {
     try {
       body = await readJsonBody(req);
     } catch {
-      sendJson(res, 400, {
-        status: 400,
-        code: 'INVALID_JSON',
-        error: 'Invalid JSON request payload.',
-      });
+      sendJson(
+        res,
+        400,
+        {
+          status: 400,
+          code: 'INVALID_JSON',
+          error: 'Invalid JSON request payload.',
+        },
+        requestId
+      );
       return;
     }
-
-    const rawReqId = req.headers['x-vercel-id'] || req.headers['x-request-id'];
-    const requestId =
-      (Array.isArray(rawReqId) ? rawReqId[0] : rawReqId)?.trim() || crypto.randomUUID();
 
     const result = await handlePlaceCodOrderRequest({
       body,
@@ -122,7 +149,7 @@ export function createOrdersHandler(options?: {
       requireDurablePersistence: options?.requireDurablePersistence ?? true,
       requestId,
     });
-    sendJson(res, result.status, result.body);
+    sendJson(res, result.status, result.body, requestId);
   };
 }
 

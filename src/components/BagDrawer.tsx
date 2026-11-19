@@ -49,9 +49,11 @@ interface BagDrawerProps {
 
 interface PendingConfirmationState {
   razorpayOrderId: string;
+  internalOrderRef?: string;
   razorpayPaymentId: string;
   message: string;
   checking: boolean;
+  supportReference?: string;
 }
 
 function formatSavedAddressText(addr: CustomerAddress): string {
@@ -78,6 +80,7 @@ export function BagDrawer({
 }: BagDrawerProps) {
   const drawerRef = useRef<HTMLDivElement>(null);
   const checkoutInFlightRef = useRef(false);
+  const activeModalOpenRef = useRef(false);
   const prefersReducedMotion = usePrefersReducedMotion();
   const { user, apiRequest } = useAuth();
 
@@ -93,8 +96,12 @@ export function BagDrawer({
   const [checkoutOpen, setCheckoutOpen] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<'razorpay' | 'cod'>('razorpay');
   const [submitting, setSubmitting] = useState(false);
+  const [checkoutStage, setCheckoutStage] = useState<
+    'idle' | 'initializing' | 'awaiting_payment' | 'verifying'
+  >('idle');
   const [errorText, setErrorText] = useState<string | null>(null);
   const [paymentErrorText, setPaymentErrorText] = useState<string | null>(null);
+  const [paymentErrorSupportRef, setPaymentErrorSupportRef] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<PlacedOrderReceipt | null>(null);
   const [pendingConfirmation, setPendingConfirmation] =
     useState<PendingConfirmationState | null>(null);
@@ -121,6 +128,7 @@ export function BagDrawer({
   );
 
   const codAttemptRef = useRef<{ signature: string; key: string } | null>(null);
+  const rzpAttemptRef = useRef<{ signature: string; key: string } | null>(null);
   const lastAuthUserIdRef = useRef<string | null>(user?.id ?? null);
 
   useFocusTrap(isOpen, drawerRef, onClose);
@@ -132,12 +140,17 @@ export function BagDrawer({
     if (prevUserId !== nextUserId) {
       lastAuthUserIdRef.current = nextUserId;
       codAttemptRef.current = null;
+      rzpAttemptRef.current = null;
+      activeModalOpenRef.current = false;
+      checkoutInFlightRef.current = false;
       setSavedAddresses([]);
       setSelectedAddressId('');
       setReceipt(null);
       setPendingConfirmation(null);
+      setCheckoutStage('idle');
       setErrorText(null);
       setPaymentErrorText(null);
+      setPaymentErrorSupportRef(null);
       setCustomerPhone('');
       setShippingAddress('');
       setCouponInput('');
@@ -358,6 +371,7 @@ export function BagDrawer({
     if (!pendingConfirmation || pendingConfirmation.checking) return;
     setPendingConfirmation((prev) => (prev ? { ...prev, checking: true } : prev));
     setPaymentErrorText(null);
+    setPaymentErrorSupportRef(null);
     const statusRes = await checkRazorpayOrderStatus({
       razorpayOrderId: pendingConfirmation.razorpayOrderId,
       razorpayPaymentId: pendingConfirmation.razorpayPaymentId,
@@ -365,14 +379,29 @@ export function BagDrawer({
     if (!statusRes.ok) {
       setPendingConfirmation((prev) => (prev ? { ...prev, checking: false } : prev));
       setPaymentErrorText(statusRes.error);
+      setPaymentErrorSupportRef(statusRes.supportReference || null);
       return;
     }
     if (statusRes.confirmed && statusRes.order?.orderNumber) {
+      rzpAttemptRef.current = null;
       setPendingConfirmation(null);
+      setCheckoutStage('idle');
       setReceipt(statusRes.order);
       setCheckoutOpen(false);
       onClearBag();
       onOrderCompleted();
+      window.dispatchEvent(new Event('sahithi:notifications-updated'));
+      return;
+    }
+    if (statusRes.failed) {
+      rzpAttemptRef.current = null;
+      setPendingConfirmation(null);
+      setCheckoutStage('idle');
+      setPaymentErrorText(
+        statusRes.message ||
+          'Your previous payment attempt did not succeed. Your bag is saved — you can retry payment.'
+      );
+      setPaymentErrorSupportRef(statusRes.supportReference || null);
       return;
     }
     setPendingConfirmation((prev) =>
@@ -380,6 +409,7 @@ export function BagDrawer({
         ? {
             ...prev,
             checking: false,
+            supportReference: statusRes.supportReference || prev.supportReference,
             message:
               statusRes.message ||
               'Payment received. We’re still confirming your order—please check again in a few seconds.',
@@ -390,9 +420,17 @@ export function BagDrawer({
 
   const handlePlaceOrder = async (e: FormEvent) => {
     e.preventDefault();
-    if (checkoutInFlightRef.current || submitting || pendingConfirmation) return;
+    if (
+      checkoutInFlightRef.current ||
+      activeModalOpenRef.current ||
+      submitting ||
+      pendingConfirmation
+    ) {
+      return;
+    }
     setErrorText(null);
     setPaymentErrorText(null);
+    setPaymentErrorSupportRef(null);
 
     if (items.length === 0) {
       setPaymentErrorText('Your shopping bag is empty.');
@@ -440,6 +478,7 @@ export function BagDrawer({
       });
 
       if (paymentMethod === 'cod') {
+        setCheckoutStage('verifying');
         const payloadSignature = JSON.stringify({
           items: payloadItems,
           customerDetails,
@@ -472,6 +511,7 @@ export function BagDrawer({
         let codStatus = 500;
         let codOrder: PlacedOrderReceipt | undefined;
         let codError = 'Could not confirm your Cash on Delivery order. Please try again.';
+        let codSupportRef: string | null = null;
 
         // Prefer real server /api/orders endpoint (Vercel Function / Express server) so stock, coupons & gift cards execute atomically with admin credentials.
         const serverResponse = await fetch('/api/orders', {
@@ -495,10 +535,14 @@ export function BagDrawer({
           const parsed = (await serverResponse.json().catch(() => ({}))) as {
             order?: PlacedOrderReceipt;
             error?: string;
+            support_reference?: string;
           };
           codStatus = serverResponse.status;
           codResOk = serverResponse.ok && Boolean(parsed.order?.orderNumber);
           codOrder = parsed.order;
+          if (typeof parsed.support_reference === 'string' && parsed.support_reference) {
+            codSupportRef = parsed.support_reference;
+          }
           if (!codResOk && typeof parsed.error === 'string' && parsed.error) {
             codError = parsed.error;
           }
@@ -521,9 +565,11 @@ export function BagDrawer({
 
         checkoutInFlightRef.current = false;
         setSubmitting(false);
+        setCheckoutStage('idle');
 
         if (!codResOk || !codOrder?.orderNumber) {
           setPaymentErrorText(codError);
+          setPaymentErrorSupportRef(codSupportRef);
           if (codStatus === 409) {
             void revalidateBag();
           }
@@ -539,6 +585,25 @@ export function BagDrawer({
         return;
       }
 
+      setCheckoutStage('initializing');
+      const rzpSignature = JSON.stringify({
+        userId: user?.id || null,
+        items: payloadItems,
+        customerDetails,
+        appliedCouponCode,
+        appliedGiftCardCode,
+      });
+      if (!rzpAttemptRef.current || rzpAttemptRef.current.signature !== rzpSignature) {
+        const freshId =
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+        rzpAttemptRef.current = {
+          signature: rzpSignature,
+          key: `rzp_${freshId}`,
+        };
+      }
+
       const [scriptLoaded, orderRes] = await Promise.all([
         ensureRazorpayCheckoutScript(10_000),
         createRazorpayOrder({
@@ -548,13 +613,31 @@ export function BagDrawer({
           giftCardCode: appliedGiftCardCode || undefined,
           currency: 'INR',
           receipt: `sc_rcpt_${Date.now()}`,
+          idempotencyKey: rzpAttemptRef.current.key,
         }),
       ]);
 
       if (!orderRes.ok) {
+        if (orderRes.code === 'ORDER_ALREADY_CONFIRMED' && orderRes.existingOrder?.orderNumber) {
+          rzpAttemptRef.current = null;
+          checkoutInFlightRef.current = false;
+          setSubmitting(false);
+          setCheckoutStage('idle');
+          setReceipt(orderRes.existingOrder);
+          setCheckoutOpen(false);
+          onClearBag();
+          onOrderCompleted();
+          window.dispatchEvent(new Event('sahithi:notifications-updated'));
+          return;
+        }
+        if (orderRes.code === 'IDEMPOTENCY_CONFLICT') {
+          rzpAttemptRef.current = null;
+        }
         setPaymentErrorText(orderRes.error);
+        setPaymentErrorSupportRef(orderRes.supportReference || null);
         checkoutInFlightRef.current = false;
         setSubmitting(false);
+        setCheckoutStage('idle');
         if (orderRes.status === 409) {
           void revalidateBag();
         }
@@ -563,16 +646,29 @@ export function BagDrawer({
 
       if (!scriptLoaded || typeof window.Razorpay !== 'function') {
         setPaymentErrorText(
-          'Razorpay Checkout could not load in time. Please check your connection and try again.'
+          'Razorpay Checkout could not load right now. Your bag items and details are saved—please tap retry.'
         );
+        setPaymentErrorSupportRef(orderRes.data.support_reference || null);
         checkoutInFlightRef.current = false;
         setSubmitting(false);
+        setCheckoutStage('idle');
         return;
       }
 
-      const { order_id, amount, currency, key_id, checkout_token } = orderRes.data;
+      const {
+        order_id,
+        internal_order_ref,
+        amount,
+        currency,
+        key_id,
+        checkout_token,
+        support_reference,
+      } = orderRes.data;
 
       let settled = false;
+      activeModalOpenRef.current = true;
+      setCheckoutStage('awaiting_payment');
+
       const rzp = new window.Razorpay({
         key: key_id,
         amount,
@@ -592,15 +688,22 @@ export function BagDrawer({
           ondismiss: () => {
             if (settled) return;
             settled = true;
+            activeModalOpenRef.current = false;
             checkoutInFlightRef.current = false;
             setSubmitting(false);
-            setPaymentErrorText('Payment was cancelled. Your bag items are still saved.');
+            setCheckoutStage('idle');
+            setPaymentErrorText('Payment was cancelled. Your bag items and details are still saved.');
+            setPaymentErrorSupportRef(support_reference || null);
           },
         },
         handler: async (paymentResponse) => {
           settled = true;
+          activeModalOpenRef.current = false;
           setSubmitting(true);
+          setCheckoutStage('verifying');
           setPaymentErrorText(null);
+          setPaymentErrorSupportRef(null);
+
           const verifyRes = await verifyRazorpayPayment({
             razorpay_order_id: paymentResponse.razorpay_order_id,
             razorpay_payment_id: paymentResponse.razorpay_payment_id,
@@ -618,9 +721,23 @@ export function BagDrawer({
 
           checkoutInFlightRef.current = false;
           setSubmitting(false);
+          setCheckoutStage('idle');
 
           if (!verifyRes.ok) {
+            if (verifyRes.timedOut || verifyRes.status >= 500 || verifyRes.status === 0) {
+              setPendingConfirmation({
+                razorpayOrderId: paymentResponse.razorpay_order_id,
+                internalOrderRef: internal_order_ref,
+                razorpayPaymentId: paymentResponse.razorpay_payment_id,
+                message: verifyRes.error,
+                checking: false,
+                supportReference: verifyRes.supportReference || support_reference,
+              });
+              return;
+            }
+            rzpAttemptRef.current = null;
             setPaymentErrorText(verifyRes.error);
+            setPaymentErrorSupportRef(verifyRes.supportReference || support_reference || null);
             void revalidateBag();
             return;
           }
@@ -628,11 +745,13 @@ export function BagDrawer({
           if (verifyRes.data.pending_confirmation) {
             setPendingConfirmation({
               razorpayOrderId: verifyRes.data.order_id,
+              internalOrderRef: verifyRes.data.internal_order_ref || internal_order_ref,
               razorpayPaymentId: verifyRes.data.payment_id,
               message:
                 verifyRes.data.message ||
                 'Payment received. We’re confirming your order and will update your confirmation shortly.',
               checking: false,
+              supportReference: verifyRes.data.support_reference || support_reference,
             });
             return;
           }
@@ -640,14 +759,17 @@ export function BagDrawer({
           if (!verifyRes.data.order || !verifyRes.data.order.orderNumber) {
             setPendingConfirmation({
               razorpayOrderId: verifyRes.data.order_id,
+              internalOrderRef: verifyRes.data.internal_order_ref || internal_order_ref,
               razorpayPaymentId: verifyRes.data.payment_id,
               message:
                 'Payment received. We’re confirming your order in our system. Tap Check Order Status below before retrying payment.',
               checking: false,
+              supportReference: verifyRes.data.support_reference || support_reference,
             });
             return;
           }
 
+          rzpAttemptRef.current = null;
           setReceipt(verifyRes.data.order);
           setCheckoutOpen(false);
           onClearBag();
@@ -659,19 +781,25 @@ export function BagDrawer({
       rzp.on('payment.failed', (failure) => {
         if (settled) return;
         settled = true;
+        activeModalOpenRef.current = false;
+        rzpAttemptRef.current = null;
         checkoutInFlightRef.current = false;
         setSubmitting(false);
+        setCheckoutStage('idle');
         const failureMsg =
           failure?.error?.description ||
           failure?.error?.reason ||
-          'Payment failed. Please try again with another payment method.';
+          'Payment failed. Your bag items are saved—please retry or choose another payment method.';
         setPaymentErrorText(failureMsg);
+        setPaymentErrorSupportRef(support_reference || null);
       });
 
       rzp.open();
     } catch (err) {
+      activeModalOpenRef.current = false;
       checkoutInFlightRef.current = false;
       setSubmitting(false);
+      setCheckoutStage('idle');
       setPaymentErrorText(
         err instanceof Error ? err.message : 'Something went wrong while starting payment.'
       );
@@ -852,11 +980,27 @@ export function BagDrawer({
                         {pendingConfirmation.razorpayOrderId}
                       </dd>
                     </div>
+                    {pendingConfirmation.internalOrderRef && (
+                      <div className="flex items-center justify-between gap-2">
+                        <dt className="text-[#242124]/65">Store Reference</dt>
+                        <dd className="font-mono font-semibold text-[#49243E]">
+                          {pendingConfirmation.internalOrderRef}
+                        </dd>
+                      </div>
+                    )}
                     {pendingConfirmation.razorpayPaymentId && (
                       <div className="flex items-center justify-between gap-2">
                         <dt className="text-[#242124]/65">Payment Ref</dt>
                         <dd className="font-mono font-semibold text-[#49243E]">
                           {pendingConfirmation.razorpayPaymentId}
+                        </dd>
+                      </div>
+                    )}
+                    {pendingConfirmation.supportReference && (
+                      <div className="flex items-center justify-between gap-2">
+                        <dt className="text-[#242124]/65">Support Ref</dt>
+                        <dd className="font-mono text-[11px] text-[#49243E]">
+                          {pendingConfirmation.supportReference}
                         </dd>
                       </div>
                     )}
@@ -868,7 +1012,14 @@ export function BagDrawer({
                       className="flex items-start gap-2 rounded-xl border border-[#B76E79]/55 bg-[#F3D5DF]/40 p-3 text-xs text-[#49243E]"
                     >
                       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#B76E79]" aria-hidden="true" />
-                      <span>{paymentErrorText}</span>
+                      <div>
+                        <p>{paymentErrorText}</p>
+                        {paymentErrorSupportRef && (
+                          <p className="mt-1 font-mono text-[10px] text-[#242124]/65">
+                            Support Ref: {paymentErrorSupportRef}
+                          </p>
+                        )}
+                      </div>
                     </div>
                   )}
 
@@ -1296,7 +1447,14 @@ export function BagDrawer({
                             className="mt-0.5 h-4 w-4 shrink-0 text-[#B76E79]"
                             aria-hidden="true"
                           />
-                          <span>{paymentErrorText}</span>
+                          <div>
+                            <p>{paymentErrorText}</p>
+                            {paymentErrorSupportRef && (
+                              <p className="mt-1 font-mono text-[10px] text-[#242124]/65">
+                                Support Ref: {paymentErrorSupportRef}
+                              </p>
+                            )}
+                          </div>
                         </div>
                       )}
                       <button
@@ -1315,7 +1473,11 @@ export function BagDrawer({
                           {submitting
                             ? paymentMethod === 'cod'
                               ? 'Placing Order…'
-                              : 'Processing Payment…'
+                              : checkoutStage === 'verifying'
+                                ? 'Verifying Payment…'
+                                : checkoutStage === 'awaiting_payment'
+                                  ? 'Complete Payment in Window…'
+                                  : 'Preparing Checkout…'
                             : paymentMethod === 'cod'
                               ? 'Place Order'
                               : `Pay with Razorpay (${formatPaiseINR(netPayablePaise)})`}

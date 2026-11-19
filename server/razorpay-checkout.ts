@@ -68,6 +68,9 @@ export interface RazorpayPaymentEntity {
   captured?: boolean;
   email?: string;
   contact?: string;
+  error_code?: string;
+  error_description?: string;
+  error_reason?: string;
   notes?: Record<string, string>;
 }
 
@@ -173,11 +176,14 @@ interface PendingCheckoutRecord {
   items: ValidatedOrderLine[];
   customer: OrderCustomerDetails | null;
   customerUserId: string | null;
-  status: 'pending' | 'confirmed' | 'payment_received_pending_confirm';
+  status: 'pending' | 'confirmed' | 'payment_received_pending_confirm' | 'failed';
   createdAt: number;
   expiresAt: number;
   confirmedOrder?: SerializedOrderReceipt;
   razorpayPaymentId?: string;
+  idempotencyKey?: string | null;
+  payloadHash?: string;
+  failureReason?: string;
 }
 
 interface SignedCheckoutTokenPayload {
@@ -212,6 +218,14 @@ const completedCheckoutsMemory = new Map<
   { paymentId: string; order?: SerializedOrderReceipt; responseBody: Record<string, unknown> }
 >();
 const inFlightVerifications = new Map<string, Promise<CheckoutHandlerResponse>>();
+const idempotentOrderAttemptsMemory = new Map<
+  string,
+  { payloadHash: string; razorpayOrderId: string; keyId: string; expiresAt: number }
+>();
+const processedWebhookEventsMemory = new Map<
+  string,
+  { eventType: string; processedAt: number; orderId?: string; order?: SerializedOrderReceipt }
+>();
 
 let cachedGoogleAccessToken: {
   token: string;
@@ -224,6 +238,71 @@ function defaultRazorpayFactory(keyId: string, keySecret: string): RazorpayClien
     key_id: keyId,
     key_secret: keySecret,
   }) as unknown as RazorpayClientLike;
+}
+
+function isTransientNetworkOrServerError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const obj = err as Record<string, unknown>;
+  const statusCode =
+    typeof obj.statusCode === 'number'
+      ? obj.statusCode
+      : typeof (obj.response as Record<string, unknown> | undefined)?.status === 'number'
+        ? ((obj.response as Record<string, unknown>).status as number)
+        : null;
+  if (statusCode !== null) {
+    return statusCode >= 500 || statusCode === 429;
+  }
+  const code = typeof obj.code === 'string' ? obj.code.toUpperCase() : '';
+  if (
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'EAI_AGAIN' ||
+    code === 'ENOTFOUND' ||
+    code === 'UND_ERR_CONNECT_TIMEOUT'
+  ) {
+    return true;
+  }
+  const msg = obj instanceof Error ? obj.message.toLowerCase() : String(obj.message || '').toLowerCase();
+  return msg.includes('timeout') || msg.includes('network') || msg.includes('econnreset');
+}
+
+async function withTransientRetry<T>(
+  operation: () => Promise<T>,
+  options?: { maxAttempts?: number; baseDelayMs?: number }
+): Promise<T> {
+  const maxAttempts = Math.max(1, Math.min(3, options?.maxAttempts ?? 3));
+  const baseDelayMs = Math.max(10, options?.baseDelayMs ?? 60);
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= maxAttempts || !isTransientNetworkOrServerError(err)) {
+        throw err;
+      }
+      const jitter = Math.floor(Math.random() * 25);
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * attempt + jitter));
+    }
+  }
+  throw lastErr;
+}
+
+function withSupportRef(
+  status: number,
+  body: Record<string, unknown>,
+  requestId?: string
+): CheckoutHandlerResponse {
+  if (!requestId || body.support_reference) {
+    return { status, body };
+  }
+  return {
+    status,
+    body: {
+      ...body,
+      support_reference: requestId,
+    },
+  };
 }
 
 function pruneMemoryCaches(now = Date.now()) {
@@ -242,6 +321,23 @@ function pruneMemoryCaches(now = Date.now()) {
       const oldest = completedCheckoutsMemory.keys().next().value;
       if (!oldest) break;
       completedCheckoutsMemory.delete(oldest);
+    }
+  }
+  if (idempotentOrderAttemptsMemory.size > PENDING_CACHE_MAX) {
+    for (const [key, rec] of idempotentOrderAttemptsMemory.entries()) {
+      if (rec.expiresAt <= now) idempotentOrderAttemptsMemory.delete(key);
+    }
+    while (idempotentOrderAttemptsMemory.size > PENDING_CACHE_MAX) {
+      const oldest = idempotentOrderAttemptsMemory.keys().next().value;
+      if (!oldest) break;
+      idempotentOrderAttemptsMemory.delete(oldest);
+    }
+  }
+  if (processedWebhookEventsMemory.size > COMPLETED_CACHE_MAX) {
+    while (processedWebhookEventsMemory.size > COMPLETED_CACHE_MAX) {
+      const oldest = processedWebhookEventsMemory.keys().next().value;
+      if (!oldest) break;
+      processedWebhookEventsMemory.delete(oldest);
     }
   }
 }
@@ -1479,7 +1575,9 @@ function fromPendingCheckoutRow(row: PendingCheckoutRow): PendingCheckoutRecord 
     customer,
     customerUserId: row.customer_user_id,
     status:
-      row.status === 'confirmed' || row.status === 'payment_received_pending_confirm'
+      row.status === 'confirmed' ||
+      row.status === 'payment_received_pending_confirm' ||
+      row.status === 'failed'
         ? row.status
         : 'pending',
     createdAt: row.created_at,
@@ -1576,6 +1674,9 @@ async function savePendingCheckoutToFirestore(
           updated_at: Date.now(),
           expires_at: record.expiresAt,
           ...(record.razorpayPaymentId ? { razorpay_payment_id: record.razorpayPaymentId } : {}),
+          ...(record.idempotencyKey ? { idempotency_key: record.idempotencyKey } : {}),
+          ...(record.payloadHash ? { payload_hash: record.payloadHash } : {}),
+          ...(record.failureReason ? { failure_reason: record.failureReason } : {}),
           ...(record.confirmedOrder ? { confirmed_order: record.confirmedOrder } : {}),
         }),
       }),
@@ -1641,10 +1742,12 @@ async function loadPendingCheckoutFromFirestore(
   const docPath = `environments/${ctx.namespace}/pending_checkouts/${razorpayOrderId}`;
   const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/pending_checkouts/${encodeURIComponent(razorpayOrderId)}`;
   try {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${tokenRes.token}` },
-    });
+    const res = await withTransientRetry(() =>
+      fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${tokenRes.token}` },
+      })
+    );
     if (!res.ok) {
       if (res.status !== 404) {
         const errText = await res.text().catch(() => '');
@@ -1687,11 +1790,19 @@ async function loadPendingCheckoutFromFirestore(
           ? 'confirmed'
           : data.status === 'payment_received_pending_confirm'
             ? 'payment_received_pending_confirm'
-            : 'pending',
+            : data.status === 'failed'
+              ? 'failed'
+              : 'pending',
       createdAt: Number(data.created_at || Date.now()),
       expiresAt: Number(data.expires_at || Date.now() + CHECKOUT_TOKEN_TTL_MS),
       razorpayPaymentId:
         typeof data.razorpay_payment_id === 'string' ? data.razorpay_payment_id : undefined,
+      idempotencyKey:
+        typeof data.idempotency_key === 'string' ? data.idempotency_key : null,
+      payloadHash:
+        typeof data.payload_hash === 'string' ? data.payload_hash : undefined,
+      failureReason:
+        typeof data.failure_reason === 'string' ? data.failure_reason : undefined,
       confirmedOrder:
         data.confirmed_order && typeof data.confirmed_order === 'object'
           ? (data.confirmed_order as SerializedOrderReceipt)
@@ -1700,6 +1811,215 @@ async function loadPendingCheckoutFromFirestore(
   } catch {
     return null;
   }
+}
+
+function buildAttemptDocId(idempotencyKey: string): string {
+  return crypto.createHash('sha256').update(`rzp_attempt:${idempotencyKey}`).digest('hex').slice(0, 32);
+}
+
+async function loadCreateOrderAttempt(
+  idempotencyKey: string,
+  options?: { store?: BoutiqueStore | null; requestId?: string }
+): Promise<{ payloadHash: string; razorpayOrderId: string; keyId: string; expiresAt: number } | null> {
+  const now = Date.now();
+  const mem = idempotentOrderAttemptsMemory.get(idempotencyKey);
+  if (mem && mem.expiresAt > now) {
+    return mem;
+  }
+  if (options?.store) return null;
+
+  const ctx = getFirestoreContext();
+  if (!ctx) return null;
+  const tokenRes = await resolveFirestoreServerBearerToken({
+    operation: 'load_create_order_attempt',
+    requestId: options?.requestId,
+    ctx,
+  });
+  if (!tokenRes.ok) return null;
+
+  const attemptDocId = buildAttemptDocId(idempotencyKey);
+  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/pending_checkout_attempts/${encodeURIComponent(attemptDocId)}`;
+  try {
+    const res = await withTransientRetry(() =>
+      fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${tokenRes.token}` },
+      })
+    );
+    if (!res.ok) return null;
+    const json = (await res.json()) as { fields?: Record<string, FsFieldValue> };
+    const data = fromFsFields(json.fields);
+    if (
+      typeof data.razorpay_order_id !== 'string' ||
+      typeof data.payload_hash !== 'string' ||
+      Number(data.expires_at || 0) <= now
+    ) {
+      return null;
+    }
+    const found = {
+      payloadHash: data.payload_hash,
+      razorpayOrderId: data.razorpay_order_id,
+      keyId: typeof data.key_id === 'string' ? data.key_id : '',
+      expiresAt: Number(data.expires_at),
+    };
+    idempotentOrderAttemptsMemory.set(idempotencyKey, found);
+    return found;
+  } catch {
+    return null;
+  }
+}
+
+async function saveCreateOrderAttempt(params: {
+  idempotencyKey: string;
+  payloadHash: string;
+  razorpayOrderId: string;
+  keyId: string;
+  expiresAt: number;
+  store?: BoutiqueStore | null;
+  requestId?: string;
+  bearerToken?: string | null;
+}): Promise<void> {
+  idempotentOrderAttemptsMemory.set(params.idempotencyKey, {
+    payloadHash: params.payloadHash,
+    razorpayOrderId: params.razorpayOrderId,
+    keyId: params.keyId,
+    expiresAt: params.expiresAt,
+  });
+
+  if (params.store) return;
+  const ctx = getFirestoreContext();
+  if (!ctx) return;
+
+  let token = params.bearerToken || null;
+  if (!token) {
+    const tokenRes = await resolveFirestoreServerBearerToken({
+      operation: 'save_create_order_attempt',
+      requestId: params.requestId,
+      ctx,
+    }).catch(() => null);
+    if (tokenRes && tokenRes.ok) {
+      token = tokenRes.token;
+    }
+  }
+
+  if (!token) return;
+  const attemptDocId = buildAttemptDocId(params.idempotencyKey);
+  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/pending_checkout_attempts/${encodeURIComponent(attemptDocId)}`;
+  await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      fields: toFsFields({
+        id: attemptDocId,
+        idempotency_key: params.idempotencyKey,
+        payload_hash: params.payloadHash,
+        razorpay_order_id: params.razorpayOrderId,
+        key_id: params.keyId,
+        expires_at: params.expiresAt,
+        updated_at: Date.now(),
+      }),
+    }),
+  }).catch(() => {});
+}
+
+function buildWebhookEventDocId(eventId: string): string {
+  return crypto.createHash('sha256').update(`webhook:${eventId}`).digest('hex').slice(0, 32);
+}
+
+async function loadWebhookEventProcessed(
+  eventId: string,
+  options?: { store?: BoutiqueStore | null; requestId?: string }
+): Promise<{ eventType: string; processedAt: number; orderId?: string; order?: SerializedOrderReceipt } | null> {
+  const mem = processedWebhookEventsMemory.get(eventId);
+  if (mem) return mem;
+  if (options?.store) return null;
+
+  const ctx = getFirestoreContext();
+  if (!ctx) return null;
+  const tokenRes = await resolveFirestoreServerBearerToken({
+    operation: 'load_webhook_event',
+    requestId: options?.requestId,
+    ctx,
+  });
+  if (!tokenRes.ok) return null;
+
+  const docId = buildWebhookEventDocId(eventId);
+  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/webhook_events/${encodeURIComponent(docId)}`;
+  try {
+    const res = await withTransientRetry(() =>
+      fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${tokenRes.token}` },
+      })
+    );
+    if (!res.ok) return null;
+    const json = (await res.json()) as { fields?: Record<string, FsFieldValue> };
+    const data = fromFsFields(json.fields);
+    if (typeof data.event_type !== 'string') return null;
+    const found = {
+      eventType: data.event_type,
+      processedAt: Number(data.processed_at || Date.now()),
+      orderId: typeof data.order_id === 'string' ? data.order_id : undefined,
+      order:
+        data.order && typeof data.order === 'object'
+          ? (data.order as SerializedOrderReceipt)
+          : undefined,
+    };
+    processedWebhookEventsMemory.set(eventId, found);
+    return found;
+  } catch {
+    return null;
+  }
+}
+
+async function saveWebhookEventProcessed(params: {
+  eventId: string;
+  eventType: string;
+  orderId?: string;
+  order?: SerializedOrderReceipt;
+  store?: BoutiqueStore | null;
+  requestId?: string;
+}): Promise<void> {
+  const record = {
+    eventType: params.eventType,
+    processedAt: Date.now(),
+    orderId: params.orderId,
+    order: params.order,
+  };
+  processedWebhookEventsMemory.set(params.eventId, record);
+
+  if (params.store) return;
+  const ctx = getFirestoreContext();
+  if (!ctx) return;
+  const tokenRes = await resolveFirestoreServerBearerToken({
+    operation: 'save_webhook_event',
+    requestId: params.requestId,
+    ctx,
+  });
+  if (!tokenRes.ok) return;
+
+  const docId = buildWebhookEventDocId(params.eventId);
+  const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/webhook_events/${encodeURIComponent(docId)}`;
+  await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokenRes.token}`,
+    },
+    body: JSON.stringify({
+      fields: toFsFields({
+        id: docId,
+        event_id: params.eventId,
+        event_type: params.eventType,
+        order_id: params.orderId || null,
+        processed_at: record.processedAt,
+        ...(params.order ? { order: params.order } : {}),
+      }),
+    }),
+  }).catch(() => {});
 }
 
 function buildDeterministicOrderId(razorpayOrderId: string): string {
@@ -1741,10 +2061,12 @@ async function fetchExistingFirestoreOrder(
   const docPath = `environments/${ctx.namespace}/orders/${orderDocId}`;
   const url = `${ctx.docBaseUrl}/environments/${ctx.namespace}/orders/${encodeURIComponent(orderDocId)}`;
   try {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${tokenRes.token}` },
-    });
+    const res = await withTransientRetry(() =>
+      fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${tokenRes.token}` },
+      })
+    );
     if (!res.ok) {
       if (res.status !== 404) {
         const errText = await res.text().catch(() => '');
@@ -2407,6 +2729,38 @@ async function loadPendingCheckoutRecord(
   return loadPendingCheckoutFromFirestore(razorpayOrderId, { requestId });
 }
 
+function computeCreateOrderPayloadHash(params: {
+  currency: string;
+  subtotalPaise: number;
+  amountPaise: number;
+  discountPaise: number;
+  giftCardPaise: number;
+  couponCode: string | null;
+  giftCardCode: string | null;
+  customerUserId: string | null;
+  items: ValidatedOrderLine[];
+}): string {
+  const normalizedItems = [...params.items]
+    .map((l) => `${l.productId}:${l.variantId}:${l.quantity}:${l.unitPricePaise}`)
+    .sort();
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        currency: params.currency,
+        subtotalPaise: params.subtotalPaise,
+        amountPaise: params.amountPaise,
+        discountPaise: params.discountPaise,
+        giftCardPaise: params.giftCardPaise,
+        couponCode: params.couponCode,
+        giftCardCode: params.giftCardCode,
+        customerUserId: params.customerUserId,
+        items: normalizedItems,
+      })
+    )
+    .digest('hex');
+}
+
 export async function handleCreateOrderRequest(params: {
   body: Record<string, unknown>;
   store?: BoutiqueStore | null;
@@ -2427,14 +2781,15 @@ export async function handleCreateOrderRequest(params: {
 
   const creds = resolveRazorpayCredentials();
   if (!creds.ok) {
-    return {
-      status: 401,
-      body: {
+    return withSupportRef(
+      401,
+      {
         status: 401,
         code: creds.code,
         error: creds.error,
       },
-    };
+      requestId
+    );
   }
   const { keyId, keySecret, mode: keyMode } = creds;
 
@@ -2444,14 +2799,15 @@ export async function handleCreateOrderRequest(params: {
       : 'INR';
 
   if (currency !== 'INR') {
-    return {
-      status: 400,
-      body: {
+    return withSupportRef(
+      400,
+      {
         status: 400,
         code: 'INVALID_CURRENCY',
         error: 'Only INR currency is supported for checkout.',
       },
-    };
+      requestId
+    );
   }
 
   let validatedLines: ValidatedOrderLine[] = [];
@@ -2466,14 +2822,15 @@ export async function handleCreateOrderRequest(params: {
       subtotalPaise = checked.totalPaise;
     } catch (err) {
       if (err instanceof StoreHttpError) {
-        return {
-          status: err.httpStatus,
-          body: {
+        return withSupportRef(
+          err.httpStatus,
+          {
             status: err.httpStatus,
             code: err.code,
             error: err.message,
           },
-        };
+          requestId
+        );
       }
       throw err;
     }
@@ -2488,14 +2845,15 @@ export async function handleCreateOrderRequest(params: {
   }
 
   if (!Number.isInteger(subtotalPaise) || subtotalPaise < MIN_PRICE_PAISE) {
-    return {
-      status: 400,
-      body: {
+    return withSupportRef(
+      400,
+      {
         status: 400,
         code: 'INVALID_AMOUNT',
         error: 'Amount must be at least 100 paise (₹1.00).',
       },
-    };
+      requestId
+    );
   }
 
   const requestedCouponCode =
@@ -2533,18 +2891,51 @@ export async function handleCreateOrderRequest(params: {
       amountPaise = promoResult.finalAmountPaise;
     } catch (err) {
       if (err instanceof StoreHttpError) {
-        return {
-          status: err.httpStatus,
-          body: {
+        return withSupportRef(
+          err.httpStatus,
+          {
             status: err.httpStatus,
             code: err.code,
             error: err.message,
           },
-        };
+          requestId
+        );
       }
       throw err;
     }
   }
+
+  const rawIdempotencyKey =
+    typeof body.idempotencyKey === 'string'
+      ? body.idempotencyKey.trim()
+      : typeof body.idempotency_key === 'string'
+        ? body.idempotency_key.trim()
+        : typeof body.checkoutAttemptId === 'string'
+          ? body.checkoutAttemptId.trim()
+          : '';
+  if (rawIdempotencyKey && !/^[A-Za-z0-9_.:-]{6,120}$/.test(rawIdempotencyKey)) {
+    return withSupportRef(
+      400,
+      {
+        status: 400,
+        code: 'INVALID_IDEMPOTENCY_KEY',
+        error: 'Invalid checkout attempt reference.',
+      },
+      requestId
+    );
+  }
+  const cleanIdempotencyKey = rawIdempotencyKey || null;
+  const payloadHash = computeCreateOrderPayloadHash({
+    currency,
+    subtotalPaise,
+    amountPaise,
+    discountPaise,
+    giftCardPaise,
+    couponCode,
+    giftCardCode,
+    customerUserId,
+    items: validatedLines,
+  });
 
   const receipt =
     typeof body.receipt === 'string' && body.receipt.trim()
@@ -2573,14 +2964,15 @@ export async function handleCreateOrderRequest(params: {
         requestId,
         reason: 'firebase-applet-config.json is missing or invalid.',
       });
-      return {
-        status: 503,
-        body: {
+      return withSupportRef(
+        503,
+        {
           status: 503,
           code: 'CHECKOUT_PERSISTENCE_FAILED',
           error: 'Unable to initialize payment checkout right now. Please try again in a moment.',
         },
-      };
+        requestId
+      );
     }
 
     const tokenRes = await resolveFirestoreServerBearerToken({
@@ -2600,16 +2992,106 @@ export async function handleCreateOrderRequest(params: {
         requestId,
         reason: tokenRes.detail,
       });
-      return {
-        status: 503,
-        body: {
+      return withSupportRef(
+        503,
+        {
           status: 503,
           code: 'CHECKOUT_PERSISTENCE_FAILED',
           error: 'Unable to initialize payment checkout right now. Please try again in a moment.',
         },
-      };
+        requestId
+      );
     }
     precheckedServerBearer = tokenRes.token;
+  }
+
+  // Deduplicate repeated create-order clicks/retries using idempotencyKey
+  if (cleanIdempotencyKey) {
+    const existingAttempt = await loadCreateOrderAttempt(cleanIdempotencyKey, {
+      store,
+      requestId,
+    });
+    if (existingAttempt) {
+      if (existingAttempt.payloadHash !== payloadHash) {
+        return withSupportRef(
+          409,
+          {
+            status: 409,
+            code: 'IDEMPOTENCY_CONFLICT',
+            error: 'Your bag or promo selection changed. Please retry payment from the updated total.',
+          },
+          requestId
+        );
+      }
+
+      const existingPending = await loadPendingCheckoutRecord(
+        existingAttempt.razorpayOrderId,
+        store,
+        requestId
+      );
+      if (existingPending?.status === 'confirmed' && existingPending.confirmedOrder) {
+        return withSupportRef(
+          409,
+          {
+            status: 409,
+            code: 'ORDER_ALREADY_CONFIRMED',
+            error: 'Payment for this checkout attempt was already confirmed.',
+            order: existingPending.confirmedOrder,
+          },
+          requestId
+        );
+      }
+      if (
+        existingPending &&
+        existingPending.status === 'pending' &&
+        existingPending.expiresAt > Date.now()
+      ) {
+        const nowReuse = Date.now();
+        const reusedToken = createSignedCheckoutToken(
+          {
+            v: 1,
+            oid: existingPending.razorpayOrderId,
+            amt: existingPending.amountPaise,
+            sub: existingPending.subtotalPaise,
+            disc: existingPending.discountPaise,
+            gc: existingPending.giftCardPaise,
+            cpn: existingPending.couponCode,
+            gcc: existingPending.giftCardCode,
+            cur: existingPending.currency,
+            uid: customerUserId,
+            items: existingPending.items.map((l) => ({
+              productId: l.productId,
+              variantId: l.variantId,
+              quantity: l.quantity,
+              unitPricePaise: l.unitPricePaise,
+            })),
+            iat: nowReuse,
+            exp: existingPending.expiresAt,
+          },
+          keySecret
+        );
+        return withSupportRef(
+          200,
+          {
+            order_id: existingPending.razorpayOrderId,
+            id: existingPending.razorpayOrderId,
+            internal_order_ref: buildDeterministicOrderId(existingPending.razorpayOrderId),
+            amount: existingPending.amountPaise,
+            subtotal_paise: existingPending.subtotalPaise,
+            discount_paise: existingPending.discountPaise,
+            gift_card_paise: existingPending.giftCardPaise,
+            coupon_code: existingPending.couponCode,
+            gift_card_code: existingPending.giftCardCode,
+            currency: existingPending.currency,
+            receipt: existingPending.receipt,
+            key_id: keyId,
+            checkout_token: reusedToken,
+            idempotent_reuse: true,
+          },
+          requestId
+        );
+      }
+    }
   }
 
   try {
@@ -2636,6 +3118,7 @@ export async function handleCreateOrderRequest(params: {
     });
 
     const now = Date.now();
+    const internalOrderRef = buildDeterministicOrderId(order.id);
     const pendingRecord: PendingCheckoutRecord = {
       razorpayOrderId: order.id,
       amountPaise: Number(order.amount || amountPaise),
@@ -2649,6 +3132,8 @@ export async function handleCreateOrderRequest(params: {
       items: validatedLines,
       customer,
       customerUserId,
+      idempotencyKey: cleanIdempotencyKey,
+      payloadHash,
       status: 'pending',
       createdAt: now,
       expiresAt: now + CHECKOUT_TOKEN_TTL_MS,
@@ -2666,23 +3151,38 @@ export async function handleCreateOrderRequest(params: {
     } catch (persistErr) {
       pendingCheckoutsMemory.delete(order.id);
       if (persistErr instanceof StoreHttpError) {
-        return {
-          status: persistErr.httpStatus,
-          body: {
+        return withSupportRef(
+          persistErr.httpStatus,
+          {
             status: persistErr.httpStatus,
             code: persistErr.code,
             error: persistErr.message,
           },
-        };
+          requestId
+        );
       }
-      return {
-        status: 503,
-        body: {
+      return withSupportRef(
+        503,
+        {
           status: 503,
           code: 'CHECKOUT_PERSISTENCE_FAILED',
           error: 'Unable to initialize payment checkout right now. Please try again in a moment.',
         },
-      };
+        requestId
+      );
+    }
+
+    if (cleanIdempotencyKey) {
+      await saveCreateOrderAttempt({
+        idempotencyKey: cleanIdempotencyKey,
+        payloadHash,
+        razorpayOrderId: order.id,
+        keyId,
+        expiresAt: pendingRecord.expiresAt,
+        store,
+        requestId,
+        bearerToken: precheckedServerBearer,
+      });
     }
 
     const checkoutToken = createSignedCheckoutToken(
@@ -2709,11 +3209,12 @@ export async function handleCreateOrderRequest(params: {
       keySecret
     );
 
-    return {
-      status: 200,
-      body: {
+    return withSupportRef(
+      200,
+      {
         order_id: order.id,
         id: order.id,
+        internal_order_ref: internalOrderRef,
         amount: pendingRecord.amountPaise,
         subtotal_paise: subtotalPaise,
         discount_paise: discountPaise,
@@ -2725,17 +3226,19 @@ export async function handleCreateOrderRequest(params: {
         key_id: keyId,
         checkout_token: checkoutToken,
       },
-    };
+      requestId
+    );
   } catch (err: unknown) {
     if (err instanceof StoreHttpError) {
-      return {
-        status: err.httpStatus,
-        body: {
+      return withSupportRef(
+        err.httpStatus,
+        {
           status: err.httpStatus,
           code: err.code,
           error: err.message,
         },
-      };
+        requestId
+      );
     }
 
     const { description, isAuthFailure } = extractRazorpayApiError(
@@ -2745,26 +3248,28 @@ export async function handleCreateOrderRequest(params: {
 
     if (isAuthFailure) {
       const masked = maskRazorpayKeyId(keyId);
-      return {
-        status: 401,
-        body: {
+      return withSupportRef(
+        401,
+        {
           status: 401,
           code: 'RAZORPAY_AUTH_FAILED',
           keyMode,
           keyPrefix: masked,
           error: `Razorpay API authentication failed for ${keyMode} key "${masked}". Update RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in your server / Vercel environment variables with an active matching key pair from Razorpay Dashboard → Account & Settings → API Keys.`,
         },
-      };
+        requestId
+      );
     }
 
-    return {
-      status: 500,
-      body: {
+    return withSupportRef(
+      500,
+      {
         status: 500,
         code: 'RAZORPAY_ORDER_FAILED',
         error: description,
       },
-    };
+      requestId
+    );
   }
 }
 
@@ -2933,70 +3438,77 @@ async function finalizePaidRazorpayOrder(params: {
     try {
       const razorpay = (razorpayClientFactory || defaultRazorpayFactory)(keyId, keySecret);
       fetchedPayment =
-        params.fetchedPaymentPreloaded || (await razorpay.payments.fetch(razorpayPaymentId));
+        params.fetchedPaymentPreloaded ||
+        (await withTransientRetry(() => razorpay.payments.fetch(razorpayPaymentId)));
 
       if (fetchedPayment.order_id && fetchedPayment.order_id !== razorpayOrderId) {
-        return {
-          status: 400,
-          body: {
+        return withSupportRef(
+          400,
+          {
             status: 400,
             success: false,
             verified: false,
             code: 'PAYMENT_ORDER_MISMATCH',
             error: 'Razorpay payment does not belong to this order.',
           },
-        };
+          requestId
+        );
       }
 
       if (
         expectedAmountPaise !== null &&
         Math.round(Number(fetchedPayment.amount)) !== expectedAmountPaise
       ) {
-        return {
-          status: 400,
-          body: {
+        return withSupportRef(
+          400,
+          {
             status: 400,
             success: false,
             verified: false,
             code: 'AMOUNT_MISMATCH',
             error: 'Paid amount does not match the expected order amount.',
           },
-        };
+          requestId
+        );
       }
 
       const paidCurrency = String(fetchedPayment.currency || '').toUpperCase();
       if (paidCurrency !== 'INR') {
-        return {
-          status: 400,
-          body: {
+        return withSupportRef(
+          400,
+          {
             status: 400,
             success: false,
             verified: false,
             code: 'CURRENCY_MISMATCH',
             error: `Unexpected payment currency (${paidCurrency || 'unknown'}). Expected INR.`,
           },
-        };
+          requestId
+        );
       }
 
       const verifyAmountForCapture =
         expectedAmountPaise ?? Math.round(Number(fetchedPayment.amount));
 
-      fetchedOrder = await razorpay.orders.fetch(razorpayOrderId).catch(() => null);
+      fetchedOrder = await withTransientRetry(() => razorpay.orders.fetch(razorpayOrderId)).catch(
+        () => null
+      );
       if (
         fetchedOrder &&
         expectedAmountPaise !== null &&
         Math.round(Number(fetchedOrder.amount)) !== expectedAmountPaise
       ) {
-        return {
-          status: 400,
-          body: {
+        return withSupportRef(
+          400,
+          {
             status: 400,
             success: false,
             verified: false,
             code: 'AMOUNT_MISMATCH',
             error: 'Razorpay order amount does not match the checkout total.',
           },
-        };
+          requestId
+        );
       }
 
       if (fetchedPayment.status === 'authorized' && !fetchedPayment.captured) {
@@ -3010,16 +3522,53 @@ async function finalizePaidRazorpayOrder(params: {
       const isCaptured =
         fetchedPayment.status === 'captured' || fetchedPayment.captured === true;
       if (!isCaptured) {
-        return {
-          status: 400,
-          body: {
+        const payStatus = String(fetchedPayment.status || 'unknown').toLowerCase();
+        if (payStatus === 'authorized' || payStatus === 'created' || payStatus === 'pending') {
+          if (pendingRecord) {
+            pendingRecord = {
+              ...pendingRecord,
+              status: 'payment_received_pending_confirm',
+              razorpayPaymentId,
+            };
+            pendingCheckoutsMemory.set(razorpayOrderId, pendingRecord);
+            await persistPendingCheckoutRecord({
+              record: pendingRecord,
+              store,
+              strictPersistence: false,
+              requestId,
+            }).catch(() => {});
+          }
+          return withSupportRef(
+            202,
+            {
+              status: 202,
+              success: true,
+              verified: true,
+              paid: false,
+              pending_confirmation: true,
+              payment_status: payStatus,
+              code: 'PAYMENT_PENDING_CAPTURE',
+              order_id: razorpayOrderId,
+              internal_order_ref: orderDocId,
+              payment_id: razorpayPaymentId,
+              message:
+                'Your payment is authorized and awaiting capture confirmation. Check status before retrying payment.',
+            },
+            requestId
+          );
+        }
+
+        return withSupportRef(
+          400,
+          {
             status: 400,
             success: false,
             verified: false,
             code: 'PAYMENT_NOT_CAPTURED',
             error: `Payment is not captured (status: ${fetchedPayment.status || 'unknown'}).`,
           },
-        };
+          requestId
+        );
       }
     } catch (rzpErr: unknown) {
       const { description, isAuthFailure } = extractRazorpayApiError(
@@ -3200,9 +3749,11 @@ async function finalizePaidRazorpayOrder(params: {
           success: true,
           verified: true,
           order_id: razorpayOrderId,
+          internal_order_ref: orderDocId,
           payment_id: razorpayPaymentId,
           message: 'Payment verified and order confirmed.',
           order: confirmedReceipt,
+          ...(requestId ? { support_reference: requestId } : {}),
         };
         completedCheckoutsMemory.set(razorpayOrderId, {
           paymentId: razorpayPaymentId,
@@ -3246,15 +3797,16 @@ async function finalizePaidRazorpayOrder(params: {
           }).catch(() => {});
         }
 
-        return {
-          status: 202,
-          body: {
+        return withSupportRef(
+          202,
+          {
             status: 202,
             success: true,
             verified: true,
             pending_confirmation: true,
             code: 'ORDER_CONFIRMATION_PENDING',
             order_id: razorpayOrderId,
+            internal_order_ref: orderDocId,
             payment_id: razorpayPaymentId,
             message: 'Payment received. We’re confirming your order',
             error:
@@ -3262,7 +3814,8 @@ async function finalizePaidRazorpayOrder(params: {
                 ? persistErr.message
                 : 'Order confirmation is delayed and will complete shortly.',
           },
-        };
+          requestId
+        );
       }
     }
 
@@ -3271,8 +3824,10 @@ async function finalizePaidRazorpayOrder(params: {
       success: true,
       verified: true,
       order_id: razorpayOrderId,
+      internal_order_ref: orderDocId,
       payment_id: razorpayPaymentId,
       message: 'Payment verified successfully.',
+      ...(requestId ? { support_reference: requestId } : {}),
     };
     completedCheckoutsMemory.set(razorpayOrderId, {
       paymentId: razorpayPaymentId,
@@ -3493,34 +4048,47 @@ export async function handleVerifyPaymentRequest(params: {
 export async function handleRazorpayWebhookRequest(params: {
   rawBody: string;
   signatureHeader: string | string[] | undefined;
+  eventIdHeader?: string | string[] | undefined;
   store?: BoutiqueStore | null;
   razorpayClientFactory?: RazorpayClientFactory;
   requestId?: string;
 }): Promise<CheckoutHandlerResponse> {
-  const { rawBody, signatureHeader, store = null, razorpayClientFactory, requestId } = params;
+  const {
+    rawBody,
+    signatureHeader,
+    eventIdHeader,
+    store = null,
+    razorpayClientFactory,
+    requestId,
+  } = params;
   const sig = (Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader || '').trim();
+  const explicitEventId = (
+    Array.isArray(eventIdHeader) ? eventIdHeader[0] : eventIdHeader || ''
+  ).trim();
   const webhookSecret = sanitizeEnvCredential(process.env.RAZORPAY_WEBHOOK_SECRET);
 
   if (!webhookSecret) {
-    return {
-      status: 503,
-      body: {
+    return withSupportRef(
+      503,
+      {
         status: 503,
         code: 'WEBHOOK_NOT_CONFIGURED',
         error: 'RAZORPAY_WEBHOOK_SECRET is not configured on the server.',
       },
-    };
+      requestId
+    );
   }
 
   if (!sig) {
-    return {
-      status: 401,
-      body: {
+    return withSupportRef(
+      401,
+      {
         status: 401,
         code: 'MISSING_WEBHOOK_SIGNATURE',
         error: 'Missing X-Razorpay-Signature header.',
       },
-    };
+      requestId
+    );
   }
 
   const expectedSig = crypto
@@ -3530,32 +4098,58 @@ export async function handleRazorpayWebhookRequest(params: {
   const expectedBuf = Buffer.from(expectedSig, 'utf8');
   const actualBuf = Buffer.from(sig, 'utf8');
   if (expectedBuf.length !== actualBuf.length || !crypto.timingSafeEqual(expectedBuf, actualBuf)) {
-    return {
-      status: 401,
-      body: {
+    return withSupportRef(
+      401,
+      {
         status: 401,
         code: 'INVALID_WEBHOOK_SIGNATURE',
         error: 'Webhook signature verification failed.',
       },
-    };
+      requestId
+    );
   }
 
   let event: Record<string, unknown>;
   try {
     event = JSON.parse(rawBody) as Record<string, unknown>;
   } catch {
-    return {
-      status: 400,
-      body: { status: 400, code: 'INVALID_JSON', error: 'Invalid webhook payload.' },
-    };
+    return withSupportRef(
+      400,
+      { status: 400, code: 'INVALID_JSON', error: 'Invalid webhook payload.' },
+      requestId
+    );
   }
 
   const eventType = typeof event.event === 'string' ? event.event : '';
-  if (eventType !== 'payment.captured' && eventType !== 'order.paid') {
-    return {
-      status: 200,
-      body: { received: true, ignored: true, event: eventType },
-    };
+  if (
+    eventType !== 'payment.captured' &&
+    eventType !== 'order.paid' &&
+    eventType !== 'payment.failed'
+  ) {
+    return withSupportRef(
+      200,
+      { received: true, ignored: true, event: eventType },
+      requestId
+    );
+  }
+
+  if (explicitEventId) {
+    const seen = await loadWebhookEventProcessed(explicitEventId, { store, requestId });
+    if (seen) {
+      return withSupportRef(
+        200,
+        {
+          received: true,
+          duplicate_event: true,
+          already_processed: true,
+          event: seen.eventType,
+          event_id: explicitEventId,
+          ...(seen.orderId ? { order_id: seen.orderId } : {}),
+          ...(seen.order ? { order: seen.order } : {}),
+        },
+        requestId
+      );
+    }
   }
 
   const payload =
@@ -3586,26 +4180,134 @@ export async function handleRazorpayWebhookRequest(params: {
   const razorpayPaymentId =
     typeof paymentEntity?.id === 'string' ? paymentEntity.id.trim() : '';
 
+  if (eventType === 'payment.failed') {
+    if (!razorpayOrderId) {
+      return withSupportRef(
+        400,
+        {
+          status: 400,
+          code: 'MISSING_FIELDS',
+          error: 'Webhook payment.failed payload missing order_id.',
+        },
+        requestId
+      );
+    }
+
+    const orderDocId = buildDeterministicOrderId(razorpayOrderId);
+    const memDone = completedCheckoutsMemory.get(razorpayOrderId)?.order;
+    const storeDone = store
+      ? await store
+          .getOrderById(orderDocId)
+          .then((res) => (res ? res.order : null))
+          .catch(() => null)
+      : null;
+    const pending = await loadPendingCheckoutRecord(razorpayOrderId, store, requestId);
+    const fsDone =
+      !store && !memDone && pending?.status !== 'confirmed'
+        ? await fetchExistingFirestoreOrder(orderDocId, razorpayOrderId, razorpayPaymentId, {
+            requestId,
+          })
+        : null;
+
+    if (memDone || storeDone || pending?.status === 'confirmed' || fsDone) {
+      // Out-of-order guard: NEVER let payment.failed overwrite an already-paid/confirmed order.
+      if (explicitEventId) {
+        await saveWebhookEventProcessed({
+          eventId: explicitEventId,
+          eventType,
+          orderId: razorpayOrderId,
+          order: memDone || pending?.confirmedOrder || fsDone || undefined,
+          store,
+          requestId,
+        });
+      }
+      return withSupportRef(
+        200,
+        {
+          received: true,
+          ignored_out_of_order: true,
+          already_processed: true,
+          event: eventType,
+          order_id: razorpayOrderId,
+          internal_order_ref: orderDocId,
+          ...(memDone || pending?.confirmedOrder || fsDone
+            ? { order: memDone || pending?.confirmedOrder || fsDone }
+            : {}),
+        },
+        requestId
+      );
+    }
+
+    const failureReason =
+      (typeof paymentEntity?.error_description === 'string' &&
+        paymentEntity.error_description.trim()) ||
+      (typeof paymentEntity?.error_reason === 'string' && paymentEntity.error_reason.trim()) ||
+      'Payment failed at the payment gateway.';
+
+    if (pending) {
+      const updatedPending: PendingCheckoutRecord = {
+        ...pending,
+        status: 'failed',
+        razorpayPaymentId: razorpayPaymentId || pending.razorpayPaymentId,
+        failureReason,
+      };
+      pendingCheckoutsMemory.set(razorpayOrderId, updatedPending);
+      await persistPendingCheckoutRecord({
+        record: updatedPending,
+        store,
+        strictPersistence: false,
+        requestId,
+      }).catch(() => {});
+    }
+
+    if (explicitEventId) {
+      await saveWebhookEventProcessed({
+        eventId: explicitEventId,
+        eventType,
+        orderId: razorpayOrderId,
+        store,
+        requestId,
+      });
+    }
+
+    return withSupportRef(
+      200,
+      {
+        received: true,
+        handled: true,
+        event: eventType,
+        status: 'failed',
+        order_id: razorpayOrderId,
+        internal_order_ref: orderDocId,
+        payment_id: razorpayPaymentId || null,
+        failure_reason: failureReason,
+      },
+      requestId
+    );
+  }
+
   if (!razorpayOrderId || !razorpayPaymentId) {
-    return {
-      status: 400,
-      body: {
+    return withSupportRef(
+      400,
+      {
         status: 400,
         code: 'MISSING_FIELDS',
         error: 'Webhook payload missing payment.entity.id or order_id.',
       },
-    };
+      requestId
+    );
   }
 
   const creds = resolveRazorpayCredentials();
   if (!creds.ok) {
-    return {
-      status: 401,
-      body: { status: 401, code: creds.code, error: creds.error },
-    };
+    return withSupportRef(
+      401,
+      { status: 401, code: creds.code, error: creds.error },
+      requestId
+    );
   }
 
-  return finalizePaidRazorpayOrder({
+  const finalResult = await finalizePaidRazorpayOrder({
     razorpayOrderId,
     razorpayPaymentId,
     keyId: creds.keyId,
@@ -3618,6 +4320,19 @@ export async function handleRazorpayWebhookRequest(params: {
     strictPersistence: shouldRequireDurablePersistence({ store }),
     requestId,
   });
+
+  if (explicitEventId && finalResult.status === 200) {
+    await saveWebhookEventProcessed({
+      eventId: explicitEventId,
+      eventType,
+      orderId: razorpayOrderId,
+      order: finalResult.body.order as SerializedOrderReceipt | undefined,
+      store,
+      requestId,
+    });
+  }
+
+  return finalResult;
 }
 
 export async function handleOrderStatusRequest(params: {
@@ -3641,10 +4356,11 @@ export async function handleOrderStatusRequest(params: {
 
   const cleanOid = razorpayOrderId.trim();
   if (!cleanOid) {
-    return {
-      status: 400,
-      body: { status: 400, code: 'MISSING_ORDER_ID', error: 'razorpay_order_id is required.' },
-    };
+    return withSupportRef(
+      400,
+      { status: 400, code: 'MISSING_ORDER_ID', error: 'razorpay_order_id is required.' },
+      requestId
+    );
   }
 
   const orderDocId = buildDeterministicOrderId(cleanOid);
@@ -3656,17 +4372,21 @@ export async function handleOrderStatusRequest(params: {
         customerUserId &&
         existing.order.customer_user_id !== customerUserId
       ) {
-        return {
-          status: 403,
-          body: { status: 403, code: 'FORBIDDEN', error: 'Access denied for this order.' },
-        };
+        return withSupportRef(
+          403,
+          { status: 403, code: 'FORBIDDEN', error: 'Access denied for this order.' },
+          requestId
+        );
       }
-      return {
-        status: 200,
-        body: {
+      return withSupportRef(
+        200,
+        {
           confirmed: true,
           pending_confirmation: false,
+          failed: false,
+          status: 'confirmed',
           order_id: cleanOid,
+          internal_order_ref: orderDocId,
           payment_id: existing.order.razorpay_payment_id || razorpayPaymentId || null,
           order: {
             id: existing.order.id,
@@ -3699,7 +4419,8 @@ export async function handleOrderStatusRequest(params: {
             })),
           },
         },
-      };
+        requestId
+      );
     }
   } else {
     const existingFs = await fetchExistingFirestoreOrder(
@@ -3709,45 +4430,75 @@ export async function handleOrderStatusRequest(params: {
       { requestId }
     );
     if (existingFs) {
-      return {
-        status: 200,
-        body: {
+      return withSupportRef(
+        200,
+        {
           confirmed: true,
           pending_confirmation: false,
+          failed: false,
+          status: 'confirmed',
           order_id: cleanOid,
+          internal_order_ref: orderDocId,
           payment_id: existingFs.razorpayPaymentId || razorpayPaymentId || null,
           order: existingFs,
         },
-      };
+        requestId
+      );
     }
   }
 
   const pendingRecord = await loadPendingCheckoutRecord(cleanOid, store, requestId);
+  if (pendingRecord?.status === 'failed') {
+    return withSupportRef(
+      200,
+      {
+        confirmed: false,
+        pending_confirmation: false,
+        failed: true,
+        status: 'failed',
+        order_id: cleanOid,
+        internal_order_ref: orderDocId,
+        payment_id: razorpayPaymentId?.trim() || pendingRecord.razorpayPaymentId || null,
+        failure_reason: pendingRecord.failureReason || 'Payment failed.',
+        message:
+          pendingRecord.failureReason ||
+          'Your previous payment attempt failed. You can retry checkout safely.',
+      },
+      requestId
+    );
+  }
+
   const pid = razorpayPaymentId?.trim() || pendingRecord?.razorpayPaymentId || '';
   if (!pid) {
-    return {
-      status: 200,
-      body: {
+    return withSupportRef(
+      200,
+      {
         confirmed: false,
         pending_confirmation: pendingRecord?.status === 'payment_received_pending_confirm',
+        failed: false,
         order_id: cleanOid,
+        internal_order_ref: orderDocId,
         status: pendingRecord?.status || 'pending',
       },
-    };
+      requestId
+    );
   }
 
   const creds = resolveRazorpayCredentials();
   if (!creds.ok) {
-    return {
-      status: 202,
-      body: {
+    return withSupportRef(
+      202,
+      {
         confirmed: false,
         pending_confirmation: true,
+        failed: false,
         order_id: cleanOid,
+        internal_order_ref: orderDocId,
         payment_id: pid,
         message: 'Payment received. We’re confirming your order',
       },
-    };
+      requestId
+    );
   }
 
   const finalRes = await finalizePaidRazorpayOrder({
@@ -3766,16 +4517,18 @@ export async function handleOrderStatusRequest(params: {
   });
 
   if (finalRes.status === 200 && finalRes.body.order) {
-    return {
-      status: 200,
-      body: {
+    return withSupportRef(
+      200,
+      {
         confirmed: true,
         pending_confirmation: false,
+        failed: false,
         ...finalRes.body,
       },
-    };
+      requestId
+    );
   }
-  return finalRes;
+  return withSupportRef(finalRes.status, finalRes.body, requestId);
 }
 
 export async function handleRecoverRazorpayOrder(params: {
@@ -4624,5 +5377,7 @@ export function clearRazorpayCheckoutCachesForTest() {
   pendingCheckoutsMemory.clear();
   completedCheckoutsMemory.clear();
   inFlightVerifications.clear();
+  idempotentOrderAttemptsMemory.clear();
+  processedWebhookEventsMemory.clear();
   cachedGoogleAccessToken = null;
 }

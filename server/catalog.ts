@@ -1477,6 +1477,7 @@ export function registerCatalogAndAdminRoutes(params: {
         const result = await handleRazorpayWebhookRequest({
           rawBody,
           signatureHeader: req.get('x-razorpay-signature'),
+          eventIdHeader: req.get('x-razorpay-event-id'),
           store,
           razorpayClientFactory,
           requestId: req.requestId,
