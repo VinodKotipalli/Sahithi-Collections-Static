@@ -4,11 +4,14 @@ import {
   clearClientFirebaseSession,
   handleClientlessApiRequest,
 } from '../services/firebaseClientApi';
+import type { NotificationPreferences } from '../types/boutique';
 
 export interface AuthUser {
   id: string;
   fullName: string;
   email: string | null;
+  phone?: string | null;
+  notificationPrefs?: NotificationPreferences;
   emailVerified: boolean;
   hasPassword: boolean;
   isOwner: boolean;
@@ -84,6 +87,14 @@ interface AuthContextValue {
   requestPasswordReset: (email: string) => Promise<ApiResult<{ message: string }>>;
   resetPassword: (token: string, password: string) => Promise<ApiResult<{ message: string }>>;
   updateProfileName: (fullName: string) => Promise<ApiResult<{ user: AuthUser }>>;
+  updateProfile: (input: {
+    fullName?: string;
+    phone?: string | null;
+    notificationPrefs?: Partial<NotificationPreferences>;
+  }) => Promise<ApiResult<{ user: AuthUser }>>;
+  deleteAccount: (
+    confirmText: string
+  ) => Promise<ApiResult<{ ok: boolean; deletedUserId: string; message: string }>>;
   reauthenticateWithPassword: (
     password: string
   ) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
@@ -641,15 +652,68 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [requestApi]
   );
 
-  const updateProfileName = useCallback(
-    async (fullName: string) => {
+  const updateProfile = useCallback(
+    async (input: {
+      fullName?: string;
+      phone?: string | null;
+      notificationPrefs?: Partial<NotificationPreferences>;
+    }) => {
       const res = await requestApi<{ user: AuthUser }>('/api/account/profile', {
         method: 'PATCH',
-        body: JSON.stringify({ fullName }),
+        body: JSON.stringify(input),
       });
       if (res.ok) {
         sessionEpochRef.current += 1;
         setUser(res.data.user);
+        try {
+          if (typeof BroadcastChannel !== 'undefined') {
+            const ch = new BroadcastChannel('sahithi-boutique-sync');
+            ch.postMessage({ topic: 'account', at: Date.now() });
+            ch.close();
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return res;
+    },
+    [requestApi]
+  );
+
+  const updateProfileName = useCallback(
+    (fullName: string) => updateProfile({ fullName }),
+    [updateProfile]
+  );
+
+  const deleteAccount = useCallback(
+    async (confirmText: string) => {
+      const res = await requestApi<{
+        ok: boolean;
+        deletedUserId: string;
+        csrfToken?: string;
+        message: string;
+      }>('/api/account/profile', {
+        method: 'DELETE',
+        body: JSON.stringify({ confirmText }),
+      });
+      if (res.ok) {
+        sessionEpochRef.current += 1;
+        sessionTokenRef.current = '';
+        writeStoredApiSessionToken('');
+        clearClientFirebaseSession();
+        if (typeof res.data.csrfToken === 'string' && res.data.csrfToken) {
+          csrfTokenRef.current = res.data.csrfToken;
+        }
+        setUser(null);
+        try {
+          if (typeof BroadcastChannel !== 'undefined') {
+            const ch = new BroadcastChannel('sahithi-boutique-sync');
+            ch.postMessage({ topic: 'account', at: Date.now() });
+            ch.close();
+          }
+        } catch {
+          // ignore
+        }
       }
       return res;
     },
@@ -845,6 +909,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         requestPasswordReset,
         resetPassword,
         updateProfileName,
+        updateProfile,
+        deleteAccount,
         reauthenticateWithPassword,
         changePassword,
         requestLinkEmail,

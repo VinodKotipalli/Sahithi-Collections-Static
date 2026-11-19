@@ -22,10 +22,12 @@ import {
   type CouponRow,
   type CustomerAddressRow,
   type CustomerNotificationRow,
+  type CustomerPaymentMethodRow,
   type EmailTokenRow,
   type GiftCardRow,
   type LegacyPhoneOnlyAccount,
   type LoyaltyConfigData,
+  type NotificationPreferencesData,
   type OrderItemRow,
   type OrderReturnRequestRecord,
   type OrderRow,
@@ -53,6 +55,15 @@ import {
   mergeSiteSettings,
   mergeStorefrontContent,
 } from './storefront-defaults.ts';
+import {
+  normalizeOrderRequestsAndStatus,
+  parseNotificationPrefs,
+  parseOrderHistory,
+  PRE_CUTOFF_DELIVERY_EDIT_STATES,
+  PRE_SHIPPING_CANCEL_STATES,
+  RETURN_ELIGIBLE_STATES,
+  validateNonSensitivePaymentMethodInput,
+} from './order-utils.ts';
 
 export class SqliteBoutiqueStore implements BoutiqueStore {
   readonly backend = 'sqlite' as const;
@@ -152,6 +163,84 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       .prepare(`UPDATE users SET full_name = ?, updated_at = ? WHERE id = ?`)
       .run(fullName, now, userId);
     return (await this.getUserById(userId))!;
+  }
+
+  async updateCustomerProfile(
+    userId: string,
+    input: {
+      fullName?: string;
+      phone?: string | null;
+      notificationPrefs?: NotificationPreferencesData;
+    },
+    now: number
+  ): Promise<UserRow> {
+    const existing = await this.getUserById(userId);
+    if (!existing) {
+      throw new StoreHttpError(404, 'USER_NOT_FOUND', 'Customer account was not found.');
+    }
+    const nextName =
+      typeof input.fullName === 'string' && input.fullName.trim().length >= 2
+        ? input.fullName.trim().slice(0, 100)
+        : existing.full_name;
+    const nextPhone =
+      input.phone === null
+        ? null
+        : typeof input.phone === 'string'
+          ? input.phone.trim() || null
+          : existing.phone_e164;
+    const nextPrefsJson = input.notificationPrefs
+      ? JSON.stringify(parseNotificationPrefs(input.notificationPrefs))
+      : existing.notification_prefs_json ?? null;
+
+    this.db
+      .prepare(
+        `UPDATE users SET full_name = ?, phone_e164 = ?, notification_prefs_json = ?, updated_at = ? WHERE id = ?`
+      )
+      .run(nextName, nextPhone, nextPrefsJson, now, userId);
+    return (await this.getUserById(userId))!;
+  }
+
+  async deleteCustomerAccount(
+    userId: string,
+    now: number
+  ): Promise<{ deleted: boolean; preservedOrdersCount: number }> {
+    const user = await this.getUserById(userId);
+    if (!user) return { deleted: false, preservedOrdersCount: 0 };
+
+    const boundOwner = await this.resolveBoundOwner();
+    if (boundOwner && boundOwner.owner_user_id === userId) {
+      throw new StoreHttpError(
+        403,
+        'OWNER_ACCOUNT_PROTECTED',
+        'The primary store owner account cannot be deleted from customer settings.'
+      );
+    }
+
+    const orderCountRow = this.db
+      .prepare(`SELECT COUNT(*) AS cnt FROM orders WHERE customer_user_id = ?`)
+      .get(userId) as { cnt: number };
+    const preservedOrdersCount = Number(orderCountRow?.cnt || 0);
+
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      // Detach orders so historical ledger & audit snapshot stay intact while user record is removed
+      this.db
+        .prepare(`UPDATE orders SET customer_user_id = NULL, updated_at = ? WHERE customer_user_id = ?`)
+        .run(now, userId);
+      this.db.prepare(`UPDATE pending_checkouts SET customer_user_id = NULL WHERE customer_user_id = ?`).run(userId);
+      this.db.prepare(`DELETE FROM sessions WHERE user_id = ?`).run(userId);
+      this.db.prepare(`DELETE FROM email_tokens WHERE user_id = ?`).run(userId);
+      this.db.prepare(`DELETE FROM customer_addresses WHERE user_id = ?`).run(userId);
+      this.db.prepare(`DELETE FROM customer_payment_methods WHERE user_id = ?`).run(userId);
+      this.db.prepare(`DELETE FROM customer_wishlists WHERE user_id = ?`).run(userId);
+      this.db.prepare(`DELETE FROM customer_notifications WHERE user_id = ?`).run(userId);
+      const res = this.db.prepare(`DELETE FROM users WHERE id = ?`).run(userId);
+      this.db.exec('COMMIT;');
+      return { deleted: res.changes > 0, preservedOrdersCount };
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
   }
 
   async updateUserPasswordHash(userId: string, passwordHash: string, now: number): Promise<void> {
@@ -515,7 +604,7 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     const openReturnRequests = (
       this.db
         .prepare(
-          `SELECT COUNT(*) AS cnt FROM orders WHERE return_request_json LIKE '%"status":"pending"%'`
+          `SELECT COUNT(*) AS cnt FROM orders WHERE return_request_json LIKE '%"status":"pending"%' OR cancel_request_json LIKE '%"status":"pending"%'`
         )
         .get() as { cnt: number }
     ).cnt;
@@ -1630,7 +1719,9 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
 
   async listCustomerOrders(userId: string): Promise<OrderWithItems[]> {
     const orders = this.db
-      .prepare(`SELECT * FROM orders WHERE customer_user_id = ? ORDER BY created_at DESC`)
+      .prepare(
+        `SELECT * FROM orders WHERE customer_user_id = ? AND COALESCE(hidden_by_customer, 0) = 0 ORDER BY created_at DESC`
+      )
       .all(userId) as unknown as OrderRow[];
     const fetchItems = this.db.prepare(`SELECT * FROM order_items WHERE order_id = ?`);
     return orders.map((order) => ({
@@ -1713,25 +1804,31 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       changed &&
       existing.customer_user_id
     ) {
-      const label = nextStatus.replace(/_/g, ' ');
-      const notifId = `notif_status_${orderId}_${nextStatus}_${now}`;
-      this.db
-        .prepare(
-          `INSERT INTO customer_notifications (
-            id, user_id, type, title, message, order_id, order_number, is_read, read_at, created_at
-          ) VALUES (?, ?, 'order_status', ?, ?, ?, ?, 0, NULL, ?)`
-        )
-        .run(
-          notifId,
-          existing.customer_user_id,
-          `Order ${existing.order_number} is now ${label}`,
-          options?.note?.trim()
-            ? `${options.note.trim()} (Order ${existing.order_number})`
-            : `Your order ${existing.order_number} status has been updated to ${label}.`,
-          orderId,
-          existing.order_number,
-          now
-        );
+      const custRow = this.db
+        .prepare(`SELECT notification_prefs_json FROM users WHERE id = ? LIMIT 1`)
+        .get(existing.customer_user_id) as { notification_prefs_json?: string | null } | undefined;
+      const prefs = parseNotificationPrefs(custRow?.notification_prefs_json);
+      if (prefs.orderUpdates) {
+        const label = nextStatus.replace(/_/g, ' ');
+        const notifId = `notif_status_${orderId}_${nextStatus}_${now}`;
+        this.db
+          .prepare(
+            `INSERT INTO customer_notifications (
+              id, user_id, type, title, message, order_id, order_number, is_read, read_at, created_at
+            ) VALUES (?, ?, 'order_status', ?, ?, ?, ?, 0, NULL, ?)`
+          )
+          .run(
+            notifId,
+            existing.customer_user_id,
+            `Order ${existing.order_number} is now ${label}`,
+            options?.note?.trim()
+              ? `${options.note.trim()} (Order ${existing.order_number})`
+              : `Your order ${existing.order_number} status has been updated to ${label}.`,
+            orderId,
+            existing.order_number,
+            now
+          );
+      }
     }
 
     return this.getOrderById(orderId);
@@ -1743,126 +1840,555 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     type: 'cancel' | 'return';
     reason: string;
   }): Promise<OrderWithItems | null> {
-    const existing = this.db
-      .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
-      .get(input.orderId) as OrderRow | undefined;
-    if (!existing) return null;
-    if (existing.customer_user_id !== input.userId) {
-      throw new StoreHttpError(403, 'FORBIDDEN', 'You can only request changes for your own orders.');
+    return this.submitOrderRequest(input);
+  }
+
+  async submitOrderRequest(input: {
+    orderId: string;
+    userId: string;
+    type: 'cancel' | 'return';
+    reason: string;
+  }): Promise<OrderWithItems | null> {
+    const cleanReason = input.reason.trim().slice(0, 500);
+    if (cleanReason.length < 3) {
+      throw new StoreHttpError(
+        400,
+        'VALIDATION_ERROR',
+        'Please provide a brief reason (at least 3 characters).'
+      );
     }
 
-    const now = Date.now();
-    const requestRecord: OrderReturnRequestRecord = {
-      id: `req_${crypto.randomUUID().slice(0, 12)}`,
-      type: input.type,
-      reason: input.reason.trim().slice(0, 500),
-      status: 'pending',
-      requestedAt: now,
-      resolvedAt: null,
-    };
-
-    let history: OrderStatusHistoryEntry[] = [];
+    this.db.exec('BEGIN IMMEDIATE;');
     try {
-      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
-      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
-    } catch {
-      history = [];
-    }
-    history.push({
-      status: input.type === 'cancel' ? 'cancellation_requested' : 'return_requested',
-      note: requestRecord.reason,
-      actor: 'customer',
-      at: now,
-    });
+      const existing = this.db
+        .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+        .get(input.orderId) as OrderRow | undefined;
+      if (!existing) {
+        this.db.exec('ROLLBACK;');
+        return null;
+      }
+      if (existing.customer_user_id !== input.userId) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          403,
+          'FORBIDDEN',
+          'You can only request changes for your own orders.'
+        );
+      }
 
+      const history = parseOrderHistory(existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.status,
+        rawFulfillmentStatus: existing.fulfillment_status,
+        rawCancelRequest: existing.cancel_request_json,
+        rawReturnRequest: existing.return_request_json,
+        history,
+        paymentMethod: existing.payment_method,
+      });
+
+      if (input.type === 'cancel') {
+        if (!PRE_SHIPPING_CANCEL_STATES.has(norm.fulfillmentStatus)) {
+          this.db.exec('ROLLBACK;');
+          throw new StoreHttpError(
+            409,
+            'CANCELLATION_CUTOFF_PASSED',
+            `Cancellation is unavailable once an order is ${norm.fulfillmentStatus}.`
+          );
+        }
+        if (norm.cancelRequest?.status === 'pending') {
+          if (norm.cancelRequest.reason === cleanReason) {
+            this.db.exec('COMMIT;');
+            return this.getOrderById(input.orderId);
+          }
+          this.db.exec('ROLLBACK;');
+          throw new StoreHttpError(
+            409,
+            'REQUEST_ALREADY_PENDING',
+            'A cancellation request is already pending for this order. You can edit or withdraw it below.'
+          );
+        }
+      } else {
+        if (!RETURN_ELIGIBLE_STATES.has(norm.fulfillmentStatus)) {
+          this.db.exec('ROLLBACK;');
+          throw new StoreHttpError(
+            409,
+            'RETURN_NOT_ELIGIBLE',
+            'Return requests can only be submitted after your order is delivered.'
+          );
+        }
+        if (norm.returnRequest?.status === 'pending') {
+          if (norm.returnRequest.reason === cleanReason) {
+            this.db.exec('COMMIT;');
+            return this.getOrderById(input.orderId);
+          }
+          this.db.exec('ROLLBACK;');
+          throw new StoreHttpError(
+            409,
+            'REQUEST_ALREADY_PENDING',
+            'A return request is already pending for this order. You can edit or withdraw it below.'
+          );
+        }
+      }
+
+      const now = Date.now();
+      const requestRecord: OrderReturnRequestRecord = {
+        id: `req_${crypto.randomUUID().slice(0, 12)}`,
+        type: input.type,
+        reason: cleanReason,
+        status: 'pending',
+        requestedAt: now,
+        updatedAt: now,
+        resolvedAt: null,
+      };
+
+      history.push({
+        status: input.type === 'cancel' ? 'cancellation_requested' : 'return_requested',
+        note: cleanReason,
+        actor: 'customer',
+        at: now,
+      });
+
+      if (input.type === 'cancel') {
+        // Store in cancel_request_json ONLY; preserve actual fulfillment_status and status!
+        this.db
+          .prepare(
+            `UPDATE orders SET status = ?, fulfillment_status = ?, cancel_request_json = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
+          )
+          .run(
+            norm.fulfillmentStatus,
+            norm.fulfillmentStatus,
+            JSON.stringify(requestRecord),
+            JSON.stringify(history),
+            now,
+            input.orderId
+          );
+      } else {
+        this.db
+          .prepare(
+            `UPDATE orders SET status = ?, fulfillment_status = ?, return_request_json = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
+          )
+          .run(
+            norm.fulfillmentStatus,
+            norm.fulfillmentStatus,
+            JSON.stringify(requestRecord),
+            JSON.stringify(history),
+            now,
+            input.orderId
+          );
+      }
+
+      this.db.exec('COMMIT;');
+      return this.getOrderById(input.orderId);
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
+  }
+
+  async updateOrderRequest(input: {
+    orderId: string;
+    userId: string;
+    type: 'cancel' | 'return';
+    action: 'edit' | 'withdraw';
+    reason?: string;
+  }): Promise<OrderWithItems | null> {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const existing = this.db
+        .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+        .get(input.orderId) as OrderRow | undefined;
+      if (!existing) {
+        this.db.exec('ROLLBACK;');
+        return null;
+      }
+      if (existing.customer_user_id !== input.userId) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          403,
+          'FORBIDDEN',
+          'You can only update requests for your own orders.'
+        );
+      }
+
+      const history = parseOrderHistory(existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.status,
+        rawFulfillmentStatus: existing.fulfillment_status,
+        rawCancelRequest: existing.cancel_request_json,
+        rawReturnRequest: existing.return_request_json,
+        history,
+        paymentMethod: existing.payment_method,
+      });
+
+      const target = input.type === 'cancel' ? norm.cancelRequest : norm.returnRequest;
+      if (!target) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(404, 'REQUEST_NOT_FOUND', 'No request was found on this order.');
+      }
+      if (target.status !== 'pending') {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          409,
+          'CONCURRENCY_CONFLICT',
+          `This request is already ${target.status} and can no longer be changed.`
+        );
+      }
+
+      const now = Date.now();
+      let updatedTarget: OrderReturnRequestRecord;
+
+      if (input.action === 'withdraw') {
+        updatedTarget = {
+          ...target,
+          status: 'withdrawn',
+          updatedAt: now,
+          resolvedAt: now,
+        };
+        history.push({
+          status: `${input.type}_withdrawn`,
+          note: 'Customer withdrew pending request',
+          actor: 'customer',
+          at: now,
+        });
+      } else {
+        const cleanReason = (input.reason || '').trim().slice(0, 500);
+        if (cleanReason.length < 3) {
+          this.db.exec('ROLLBACK;');
+          throw new StoreHttpError(
+            400,
+            'VALIDATION_ERROR',
+            'Please provide a reason of at least 3 characters.'
+          );
+        }
+        updatedTarget = {
+          ...target,
+          reason: cleanReason,
+          updatedAt: now,
+        };
+        history.push({
+          status: `${input.type}_request_updated`,
+          note: cleanReason,
+          actor: 'customer',
+          at: now,
+        });
+      }
+
+      const nextCancelJson =
+        input.type === 'cancel'
+          ? JSON.stringify(updatedTarget)
+          : norm.cancelRequest
+            ? JSON.stringify(norm.cancelRequest)
+            : null;
+      const nextReturnJson =
+        input.type === 'return'
+          ? JSON.stringify(updatedTarget)
+          : norm.returnRequest
+            ? JSON.stringify(norm.returnRequest)
+            : null;
+
+      this.db
+        .prepare(
+          `UPDATE orders
+           SET status = ?, fulfillment_status = ?, cancel_request_json = ?, return_request_json = ?, status_history_json = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          norm.fulfillmentStatus,
+          norm.fulfillmentStatus,
+          nextCancelJson,
+          nextReturnJson,
+          JSON.stringify(history),
+          now,
+          input.orderId
+        );
+
+      this.db.exec('COMMIT;');
+      return this.getOrderById(input.orderId);
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
+  }
+
+  async updateOrderDeliveryDetails(input: {
+    orderId: string;
+    userId: string;
+    customerName?: string;
+    customerPhone?: string;
+    shippingAddress?: string;
+  }): Promise<OrderWithItems | null> {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const existing = this.db
+        .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+        .get(input.orderId) as OrderRow | undefined;
+      if (!existing) {
+        this.db.exec('ROLLBACK;');
+        return null;
+      }
+      if (existing.customer_user_id !== input.userId) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(403, 'FORBIDDEN', 'You can only edit delivery details for your own orders.');
+      }
+
+      const history = parseOrderHistory(existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.status,
+        rawFulfillmentStatus: existing.fulfillment_status,
+        rawCancelRequest: existing.cancel_request_json,
+        rawReturnRequest: existing.return_request_json,
+        history,
+        paymentMethod: existing.payment_method,
+      });
+
+      if (!PRE_CUTOFF_DELIVERY_EDIT_STATES.has(norm.fulfillmentStatus)) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          409,
+          'DELIVERY_CUTOFF_PASSED',
+          `Delivery details cannot be changed once your order is ${norm.fulfillmentStatus}.`
+        );
+      }
+
+      const cleanName =
+        typeof input.customerName === 'string' ? input.customerName.trim() : existing.customer_name.trim();
+      const cleanPhone =
+        typeof input.customerPhone === 'string' ? input.customerPhone.trim() : existing.customer_phone.trim();
+      const cleanAddress =
+        typeof input.shippingAddress === 'string'
+          ? input.shippingAddress.trim()
+          : existing.shipping_address.trim();
+      if (cleanName.length < 2 || cleanPhone.length < 6 || cleanAddress.length < 5) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          400,
+          'VALIDATION_ERROR',
+          'Please provide valid recipient name, phone number, and delivery address.'
+        );
+      }
+
+      const now = Date.now();
+      history.push({
+        status: 'delivery_updated',
+        note: 'Customer updated recipient / delivery address before dispatch',
+        actor: 'customer',
+        at: now,
+      });
+
+      this.db
+        .prepare(
+          `UPDATE orders
+           SET customer_name = ?, customer_phone = ?, shipping_address = ?, delivery_details_edited_at = ?, status_history_json = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          cleanName.slice(0, 120),
+          cleanPhone.slice(0, 32),
+          cleanAddress.slice(0, 600),
+          now,
+          JSON.stringify(history),
+          now,
+          input.orderId
+        );
+
+      this.db.exec('COMMIT;');
+      return this.getOrderById(input.orderId);
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
+  }
+
+  async hideOrderForCustomer(orderId: string, userId: string): Promise<boolean> {
+    const existing = this.db
+      .prepare(`SELECT customer_user_id FROM orders WHERE id = ? LIMIT 1`)
+      .get(orderId) as { customer_user_id: string | null } | undefined;
+    if (!existing) return false;
+    if (existing.customer_user_id !== userId) {
+      throw new StoreHttpError(403, 'FORBIDDEN', 'You can only hide orders from your own account.');
+    }
+    const now = Date.now();
     this.db
       .prepare(
-        `UPDATE orders SET return_request_json = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
+        `UPDATE orders SET hidden_by_customer = 1, hidden_at = ?, updated_at = ? WHERE id = ? AND customer_user_id = ?`
       )
-      .run(JSON.stringify(requestRecord), JSON.stringify(history), now, input.orderId);
-
-    return this.getOrderById(input.orderId);
+      .run(now, now, orderId, userId);
+    return true;
   }
 
   async resolveOrderReturnRequest(input: {
     orderId: string;
+    requestType?: 'cancel' | 'return';
     decision: 'approved' | 'rejected';
     note?: string;
   }): Promise<OrderWithItems | null> {
-    const existing = this.db
-      .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
-      .get(input.orderId) as OrderRow | undefined;
-    if (!existing || !existing.return_request_json) return null;
-
-    let reqRecord: OrderReturnRequestRecord;
+    this.db.exec('BEGIN IMMEDIATE;');
     try {
-      reqRecord = JSON.parse(existing.return_request_json) as OrderReturnRequestRecord;
-    } catch {
-      return null;
-    }
+      const existing = this.db
+        .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+        .get(input.orderId) as OrderRow | undefined;
+      if (!existing) {
+        this.db.exec('ROLLBACK;');
+        return null;
+      }
 
-    const now = Date.now();
-    reqRecord.status = input.decision;
-    reqRecord.resolvedAt = now;
-    if (input.note?.trim()) {
-      reqRecord.resolutionNote = input.note.trim().slice(0, 300);
-    }
-
-    const nextFulfillment =
-      input.decision === 'approved'
-        ? reqRecord.type === 'cancel'
-          ? 'cancelled'
-          : 'returned'
-        : existing.fulfillment_status || existing.status;
-    const nextStatus =
-      input.decision === 'approved'
-        ? reqRecord.type === 'cancel'
-          ? 'cancelled'
-          : 'returned'
-        : existing.status;
-
-    let history: OrderStatusHistoryEntry[] = [];
-    try {
-      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
-      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
-    } catch {
-      history = [];
-    }
-    history.push({
-      status: `${reqRecord.type}_${input.decision}`,
-      note: reqRecord.resolutionNote || `Request ${input.decision} by store owner`,
-      actor: 'owner',
-      at: now,
-    });
-
-    this.db
-      .prepare(
-        `UPDATE orders SET status = ?, fulfillment_status = ?, return_request_json = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
-      )
-      .run(
-        nextStatus,
-        nextFulfillment,
-        JSON.stringify(reqRecord),
-        JSON.stringify(history),
-        now,
-        input.orderId
-      );
-
-    if (existing.customer_user_id) {
-      await this.createCustomerNotification({
-        id: `notif_req_${existing.id}_${input.decision}_${now}`,
-        userId: existing.customer_user_id,
-        type: 'request_update',
-        title: `${reqRecord.type === 'cancel' ? 'Cancellation' : 'Return'} request ${input.decision}`,
-        message:
-          reqRecord.resolutionNote ||
-          `Your ${reqRecord.type} request for order ${existing.order_number} was ${input.decision}.`,
-        orderId: existing.id,
-        orderNumber: existing.order_number,
+      const history = parseOrderHistory(existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.status,
+        rawFulfillmentStatus: existing.fulfillment_status,
+        rawCancelRequest: existing.cancel_request_json,
+        rawReturnRequest: existing.return_request_json,
+        history,
+        paymentMethod: existing.payment_method,
       });
-    }
 
-    return this.getOrderById(input.orderId);
+      let target =
+        input.requestType === 'cancel'
+          ? norm.cancelRequest
+          : input.requestType === 'return'
+            ? norm.returnRequest
+            : norm.cancelRequest?.status === 'pending'
+              ? norm.cancelRequest
+              : norm.returnRequest?.status === 'pending'
+                ? norm.returnRequest
+                : norm.cancelRequest || norm.returnRequest;
+
+      if (!target) {
+        this.db.exec('ROLLBACK;');
+        return null;
+      }
+      if (target.status !== 'pending') {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          409,
+          'CONCURRENCY_CONFLICT',
+          `Cannot ${input.decision === 'approved' ? 'approve' : 'reject'} request because its status is already "${target.status}".`
+        );
+      }
+
+      const now = Date.now();
+      const updatedReq: OrderReturnRequestRecord = {
+        ...target,
+        status: input.decision,
+        updatedAt: now,
+        resolvedAt: now,
+        ...(input.note?.trim() ? { resolutionNote: input.note.trim().slice(0, 300) } : {}),
+      };
+
+      const nextFulfillment =
+        input.decision === 'approved'
+          ? updatedReq.type === 'cancel'
+            ? 'cancelled'
+            : 'returned'
+          : norm.fulfillmentStatus;
+      const nextStatus = nextFulfillment;
+
+      history.push({
+        status: `${updatedReq.type}_${input.decision}`,
+        note: updatedReq.resolutionNote || `Request ${input.decision} by store owner`,
+        actor: 'owner',
+        at: now,
+      });
+
+      let stockRestoredAt = existing.stock_restored_at ?? null;
+      if (input.decision === 'approved' && updatedReq.type === 'cancel' && !stockRestoredAt) {
+        const orderItems = this.db
+          .prepare(`SELECT product_id, variant_id, quantity FROM order_items WHERE order_id = ?`)
+          .all(input.orderId) as Array<{ product_id: string; variant_id: string | null; quantity: number }>;
+        const touchedProducts = new Set<string>();
+        for (const item of orderItems) {
+          if (item.variant_id) {
+            this.db
+              .prepare(`UPDATE product_variants SET stock_qty = stock_qty + ? WHERE id = ?`)
+              .run(Number(item.quantity || 0), item.variant_id);
+          }
+          touchedProducts.add(item.product_id);
+        }
+        for (const pid of touchedProducts) {
+          const sumRow = this.db
+            .prepare(`SELECT COALESCE(SUM(stock_qty), 0) AS total FROM product_variants WHERE product_id = ?`)
+            .get(pid) as { total: number } | undefined;
+          if (sumRow) {
+            this.db
+              .prepare(`UPDATE products SET stock_qty = ?, updated_at = ? WHERE id = ?`)
+              .run(sumRow.total, now, pid);
+          }
+        }
+        stockRestoredAt = now;
+      }
+
+      const nextCancelJson =
+        updatedReq.type === 'cancel'
+          ? JSON.stringify(updatedReq)
+          : norm.cancelRequest
+            ? JSON.stringify(norm.cancelRequest)
+            : null;
+      const nextReturnJson =
+        updatedReq.type === 'return'
+          ? JSON.stringify(updatedReq)
+          : norm.returnRequest
+            ? JSON.stringify(norm.returnRequest)
+            : null;
+
+      this.db
+        .prepare(
+          `UPDATE orders
+           SET status = ?, fulfillment_status = ?, cancel_request_json = ?, return_request_json = ?,
+               stock_restored_at = ?, status_history_json = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          nextStatus,
+          nextFulfillment,
+          nextCancelJson,
+          nextReturnJson,
+          stockRestoredAt,
+          JSON.stringify(history),
+          now,
+          input.orderId
+        );
+
+      this.db.exec('COMMIT;');
+
+      if (existing.customer_user_id) {
+        const customerRow = await this.getUserById(existing.customer_user_id);
+        const prefs = parseNotificationPrefs(customerRow?.notification_prefs_json);
+        if (prefs.cancelReturnUpdates) {
+          await this.createCustomerNotification({
+            id: `notif_req_${existing.id}_${updatedReq.id}_${input.decision}`,
+            userId: existing.customer_user_id,
+            type: 'request_update',
+            title: `${updatedReq.type === 'cancel' ? 'Cancellation' : 'Return'} request ${input.decision}`,
+            message:
+              updatedReq.resolutionNote ||
+              `Your ${updatedReq.type} request for order ${existing.order_number} was ${input.decision}.`,
+            orderId: existing.id,
+            orderNumber: existing.order_number,
+          });
+        }
+      }
+
+      return this.getOrderById(input.orderId);
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
   }
 
   async collectOrderPayment(input: {
@@ -2130,6 +2656,87 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     return res.changes > 0;
   }
 
+  async listCustomerPaymentMethods(userId: string): Promise<CustomerPaymentMethodRow[]> {
+    return this.db
+      .prepare(
+        `SELECT * FROM customer_payment_methods WHERE user_id = ? ORDER BY updated_at DESC`
+      )
+      .all(userId) as unknown as CustomerPaymentMethodRow[];
+  }
+
+  async upsertCustomerPaymentMethod(
+    userId: string,
+    input: {
+      id?: string;
+      methodType: 'card' | 'upi' | 'wallet';
+      label: string;
+      last4?: string | null;
+      network?: string | null;
+      expiry?: string | null;
+    }
+  ): Promise<CustomerPaymentMethodRow> {
+    const validated = validateNonSensitivePaymentMethodInput(input);
+    if (!validated.ok) {
+      throw new StoreHttpError(400, 'VALIDATION_ERROR', validated.error);
+    }
+    const now = Date.now();
+    const id =
+      input.id && /^[a-zA-Z0-9_-]{3,80}$/.test(input.id)
+        ? input.id
+        : `pm_${crypto.randomUUID().slice(0, 12)}`;
+    const existing = this.db
+      .prepare(`SELECT id FROM customer_payment_methods WHERE id = ? AND user_id = ? LIMIT 1`)
+      .get(id, userId) as { id: string } | undefined;
+
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE customer_payment_methods
+           SET method_type = ?, label = ?, last4 = ?, network = ?, expiry = ?, updated_at = ?
+           WHERE id = ? AND user_id = ?`
+        )
+        .run(
+          validated.methodType,
+          validated.label,
+          validated.last4,
+          validated.network,
+          validated.expiry,
+          now,
+          id,
+          userId
+        );
+    } else {
+      this.db
+        .prepare(
+          `INSERT INTO customer_payment_methods (
+            id, user_id, method_type, label, last4, network, expiry, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          id,
+          userId,
+          validated.methodType,
+          validated.label,
+          validated.last4,
+          validated.network,
+          validated.expiry,
+          now,
+          now
+        );
+    }
+
+    return this.db
+      .prepare(`SELECT * FROM customer_payment_methods WHERE id = ? LIMIT 1`)
+      .get(id) as unknown as CustomerPaymentMethodRow;
+  }
+
+  async deleteCustomerPaymentMethod(userId: string, methodId: string): Promise<boolean> {
+    const res = this.db
+      .prepare(`DELETE FROM customer_payment_methods WHERE id = ? AND user_id = ?`)
+      .run(methodId, userId);
+    return res.changes > 0;
+  }
+
   async markAllCustomerNotificationsRead(userId: string): Promise<void> {
     const now = Date.now();
     this.db
@@ -2137,6 +2744,13 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
         `UPDATE customer_notifications SET is_read = 1, read_at = ? WHERE user_id = ? AND is_read = 0`
       )
       .run(now, userId);
+  }
+
+  async deleteCustomerNotification(userId: string, notificationId: string): Promise<boolean> {
+    const res = this.db
+      .prepare(`DELETE FROM customer_notifications WHERE id = ? AND user_id = ?`)
+      .run(notificationId, userId);
+    return res.changes > 0;
   }
 
   async listCoupons(activeOnly = false): Promise<CouponRow[]> {
@@ -2345,21 +2959,35 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
   async listUsersSummary(): Promise<StoreUserSummary[]> {
     const rows = this.db
       .prepare(
-        `SELECT id, full_name, email, email_verified, created_at FROM users WHERE email_verified = 1 ORDER BY created_at DESC LIMIT 100`
+        `SELECT id, full_name, email, email_verified, phone_e164, notification_prefs_json, created_at, updated_at
+         FROM users WHERE email_verified = 1 AND deleted_at IS NULL
+         ORDER BY created_at DESC LIMIT 100`
       )
       .all() as Array<{
       id: string;
       full_name: string;
       email: string | null;
       email_verified: number;
+      phone_e164: string | null;
+      notification_prefs_json: string | null;
       created_at: number;
+      updated_at: number;
     }>;
+
+    const addrStmt = this.db.prepare(
+      `SELECT * FROM customer_addresses WHERE user_id = ? ORDER BY is_default DESC, updated_at DESC`
+    );
+
     return rows.map((r) => ({
       id: r.id,
       fullName: r.full_name,
       email: r.email || '',
       emailVerified: Boolean(r.email_verified),
+      phone: r.phone_e164 || null,
+      notificationPrefs: parseNotificationPrefs(r.notification_prefs_json),
+      addresses: addrStmt.all(r.id) as unknown as CustomerAddressRow[],
       createdAt: r.created_at,
+      updatedAt: r.updated_at,
     }));
   }
 

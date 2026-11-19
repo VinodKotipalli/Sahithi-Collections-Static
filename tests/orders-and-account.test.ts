@@ -554,6 +554,20 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
       )
     );
 
+    // Advance to delivered before customer submits a return request
+    const deliverPatchRes = await jsonReq<{
+      order: { fulfillmentStatus: string };
+    }>(
+      baseUrl,
+      ownerCreds.jar,
+      'PATCH',
+      `/api/admin/orders/${encodeURIComponent(verifyResA.data.order.id)}/status`,
+      { status: 'delivered', note: 'Delivered to bridal boutique reception' },
+      ownerCsrf
+    );
+    assert.equal(deliverPatchRes.status, 200);
+    assert.equal(deliverPatchRes.data.order.fulfillmentStatus, 'delivered');
+
     // Customer A submits a return request -> Owner resolves it -> Notification delivered
     const returnReqA = await jsonReq<{
       order: { status: string; returnRequest: { type: string; status: string } | null };

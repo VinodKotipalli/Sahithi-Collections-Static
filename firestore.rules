@@ -109,7 +109,10 @@ service cloud.firestore {
           'status_history', 'status_history_json',
           'subtotal_paise', 'discount_paise', 'gift_card_paise', 'total_paise',
           'coupon_code', 'gift_card_code', 'currency', 'created_at', 'updated_at',
-          'product_ids', 'items', 'return_request', 'return_request_json'
+          'product_ids', 'items',
+          'cancel_request', 'cancel_request_json',
+          'return_request', 'return_request_json',
+          'hidden_by_customer', 'hidden_at', 'stock_restored_at', 'delivery_details_edited_at'
         ])
         && data.id == orderId
         && data.order_number is string && data.order_number.size() >= 4 && data.order_number.size() <= 64
@@ -128,13 +131,21 @@ service cloud.firestore {
         && data.items is list && data.items.size() >= 1 && data.items.size() <= 50;
     }
 
+    function currentOrderFulfillment(data) {
+      return ('fulfillment_status' in data && data.fulfillment_status is string)
+        ? data.fulfillment_status
+        : data.status;
+    }
+
     function isValidEnvironmentUser(data, userId) {
       return data.keys().hasAll(['id', 'full_name', 'email', 'email_verified', 'created_at', 'updated_at'])
-        && data.keys().hasOnly(['id', 'full_name', 'email', 'email_verified', 'phone_e164', 'phone_verified', 'created_at', 'updated_at'])
+        && data.keys().hasOnly(['id', 'full_name', 'email', 'email_verified', 'phone_e164', 'phone_verified', 'notification_prefs', 'notification_prefs_json', 'deleted_at', 'created_at', 'updated_at'])
         && data.id == userId
         && data.full_name is string && data.full_name.size() >= 2 && data.full_name.size() <= 100
         && data.email is string && data.email.size() >= 5 && data.email.size() <= 254
         && data.email_verified is bool
+        && (!('phone_e164' in data) || data.phone_e164 == null || (data.phone_e164 is string && data.phone_e164.size() <= 32))
+        && (!('notification_prefs_json' in data) || data.notification_prefs_json == null || (data.notification_prefs_json is string && data.notification_prefs_json.size() <= 2000))
         && data.created_at is number && data.updated_at is number;
     }
 
@@ -150,6 +161,18 @@ service cloud.firestore {
         && data.pincode is string && data.pincode.size() >= 4 && data.pincode.size() <= 16
         && data.label in ['Home', 'Work', 'Other']
         && data.is_default is bool
+        && data.created_at is number && data.updated_at is number;
+    }
+
+    function isValidCustomerPaymentMethod(data, methodId) {
+      return data.keys().hasAll(['id', 'method_type', 'label', 'created_at', 'updated_at'])
+        && data.keys().hasOnly(['id', 'method_type', 'label', 'last4', 'network', 'expiry', 'created_at', 'updated_at'])
+        && data.id == methodId
+        && data.method_type in ['card', 'upi', 'wallet']
+        && data.label is string && data.label.size() >= 2 && data.label.size() <= 80
+        && (!('last4' in data) || data.last4 == null || (data.last4 is string && data.last4.matches('^[0-9]{4}$')))
+        && (!('network' in data) || data.network == null || (data.network is string && data.network.size() <= 32))
+        && (!('expiry' in data) || data.expiry == null || (data.expiry is string && data.expiry.size() <= 16))
         && data.created_at is number && data.updated_at is number;
     }
 
@@ -220,16 +243,69 @@ service cloud.firestore {
           && (
             (
               isOwner()
-              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'fulfillment_status', 'payment_status', 'payment_collected_at', 'payment_collected_by', 'status_history', 'status_history_json', 'return_request', 'return_request_json', 'updated_at'])
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'status', 'fulfillment_status', 'payment_status', 'payment_collected_at', 'payment_collected_by',
+                'status_history', 'status_history_json',
+                'cancel_request', 'cancel_request_json',
+                'return_request', 'return_request_json',
+                'stock_restored_at', 'updated_at'
+              ])
               && request.resource.data.status in ['pending', 'placed', 'confirmed', 'packed', 'shipped', 'delivered', 'cancelled', 'return_requested', 'returned']
             )
             || (
               isSignedIn()
               && resource.data.customer_user_id == request.auth.uid
-              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['return_request', 'return_request_json', 'status', 'fulfillment_status', 'status_history', 'status_history_json', 'updated_at'])
-              && request.resource.data.return_request.status == 'pending'
-              && request.resource.data.status == 'return_requested'
-              && request.resource.data.fulfillment_status == 'return_requested'
+              && (
+                (
+                  request.resource.data.diff(resource.data).affectedKeys().hasOnly(['cancel_request', 'cancel_request_json', 'status_history', 'status_history_json', 'updated_at'])
+                  && (
+                    currentOrderFulfillment(resource.data) in ['pending', 'placed', 'confirmed', 'packed']
+                    || (
+                      currentOrderFulfillment(resource.data) == 'return_requested'
+                      && 'return_request' in resource.data
+                      && resource.data.return_request is map
+                      && resource.data.return_request.type == 'cancel'
+                    )
+                  )
+                  && request.resource.data.cancel_request is map
+                  && request.resource.data.cancel_request.status in ['pending', 'withdrawn']
+                  && request.resource.data.cancel_request.reason is string
+                  && request.resource.data.cancel_request.reason.size() >= 3
+                  && request.resource.data.cancel_request.reason.size() <= 500
+                )
+                || (
+                  request.resource.data.diff(resource.data).affectedKeys().hasOnly(['return_request', 'return_request_json', 'status_history', 'status_history_json', 'updated_at'])
+                  && (
+                    currentOrderFulfillment(resource.data) == 'delivered'
+                    || (
+                      currentOrderFulfillment(resource.data) == 'return_requested'
+                      && (!('return_request' in resource.data) || !(resource.data.return_request is map) || resource.data.return_request.type != 'cancel')
+                    )
+                  )
+                  && request.resource.data.return_request is map
+                  && request.resource.data.return_request.status in ['pending', 'withdrawn']
+                  && request.resource.data.return_request.reason is string
+                  && request.resource.data.return_request.reason.size() >= 3
+                  && request.resource.data.return_request.reason.size() <= 500
+                )
+                || (
+                  request.resource.data.diff(resource.data).affectedKeys().hasOnly(['customer_name', 'customer_phone', 'shipping_address', 'delivery_details_edited_at', 'status_history', 'status_history_json', 'updated_at'])
+                  && currentOrderFulfillment(resource.data) in ['pending', 'placed', 'confirmed']
+                  && request.resource.data.customer_name is string && request.resource.data.customer_name.size() >= 2 && request.resource.data.customer_name.size() <= 120
+                  && request.resource.data.customer_phone is string && request.resource.data.customer_phone.size() >= 6 && request.resource.data.customer_phone.size() <= 32
+                  && request.resource.data.shipping_address is string && request.resource.data.shipping_address.size() >= 5 && request.resource.data.shipping_address.size() <= 600
+                )
+                || (
+                  request.resource.data.diff(resource.data).affectedKeys().hasOnly(['hidden_by_customer', 'hidden_at', 'updated_at'])
+                  && request.resource.data.hidden_by_customer == true
+                  && request.resource.data.hidden_at is number
+                )
+                || (
+                  request.resource.data.diff(resource.data).affectedKeys().hasOnly(['customer_user_id', 'updated_at'])
+                  && request.resource.data.customer_user_id == null
+                  && request.resource.data.updated_at is number
+                )
+              )
             )
           );
         allow delete: if false;
@@ -272,18 +348,47 @@ service cloud.firestore {
       match /users/{userId} {
         allow get: if isValidEnv(envKey) && isValidId(userId) && (isOwner() || (isSignedIn() && request.auth.uid == userId));
         allow list: if isValidEnv(envKey) && isOwner();
-        allow create, update: if isValidEnv(envKey)
+        allow create: if isValidEnv(envKey)
           && isValidId(userId)
           && isSignedIn()
           && request.auth.token.email_verified == true
           && (request.auth.uid == userId || isOwner())
           && isValidEnvironmentUser(request.resource.data, userId);
-        allow delete: if isValidEnv(envKey) && isOwner() && isValidId(userId);
+        allow update: if isValidEnv(envKey)
+          && isValidId(userId)
+          && isSignedIn()
+          && request.auth.token.email_verified == true
+          && (
+            isOwner()
+            || (
+              request.auth.uid == userId
+              && request.resource.data.email == resource.data.email
+              && request.resource.data.email_verified == resource.data.email_verified
+            )
+          )
+          && isValidEnvironmentUser(request.resource.data, userId);
+        allow delete: if isValidEnv(envKey)
+          && isValidId(userId)
+          && (
+            isOwner()
+            || (
+              isSignedIn()
+              && request.auth.token.email_verified == true
+              && request.auth.uid == userId
+              && request.auth.token.email != 'saivinodkotipalli2003@gmail.com'
+            )
+          );
 
         match /addresses/{addressId} {
-          allow get, list: if isValidEnv(envKey) && isSignedIn() && request.auth.uid == userId;
+          allow get, list: if isValidEnv(envKey) && (isOwner() || (isSignedIn() && request.auth.uid == userId));
           allow create, update: if isValidEnv(envKey) && isSignedIn() && request.auth.uid == userId && isValidId(addressId) && isValidCustomerAddress(request.resource.data, addressId);
           allow delete: if isValidEnv(envKey) && isSignedIn() && request.auth.uid == userId && isValidId(addressId);
+        }
+
+        match /payment_methods/{methodId} {
+          allow get, list: if isValidEnv(envKey) && (isOwner() || (isSignedIn() && request.auth.uid == userId));
+          allow create, update: if isValidEnv(envKey) && isSignedIn() && request.auth.uid == userId && isValidId(methodId) && isValidCustomerPaymentMethod(request.resource.data, methodId);
+          allow delete: if isValidEnv(envKey) && isSignedIn() && request.auth.uid == userId && isValidId(methodId);
         }
 
         match /wishlist/{itemId} {

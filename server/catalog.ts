@@ -29,6 +29,7 @@ import {
   type CouponRow,
   type CustomerAddressRow,
   type CustomerNotificationRow,
+  type CustomerPaymentMethodRow,
   type GiftCardRow,
   type LoyaltyConfigData,
   type OrderWithItems,
@@ -40,6 +41,10 @@ import {
   type StorefrontContentData,
   type UserRow,
 } from './store.ts';
+import {
+  normalizeOrderRequestsAndStatus,
+  parseOrderHistory,
+} from './order-utils.ts';
 import { FirestoreRestStore } from './firebase-rest.ts';
 import {
   mergeSiteSettings,
@@ -341,14 +346,18 @@ function serializeCategory(cat: CategoryRow) {
 }
 
 function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
-  const statusHistory = parseJsonSafe<unknown[]>(o.status_history_json || '', []);
-  const returnRequest = parseJsonSafe<unknown | null>(o.return_request_json || '', null);
+  const statusHistory = parseOrderHistory(o.status_history_json);
+  const norm = normalizeOrderRequestsAndStatus({
+    rawStatus: o.status,
+    rawFulfillmentStatus: o.fulfillment_status,
+    rawCancelRequest: o.cancel_request_json,
+    rawReturnRequest: o.return_request_json,
+    history: statusHistory,
+    paymentMethod: o.payment_method,
+  });
   const paymentMethod: 'razorpay' | 'cod' =
     (o.payment_method as 'razorpay' | 'cod') || (o.razorpay_order_id ? 'razorpay' : 'cod');
   const paymentStatus = o.payment_status || (o.razorpay_payment_id ? 'paid' : 'unpaid');
-  const fulfillmentStatus =
-    o.fulfillment_status ||
-    (o.status === 'paid' ? 'confirmed' : o.status === 'pending' ? 'placed' : o.status);
 
   return {
     id: o.id,
@@ -358,9 +367,9 @@ function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
     customerEmail: o.customer_email,
     customerPhone: o.customer_phone,
     shippingAddress: o.shipping_address,
-    status: o.status,
+    status: norm.status,
     paymentStatus,
-    fulfillmentStatus,
+    fulfillmentStatus: norm.fulfillmentStatus,
     paymentMethod,
     razorpayOrderId: o.razorpay_order_id ?? null,
     razorpayPaymentId: o.razorpay_payment_id ?? null,
@@ -375,8 +384,15 @@ function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
     subtotal: Number((o.subtotal_paise / 100).toFixed(2)),
     total: Number((o.total_paise / 100).toFixed(2)),
     currency: o.currency,
-    statusHistory: Array.isArray(statusHistory) ? statusHistory : [],
-    returnRequest: returnRequest && typeof returnRequest === 'object' ? returnRequest : null,
+    statusHistory,
+    cancelRequest: norm.cancelRequest,
+    returnRequest: norm.returnRequest,
+    hiddenByCustomer: Boolean(o.hidden_by_customer),
+    hiddenAt: o.hidden_at ?? null,
+    deliveryDetailsEditedAt: o.delivery_details_edited_at ?? null,
+    stockRestoredAt: o.stock_restored_at ?? null,
+    needsAdminReview: norm.needsAdminReview,
+    legacyCollisionNote: norm.legacyCollisionNote,
     createdAt: o.created_at,
     updatedAt: o.updated_at ?? o.created_at,
     items: items.map((it) => ({
@@ -458,6 +474,19 @@ function serializeCustomerNotification(n: CustomerNotificationRow) {
     read: Boolean(n.is_read),
     readAt: n.read_at,
     createdAt: n.created_at,
+  };
+}
+
+function serializeCustomerPaymentMethod(m: CustomerPaymentMethodRow) {
+  return {
+    id: m.id,
+    methodType: m.method_type,
+    label: m.label,
+    last4: m.last4,
+    network: m.network,
+    expiry: m.expiry,
+    createdAt: m.created_at,
+    updatedAt: m.updated_at,
   };
 }
 
@@ -1673,15 +1702,86 @@ export function registerCatalogAndAdminRoutes(params: {
             'Request type must be "cancel" or "return".'
           );
         }
-        if (reason.length < 5 || reason.length > 500) {
+        if (reason.length < 3 || reason.length > 500) {
           return sendJsonError(
             req,
             res,
             400,
             'VALIDATION_ERROR',
-            'Please provide a reason between 5 and 500 characters.'
+            'Please provide a reason between 3 and 500 characters.'
           );
         }
+        const updated = await store.submitOrderRequest({
+          orderId,
+          userId: req.authUser!.id,
+          type: reqType,
+          reason,
+        });
+        if (!updated) {
+          return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
+        }
+        return res.json({ order: serializeOrderWithItems(updated) });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.patch(
+    '/api/account/orders/:id/request',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const orderId = String(req.params.id || '');
+        const reqType = req.body?.type === 'cancel' ? 'cancel' : req.body?.type === 'return' ? 'return' : null;
+        const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+        if (!reqType) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Request type must be "cancel" or "return".'
+          );
+        }
+        if (reason.length < 3 || reason.length > 500) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Please provide a reason between 3 and 500 characters.'
+          );
+        }
+        const updated = await store.updateOrderRequest({
+          orderId,
+          userId: req.authUser!.id,
+          type: reqType,
+          action: 'edit',
+          reason,
+        });
+        if (!updated) {
+          return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
+        }
+        return res.json({ order: serializeOrderWithItems(updated) });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  const handleWithdrawOrderRequest = async (
+    req: AuthedCatalogRequest,
+    res: Response,
+    next: NextFunction
+  ) => {
+    try {
+      const orderId = String(req.params.id || '');
+      const rawType = req.body?.type ?? req.query?.type;
+      let reqType: 'cancel' | 'return' | null =
+        rawType === 'cancel' ? 'cancel' : rawType === 'return' ? 'return' : null;
+
+      if (!reqType) {
         const existing = await store.getOrderById(orderId);
         if (!existing) {
           return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
@@ -1692,19 +1792,96 @@ export function registerCatalogAndAdminRoutes(params: {
             res,
             403,
             'FORBIDDEN',
-            'You can only submit requests for your own orders.'
+            'You can only withdraw requests on your own orders.'
           );
         }
-        const updated = await store.submitOrderReturnRequest({
+        const norm = normalizeOrderRequestsAndStatus({
+          rawStatus: existing.order.status,
+          rawFulfillmentStatus: existing.order.fulfillment_status,
+          rawCancelRequest: existing.order.cancel_request_json,
+          rawReturnRequest: existing.order.return_request_json,
+          history: parseOrderHistory(existing.order.status_history_json),
+          paymentMethod: existing.order.payment_method,
+        });
+        reqType =
+          norm.cancelRequest?.status === 'pending'
+            ? 'cancel'
+            : norm.returnRequest?.status === 'pending'
+              ? 'return'
+              : null;
+      }
+
+      if (!reqType) {
+        return sendJsonError(
+          req,
+          res,
+          404,
+          'REQUEST_NOT_FOUND',
+          'No active pending cancellation or return request found on this order.'
+        );
+      }
+
+      const updated = await store.updateOrderRequest({
+        orderId,
+        userId: req.authUser!.id,
+        type: reqType,
+        action: 'withdraw',
+      });
+      if (!updated) {
+        return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
+      }
+      return res.json({ order: serializeOrderWithItems(updated) });
+    } catch (err) {
+      return next(err);
+    }
+  };
+
+  app.post('/api/account/orders/:id/request/withdraw', requireCustomerAuth, handleWithdrawOrderRequest);
+  app.delete('/api/account/orders/:id/request', requireCustomerAuth, handleWithdrawOrderRequest);
+
+  app.patch(
+    '/api/account/orders/:id/delivery',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const orderId = String(req.params.id || '');
+        const customerName =
+          typeof req.body?.customerName === 'string' ? req.body.customerName.trim() : undefined;
+        const customerPhone =
+          typeof req.body?.customerPhone === 'string' ? req.body.customerPhone.trim() : undefined;
+        const shippingAddress =
+          typeof req.body?.shippingAddress === 'string'
+            ? req.body.shippingAddress.trim()
+            : undefined;
+
+        const updated = await store.updateOrderDeliveryDetails({
           orderId,
           userId: req.authUser!.id,
-          type: reqType,
-          reason,
+          customerName,
+          customerPhone,
+          shippingAddress,
         });
         if (!updated) {
           return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
         }
         return res.json({ order: serializeOrderWithItems(updated) });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/account/orders/:id/hide',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const orderId = String(req.params.id || '');
+        const hidden = await store.hideOrderForCustomer(orderId, req.authUser!.id);
+        if (!hidden) {
+          return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
+        }
+        return res.json({ ok: true, hiddenOrderId: orderId });
       } catch (err) {
         return next(err);
       }
@@ -1883,6 +2060,29 @@ export function registerCatalogAndAdminRoutes(params: {
     }
   );
 
+  app.delete(
+    '/api/account/notifications/:id',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const id = String(req.params.id || '');
+        const deleted = await store.deleteCustomerNotification(req.authUser!.id, id);
+        if (!deleted) {
+          return sendJsonError(
+            req,
+            res,
+            404,
+            'NOTIFICATION_NOT_FOUND',
+            'Notification not found.'
+          );
+        }
+        return res.json({ ok: true, deletedId: id });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
   app.get(
     '/api/account/coupons',
     requireCustomerAuth,
@@ -1954,19 +2154,71 @@ export function registerCatalogAndAdminRoutes(params: {
   app.get(
     '/api/account/payment-methods',
     requireCustomerAuth,
-    async (_req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
       try {
         const tokenizationEnabled =
           process.env.RAZORPAY_TOKENIZATION_ENABLED === 'true' ||
           process.env.RAZORPAY_CUSTOMER_VAULT_ENABLED === 'true';
+        const rows = await store.listCustomerPaymentMethods(req.authUser!.id);
         return res.json({
           enabled: tokenizationEnabled,
           provider: 'razorpay',
           reason: tokenizationEnabled
             ? 'Razorpay Customer Vault tokenization is enabled on this merchant account. All card entry stays inside PCI-compliant Razorpay Checkout.'
-            : 'Saved card tokenization is pending merchant activation of Razorpay Customer Vault / TokenHQ. All UPI, Credit & Debit Cards, Wallets, and NetBanking options remain available inside Razorpay Checkout.',
-          methods: [],
+            : 'Full card entry stays inside PCI-compliant Razorpay Checkout. You can save non-sensitive card/UPI labels below for quick reference.',
+          methods: rows.map((m) => serializeCustomerPaymentMethod(m)),
         });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  const handleSavePaymentMethod = async (
+    req: AuthedCatalogRequest,
+    res: Response,
+    next: NextFunction,
+    fixedId?: string
+  ) => {
+    try {
+      const saved = await store.upsertCustomerPaymentMethod(req.authUser!.id, {
+        id: fixedId || (typeof req.body?.id === 'string' ? req.body.id.trim() : undefined),
+        methodType: req.body?.methodType,
+        label: req.body?.label,
+        last4: req.body?.last4,
+        network: req.body?.network,
+        expiry: req.body?.expiry,
+      });
+      return res.json({ method: serializeCustomerPaymentMethod(saved) });
+    } catch (err) {
+      return next(err);
+    }
+  };
+
+  app.post('/api/account/payment-methods', requireCustomerAuth, (req, res, next) =>
+    handleSavePaymentMethod(req, res, next)
+  );
+  app.put('/api/account/payment-methods/:id', requireCustomerAuth, (req, res, next) =>
+    handleSavePaymentMethod(req, res, next, String(req.params.id || ''))
+  );
+
+  app.delete(
+    '/api/account/payment-methods/:id',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const id = String(req.params.id || '');
+        const deleted = await store.deleteCustomerPaymentMethod(req.authUser!.id, id);
+        if (!deleted) {
+          return sendJsonError(
+            req,
+            res,
+            404,
+            'PAYMENT_METHOD_NOT_FOUND',
+            'Saved payment method was not found.'
+          );
+        }
+        return res.json({ ok: true, deletedId: id });
       } catch (err) {
         return next(err);
       }
@@ -2914,11 +3166,18 @@ export function registerCatalogAndAdminRoutes(params: {
             'Decision must be "approved" or "rejected".'
           );
         }
+        const requestType =
+          req.body?.requestType === 'cancel'
+            ? 'cancel'
+            : req.body?.requestType === 'return'
+              ? 'return'
+              : undefined;
         const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
         const resolved = await store.resolveOrderReturnRequest({
           orderId: id,
           decision,
           note: note || undefined,
+          requestType,
         });
         if (!resolved) {
           return sendJsonError(
@@ -3268,13 +3527,15 @@ export function registerCatalogAndAdminRoutes(params: {
             status: serialized.fulfillmentStatus,
             createdAt: serialized.createdAt,
           });
-          if (serialized.returnRequest) {
-            const rr = serialized.returnRequest as {
+          for (const rrCandidate of [serialized.cancelRequest, serialized.returnRequest]) {
+            if (!rrCandidate) continue;
+            const rr = rrCandidate as {
               id?: string;
               type?: string;
               reason?: string;
               status?: string;
               requestedAt?: number;
+              updatedAt?: number;
             };
             returnRequests.push({
               orderId: serialized.id,
@@ -3285,14 +3546,14 @@ export function registerCatalogAndAdminRoutes(params: {
               request: rr,
             });
             events.push({
-              id: `ret_${rr.id || serialized.id}`,
+              id: `ret_${rr.id || serialized.id}_${rr.type || 'req'}`,
               type: 'return_request',
               title: `${rr.type === 'cancel' ? 'Cancellation' : 'Return'} Request (${serialized.orderNumber})`,
               detail: rr.reason || '',
               actorLabel: serialized.customerEmail,
               refId: serialized.id,
               status: rr.status || 'pending',
-              createdAt: rr.requestedAt || serialized.updatedAt,
+              createdAt: rr.updatedAt || rr.requestedAt || serialized.updatedAt,
             });
           }
           if (serialized.couponCode) {

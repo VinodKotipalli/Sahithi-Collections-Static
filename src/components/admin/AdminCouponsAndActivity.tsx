@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { Gift, Loader2, Plus, RefreshCw, ShieldCheck, Tag, Trash2, Users } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import type {
+  AdminCustomerAccountSummary,
   BoutiqueCoupon,
   BoutiqueGiftCard,
   LoyaltyConfig,
@@ -26,9 +27,7 @@ export function AdminCouponsAndActivity({
   const [giftCards, setGiftCards] = useState<BoutiqueGiftCard[]>([]);
   const [loyalty, setLoyalty] = useState<LoyaltyConfig | null>(null);
   const [events, setEvents] = useState<StoreActivityEvent[]>([]);
-  const [customers, setCustomers] = useState<
-    Array<{ id: string; fullName: string; email: string; emailVerified: boolean; createdAt: number }>
-  >([]);
+  const [customers, setCustomers] = useState<AdminCustomerAccountSummary[]>([]);
   const [loading, setLoading] = useState(true);
 
   // Coupon creation state
@@ -59,13 +58,7 @@ export function AdminCouponsAndActivity({
       apiRequest<{ config: LoyaltyConfig }>('/api/admin/loyalty'),
       apiRequest<{
         events: StoreActivityEvent[];
-        users: Array<{
-          id: string;
-          fullName: string;
-          email: string;
-          emailVerified: boolean;
-          createdAt: number;
-        }>;
+        users: AdminCustomerAccountSummary[];
       }>('/api/admin/activity'),
     ]);
     setLoading(false);
@@ -616,17 +609,58 @@ export function AdminCouponsAndActivity({
             <p className="py-8 text-center text-xs text-[#242124]/65">No customer accounts yet.</p>
           ) : (
             <ul className="divide-y divide-[#49243E]/10">
-              {customers.map((c) => (
-                <li key={c.id} className="flex items-center justify-between gap-2 py-2.5 text-xs">
-                  <div className="min-w-0">
-                    <p className="truncate font-semibold text-[#49243E]">{c.fullName}</p>
-                    <p className="truncate text-[#242124]/65">{c.email}</p>
-                  </div>
-                  <span className="shrink-0 tabular-nums text-[11px] text-[#242124]/55">
-                    {c.emailVerified ? 'Verified' : 'Unverified'}
-                  </span>
-                </li>
-              ))}
+              {customers.map((c) => {
+                const prefs = c.notificationPrefs;
+                const addrs = Array.isArray(c.addresses) ? c.addresses : [];
+                return (
+                  <li key={c.id} className="space-y-2 py-3 text-xs">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="truncate font-semibold text-[#49243E]">{c.fullName}</p>
+                        <p className="truncate text-[#242124]/65">{c.email}</p>
+                        {c.phone && (
+                          <p className="truncate text-[11px] font-medium text-[#49243E]/85 tabular-nums">
+                            {c.phone}
+                          </p>
+                        )}
+                      </div>
+                      <div className="shrink-0 text-right tabular-nums text-[11px] text-[#242124]/55">
+                        <p>{c.emailVerified ? 'Verified' : 'Unverified'}</p>
+                        {c.updatedAt && <p>Updated {formatTimestamp(c.updatedAt)}</p>}
+                      </div>
+                    </div>
+
+                    {prefs && (
+                      <p className="text-[11px] text-[#242124]/65">
+                        Prefs:{' '}
+                        {[
+                          prefs.orderUpdates ? 'Orders' : 'Orders Off',
+                          prefs.cancelReturnUpdates ? 'Cancel/Return' : 'Cancel/Return Off',
+                          prefs.promotions ? 'Promos On' : 'Promos Off',
+                        ].join(' · ')}
+                      </p>
+                    )}
+
+                    {addrs.length > 0 && (
+                      <div className="rounded-xl border border-[#49243E]/10 bg-[#FFF9F5]/80 p-2.5 space-y-1">
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-[#B76E79]">
+                          Saved Addresses ({addrs.length})
+                        </p>
+                        {addrs.map((addr) => (
+                          <p key={addr.id} className="text-[11px] leading-snug text-[#242124]/80">
+                            <strong className="text-[#49243E]">
+                              {addr.label}
+                              {addr.isDefault ? ' (Default)' : ''}:
+                            </strong>{' '}
+                            {addr.fullName} · {addr.line1}, {addr.city}, {addr.state} - {addr.pincode}{' '}
+                            ({addr.phone})
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           )}
         </section>

@@ -7,6 +7,7 @@ import type {
   CouponRow,
   CustomerAddressRow,
   CustomerNotificationRow,
+  CustomerPaymentMethodRow,
   EmailTokenRow,
   GiftCardRow,
   LegacyPhoneOnlyAccount,
@@ -25,6 +26,7 @@ import type {
   UserRow,
 } from './db.ts';
 import type { LoyaltyConfigData } from './storefront-defaults.ts';
+import type { NotificationPreferencesData } from './order-utils.ts';
 import type { RuntimeTargetEnv, StorageBackend } from './env.ts';
 
 export type {
@@ -35,10 +37,12 @@ export type {
   CouponRow,
   CustomerAddressRow,
   CustomerNotificationRow,
+  CustomerPaymentMethodRow,
   EmailTokenRow,
   GiftCardRow,
   LegacyPhoneOnlyAccount,
   LoyaltyConfigData,
+  NotificationPreferencesData,
   OrderItemRow,
   OrderRow,
   PendingCheckoutRow,
@@ -119,8 +123,9 @@ export interface OrderReturnRequestRecord {
   id: string;
   type: 'cancel' | 'return';
   reason: string;
-  status: 'pending' | 'approved' | 'rejected';
+  status: 'pending' | 'approved' | 'rejected' | 'withdrawn';
   requestedAt: number;
+  updatedAt?: number;
   resolvedAt?: number | null;
   resolutionNote?: string;
 }
@@ -158,7 +163,11 @@ export interface StoreUserSummary {
   fullName: string;
   email: string;
   emailVerified: boolean;
+  phone?: string | null;
+  notificationPrefs?: NotificationPreferencesData;
+  addresses?: CustomerAddressRow[];
   createdAt: number;
+  updatedAt?: number;
 }
 
 export class StoreHttpError extends Error {
@@ -212,6 +221,19 @@ export interface BoutiqueStore {
   markUserEmailVerified(userId: string, now: number): Promise<UserRow>;
   linkVerifiedEmailToUser(userId: string, newEmail: string, now: number): Promise<UserRow>;
   updateUserFullName(userId: string, fullName: string, now: number): Promise<UserRow>;
+  updateCustomerProfile(
+    userId: string,
+    input: {
+      fullName?: string;
+      phone?: string | null;
+      notificationPrefs?: NotificationPreferencesData;
+    },
+    now: number
+  ): Promise<UserRow>;
+  deleteCustomerAccount(
+    userId: string,
+    now: number
+  ): Promise<{ deleted: boolean; preservedOrdersCount: number }>;
   updateUserPasswordHash(userId: string, passwordHash: string, now: number): Promise<void>;
   listLegacyPhoneOnlyAccounts(): Promise<LegacyPhoneOnlyAccount[]>;
 
@@ -369,8 +391,30 @@ export interface BoutiqueStore {
     type: 'cancel' | 'return';
     reason: string;
   }): Promise<OrderWithItems | null>;
+  submitOrderRequest(input: {
+    orderId: string;
+    userId: string;
+    type: 'cancel' | 'return';
+    reason: string;
+  }): Promise<OrderWithItems | null>;
+  updateOrderRequest(input: {
+    orderId: string;
+    userId: string;
+    type: 'cancel' | 'return';
+    action: 'edit' | 'withdraw';
+    reason?: string;
+  }): Promise<OrderWithItems | null>;
+  updateOrderDeliveryDetails(input: {
+    orderId: string;
+    userId: string;
+    customerName?: string;
+    customerPhone?: string;
+    shippingAddress?: string;
+  }): Promise<OrderWithItems | null>;
+  hideOrderForCustomer(orderId: string, userId: string): Promise<boolean>;
   resolveOrderReturnRequest(input: {
     orderId: string;
+    requestType?: 'cancel' | 'return';
     decision: 'approved' | 'rejected';
     note?: string;
   }): Promise<OrderWithItems | null>;
@@ -380,7 +424,7 @@ export interface BoutiqueStore {
     note?: string;
   }): Promise<OrderWithItems | null>;
 
-  // Customer account preferences, addresses, wishlist, notifications, rewards
+  // Customer account preferences, addresses, payment methods, wishlist, notifications, rewards
   listCustomerAddresses(userId: string): Promise<CustomerAddressRow[]>;
   upsertCustomerAddress(
     userId: string,
@@ -399,6 +443,19 @@ export interface BoutiqueStore {
     }
   ): Promise<CustomerAddressRow>;
   deleteCustomerAddress(userId: string, addressId: string): Promise<boolean>;
+  listCustomerPaymentMethods(userId: string): Promise<CustomerPaymentMethodRow[]>;
+  upsertCustomerPaymentMethod(
+    userId: string,
+    input: {
+      id?: string;
+      methodType: 'card' | 'upi' | 'wallet';
+      label: string;
+      last4?: string | null;
+      network?: string | null;
+      expiry?: string | null;
+    }
+  ): Promise<CustomerPaymentMethodRow>;
+  deleteCustomerPaymentMethod(userId: string, methodId: string): Promise<boolean>;
   getCustomerWishlist(userId: string): Promise<string[]>;
   setCustomerWishlist(userId: string, productIds: string[]): Promise<string[]>;
   listCustomerNotifications(userId: string): Promise<CustomerNotificationRow[]>;
@@ -413,6 +470,7 @@ export interface BoutiqueStore {
   }): Promise<CustomerNotificationRow>;
   markCustomerNotificationRead(userId: string, notificationId: string): Promise<boolean>;
   markAllCustomerNotificationsRead(userId: string): Promise<void>;
+  deleteCustomerNotification(userId: string, notificationId: string): Promise<boolean>;
 
   // Coupons, gift cards & loyalty
   listCoupons(activeOnly?: boolean): Promise<CouponRow[]>;

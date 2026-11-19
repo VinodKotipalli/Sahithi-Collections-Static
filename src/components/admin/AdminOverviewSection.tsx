@@ -268,7 +268,11 @@ export function AdminOverviewSection({
                         </span>
                       </p>
                       <p className="mt-0.5 truncate tabular-nums text-[#242124]/60">
-                        {payLabel} · Fulfillment {ful} · {formatTimestamp(order.createdAt)}
+                        {payLabel} · Fulfillment {ful}
+                        {order.cancelRequest?.status === 'pending' ? ' · Cancel requested' : ''}
+                        {order.returnRequest?.status === 'pending' ? ' · Return requested' : ''}
+                        {' · '}
+                        {formatTimestamp(order.createdAt)}
                       </p>
                     </div>
                     <span className="shrink-0 font-semibold tabular-nums text-[#49243E]">

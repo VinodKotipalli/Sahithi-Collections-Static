@@ -30,6 +30,7 @@ import {
   FirebaseAuthApiError,
   firebaseConfirmPasswordResetOobCode,
   firebaseConfirmVerifyEmailOobCode,
+  firebaseDeleteAccount,
   firebaseRefreshIdToken,
   firebaseSendPasswordReset,
   firebaseSendVerifyEmail,
@@ -48,6 +49,7 @@ import {
 } from './firebase-rest.ts';
 import { SqliteBoutiqueStore } from './sqlite-store.ts';
 import { StoreHttpError, type AdminBindingRow, type BoutiqueStore } from './store.ts';
+import { parseNotificationPrefs } from './order-utils.ts';
 import type { RazorpayClientFactory } from './razorpay-checkout.ts';
 
 const SESSION_COOKIE_NAME = 'sc_session';
@@ -182,6 +184,8 @@ function serializePublicUser(user: UserRow, session: SessionRow, isOwner = false
     id: user.id,
     fullName: user.full_name,
     email: user.email,
+    phone: user.phone_e164 || null,
+    notificationPrefs: parseNotificationPrefs(user.notification_prefs_json),
     emailVerified: Boolean(user.email_verified),
     hasPassword: Boolean(user.password_hash),
     isOwner: Boolean(isOwner),
@@ -697,6 +701,8 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
             password_hash: 'firebase-managed',
             phone_e164: null,
             phone_verified: 0,
+            notification_prefs_json: null,
+            deleted_at: null,
             created_at: claims.authTimeMs || Date.now(),
             updated_at: Date.now(),
           };
@@ -1907,8 +1913,13 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     requireAuth,
     async (req: AuthedRequest, res: Response, next: NextFunction) => {
       try {
-        const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim() : '';
-        if (fullName.length < 2 || fullName.length > 100) {
+        const currentUser = req.authUser!;
+        const hasFullName = req.body?.fullName !== undefined;
+        const fullName =
+          typeof req.body?.fullName === 'string'
+            ? req.body.fullName.trim()
+            : currentUser.full_name;
+        if (hasFullName && (fullName.length < 2 || fullName.length > 100)) {
           return sendError(
             req,
             res,
@@ -1918,8 +1929,58 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
           );
         }
 
-        const updated = await store.updateUserFullName(req.authUser!.id, fullName, Date.now());
-        if (restStore && req.fbEnvelope) {
+        let nextPhone: string | null | undefined = undefined;
+        if (req.body?.phone !== undefined) {
+          if (req.body.phone === null || String(req.body.phone).trim() === '') {
+            nextPhone = null;
+          } else {
+            const rawPhone = String(req.body.phone).trim();
+            const digits = rawPhone.replace(/[\s()-]/g, '');
+            if (!/^\+?[0-9]{7,15}$/.test(digits)) {
+              return sendError(
+                req,
+                res,
+                400,
+                'VALIDATION_ERROR',
+                'Please enter a valid phone number (7–15 digits) or leave it blank.'
+              );
+            }
+            nextPhone = rawPhone.slice(0, 24);
+          }
+        }
+
+        let nextPrefs = undefined;
+        if (req.body?.notificationPrefs !== undefined) {
+          if (
+            !req.body.notificationPrefs ||
+            typeof req.body.notificationPrefs !== 'object' ||
+            Array.isArray(req.body.notificationPrefs)
+          ) {
+            return sendError(
+              req,
+              res,
+              400,
+              'VALIDATION_ERROR',
+              'Invalid notification preferences format.'
+            );
+          }
+          const currentPrefs = parseNotificationPrefs(currentUser.notification_prefs_json);
+          nextPrefs = parseNotificationPrefs({
+            ...currentPrefs,
+            ...(req.body.notificationPrefs as Record<string, unknown>),
+          });
+        }
+
+        const updated = await store.updateCustomerProfile(
+          currentUser.id,
+          {
+            fullName: hasFullName ? fullName : undefined,
+            phone: nextPhone,
+            notificationPrefs: nextPrefs,
+          },
+          Date.now()
+        );
+        if (restStore && req.fbEnvelope && hasFullName && fullName !== currentUser.full_name) {
           await firebaseUpdateDisplayName(
             restStore.config.apiKey,
             req.fbEnvelope.idToken,
@@ -1929,6 +1990,63 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
         const isOwner = await resolveIsBoundOwner(updated);
         return res.json({
           user: serializePublicUser(updated, req.authSession!, isOwner),
+        });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.delete(
+    '/api/account/profile',
+    requireRecentReauth,
+    async (req: AuthedRequest, res: Response, next: NextFunction) => {
+      try {
+        const user = req.authUser!;
+        const isOwner = await resolveIsBoundOwner(user);
+        if (
+          isOwner ||
+          (restStore && (user.email || '').toLowerCase() === restStore.ownerEmail)
+        ) {
+          return sendError(
+            req,
+            res,
+            403,
+            'OWNER_ACCOUNT_PROTECTED',
+            'The verified store owner account cannot be deleted from customer settings.'
+          );
+        }
+
+        const confirmText =
+          typeof req.body?.confirmText === 'string' ? req.body.confirmText.trim() : '';
+        if (confirmText !== 'DELETE') {
+          return sendError(
+            req,
+            res,
+            400,
+            'CONFIRMATION_REQUIRED',
+            'Type DELETE to confirm permanent account deletion.'
+          );
+        }
+
+        const now = Date.now();
+        await store.deleteCustomerAccount(user.id, now);
+
+        if (restStore && req.fbEnvelope) {
+          await firebaseDeleteAccount(restStore.config.apiKey, req.fbEnvelope.idToken).catch(
+            () => undefined
+          );
+          markFirebaseSessionRevoked(req.fbEnvelope, now);
+          revokedFirebaseUsersBefore.set(user.id, now + 1);
+          setActiveFirestoreIdToken(undefined);
+        }
+
+        const nextCsrf = rotateGuestCsrfCookie(req, res);
+        return res.json({
+          ok: true,
+          deletedUserId: user.id,
+          csrfToken: nextCsrf,
+          message: 'Your account and saved personal data have been permanently deleted.',
         });
       } catch (err) {
         return next(err);

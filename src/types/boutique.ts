@@ -83,6 +83,7 @@ export interface BagValidationResult {
 
 export type OrderPaymentStatus = 'unpaid' | 'pending' | 'paid' | 'failed' | 'refunded';
 export type OrderFulfillmentStatus =
+  | 'pending'
   | 'placed'
   | 'confirmed'
   | 'packed'
@@ -99,14 +100,25 @@ export interface OrderStatusHistoryEntry {
   at: number;
 }
 
+export type OrderRequestStatus = 'pending' | 'approved' | 'rejected' | 'withdrawn';
+
 export interface OrderReturnRequest {
   id: string;
   type: 'cancel' | 'return';
   reason: string;
-  status: 'pending' | 'approved' | 'rejected';
+  status: OrderRequestStatus;
   requestedAt: number;
+  updatedAt?: number;
   resolvedAt?: number | null;
   resolutionNote?: string;
+}
+
+export interface NotificationPreferences {
+  orderUpdates: boolean;
+  cancelReturnUpdates: boolean;
+  promotions: boolean;
+  emailEnabled: boolean;
+  smsWhatsappEnabled: boolean;
 }
 
 export interface PlacedOrderReceipt {
@@ -135,7 +147,14 @@ export interface PlacedOrderReceipt {
   idempotencyKey?: string | null;
   razorpayOrderId?: string | null;
   razorpayPaymentId?: string | null;
+  cancelRequest?: OrderReturnRequest | null;
   returnRequest?: OrderReturnRequest | null;
+  hiddenByCustomer?: boolean;
+  hiddenAt?: number | null;
+  deliveryDetailsEditedAt?: number | null;
+  stockRestoredAt?: number | null;
+  needsAdminReview?: boolean;
+  legacyCollisionNote?: string | null;
   items: Array<{
     productId: string;
     variantId: string;
@@ -230,18 +249,22 @@ export interface CustomerRewardsSummary {
   plusProgressPaise: number;
 }
 
+export interface CustomerPaymentMethod {
+  id: string;
+  methodType: 'card' | 'upi' | 'wallet';
+  label: string;
+  last4?: string;
+  network?: string;
+  expiry?: string;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
 export interface SavedPaymentMethodsSummary {
   enabled: boolean;
   provider: 'razorpay';
   reason: string;
-  methods: Array<{
-    id: string;
-    methodType: 'card' | 'upi' | 'wallet';
-    label: string;
-    last4?: string;
-    network?: string;
-    expiry?: string;
-  }>;
+  methods: CustomerPaymentMethod[];
 }
 
 export interface StoreActivityEvent {
@@ -330,7 +353,14 @@ export interface AdminOrder {
   totalPaise: number;
   currency: string;
   statusHistory?: OrderStatusHistoryEntry[];
+  cancelRequest?: OrderReturnRequest | null;
   returnRequest?: OrderReturnRequest | null;
+  hiddenByCustomer?: boolean;
+  hiddenAt?: number | null;
+  deliveryDetailsEditedAt?: number | null;
+  stockRestoredAt?: number | null;
+  needsAdminReview?: boolean;
+  legacyCollisionNote?: string | null;
   createdAt: number;
   updatedAt?: number;
   items: Array<{
@@ -344,6 +374,18 @@ export interface AdminOrder {
     quantity: number;
     lineTotalPaise: number;
   }>;
+}
+
+export interface AdminCustomerAccountSummary {
+  id: string;
+  fullName: string;
+  email: string;
+  emailVerified: boolean;
+  phone?: string | null;
+  notificationPrefs?: NotificationPreferences;
+  addresses?: CustomerAddress[];
+  createdAt: number;
+  updatedAt?: number;
 }
 
 export type ContactMessageStatus = 'unread' | 'read' | 'replied' | 'archived';

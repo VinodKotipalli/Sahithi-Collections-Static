@@ -29,6 +29,8 @@ export interface UserRow {
   // Preserved on existing records for legacy/contact continuity; never used for authentication
   phone_e164: string | null;
   phone_verified: number;
+  notification_prefs_json?: string | null;
+  deleted_at?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -160,7 +162,12 @@ export interface OrderRow {
   discount_paise?: number;
   gift_card_paise?: number;
   status_history_json?: string;
+  cancel_request_json?: string | null;
   return_request_json?: string | null;
+  hidden_by_customer?: number;
+  hidden_at?: number | null;
+  stock_restored_at?: number | null;
+  delivery_details_edited_at?: number | null;
   idempotency_key?: string | null;
   payment_collected_at?: number | null;
   payment_collected_by?: string | null;
@@ -219,6 +226,18 @@ export interface CustomerAddressRow {
   landmark: string;
   label: 'Home' | 'Work' | 'Other';
   is_default: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CustomerPaymentMethodRow {
+  id: string;
+  user_id: string;
+  method_type: 'card' | 'upi' | 'wallet';
+  label: string;
+  last4: string | null;
+  network: string | null;
+  expiry: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -534,6 +553,18 @@ export function initAuthDatabase(
       created_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS customer_payment_methods (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      method_type TEXT NOT NULL CHECK (method_type IN ('card', 'upi', 'wallet')),
+      label TEXT NOT NULL,
+      last4 TEXT,
+      network TEXT,
+      expiry TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS coupons (
       id TEXT PRIMARY KEY,
       code TEXT NOT NULL UNIQUE,
@@ -574,10 +605,22 @@ export function initAuthDatabase(
     CREATE INDEX IF NOT EXISTS idx_audit_created_at ON product_audit_logs(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_order_items_product_id ON order_items(product_id);
     CREATE INDEX IF NOT EXISTS idx_customer_addresses_user ON customer_addresses(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_customer_payment_methods_user ON customer_payment_methods(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_customer_notif_user ON customer_notifications(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_categories_position ON categories(position ASC, created_at ASC);
     CREATE INDEX IF NOT EXISTS idx_contact_messages_status_created ON contact_messages(status, created_at DESC);
   `);
+
+  const userCols = (
+    db.prepare(`PRAGMA table_info(users)`).all() as Array<{ name: string }>
+  ).map((c) => c.name);
+  const ensureUserCol = (name: string, ddl: string) => {
+    if (!userCols.includes(name)) {
+      db.exec(`ALTER TABLE users ADD COLUMN ${ddl};`);
+    }
+  };
+  ensureUserCol('notification_prefs_json', `notification_prefs_json TEXT`);
+  ensureUserCol('deleted_at', `deleted_at INTEGER`);
 
   const orderCols = (
     db.prepare(`PRAGMA table_info(orders)`).all() as Array<{ name: string }>
@@ -598,7 +641,12 @@ export function initAuthDatabase(
   ensureOrderCol('discount_paise', `discount_paise INTEGER NOT NULL DEFAULT 0`);
   ensureOrderCol('gift_card_paise', `gift_card_paise INTEGER NOT NULL DEFAULT 0`);
   ensureOrderCol('status_history_json', `status_history_json TEXT NOT NULL DEFAULT '[]'`);
+  ensureOrderCol('cancel_request_json', `cancel_request_json TEXT`);
   ensureOrderCol('return_request_json', `return_request_json TEXT`);
+  ensureOrderCol('hidden_by_customer', `hidden_by_customer INTEGER NOT NULL DEFAULT 0`);
+  ensureOrderCol('hidden_at', `hidden_at INTEGER`);
+  ensureOrderCol('stock_restored_at', `stock_restored_at INTEGER`);
+  ensureOrderCol('delivery_details_edited_at', `delivery_details_edited_at INTEGER`);
   ensureOrderCol('idempotency_key', `idempotency_key TEXT`);
   ensureOrderCol('payment_collected_at', `payment_collected_at INTEGER`);
   ensureOrderCol('payment_collected_by', `payment_collected_by TEXT`);

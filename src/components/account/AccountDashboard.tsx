@@ -49,13 +49,36 @@ import type {
   BoutiqueGiftCard,
   CustomerAddress,
   CustomerNotification,
+  CustomerPaymentMethod,
   CustomerRewardsSummary,
+  NotificationPreferences,
+  OrderReturnRequest,
   PlacedOrderReceipt,
   Product,
   SavedPaymentMethodsSummary,
 } from '../../types/boutique';
 import { formatINR, formatPaiseINR, formatTimestamp } from '../../utils/format';
 import { BoutiqueImage } from '../BoutiqueImage';
+
+const DEFAULT_NOTIFICATION_PREFS: NotificationPreferences = {
+  orderUpdates: true,
+  cancelReturnUpdates: true,
+  promotions: false,
+  emailEnabled: true,
+  smsWhatsappEnabled: false,
+};
+
+function emitBoutiqueSync(topic: 'orders' | 'account'): void {
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      const channel = new BroadcastChannel('sahithi-boutique-sync');
+      channel.postMessage({ topic, at: Date.now() });
+      channel.close();
+    }
+  } catch {
+    // Ignore if BroadcastChannel is unavailable
+  }
+}
 
 export type { AccountSectionId };
 
@@ -100,7 +123,8 @@ export function AccountDashboard({
     user,
     capabilities,
     apiRequest,
-    updateProfileName,
+    updateProfile,
+    deleteAccount,
     reauthenticateWithPassword,
     changePassword,
     requestLinkEmail,
@@ -108,6 +132,7 @@ export function AccountDashboard({
   } = useAuth();
 
   const nameId = useId();
+  const phoneId = useId();
   const reauthPassId = useId();
   const linkEmailId = useId();
   const newPassId = useId();
@@ -131,10 +156,20 @@ export function AccountDashboard({
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const navButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
-  // Profile name & security
+  // Profile name, phone, notification preferences & security
   const [fullName, setFullName] = useState(user?.fullName || '');
-  const [nameSaving, setNameSaving] = useState(false);
+  const [phone, setPhone] = useState(user?.phone || '');
+  const [notifPrefs, setNotifPrefs] = useState<NotificationPreferences>(
+    user?.notificationPrefs || DEFAULT_NOTIFICATION_PREFS
+  );
+  const [profileSaving, setProfileSaving] = useState(false);
   const [nameFeedback, setNameFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  // Account deletion confirmation modal
+  const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
+  const [deleteConfirmInput, setDeleteConfirmInput] = useState('');
+  const [deleteAccountBusy, setDeleteAccountBusy] = useState(false);
+  const [deleteAccountError, setDeleteAccountError] = useState<string | null>(null);
 
   const [reauthPassword, setReauthPassword] = useState('');
   const [showReauthPassword, setShowReauthPassword] = useState(false);
@@ -151,15 +186,35 @@ export function AccountDashboard({
   const [passSubmitting, setPassSubmitting] = useState(false);
   const [passFeedback, setPassFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
-  // Orders
+  // Orders & Customer Order Actions
   const [orders, setOrders] = useState<PlacedOrderReceipt[]>([]);
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [ordersError, setOrdersError] = useState<string | null>(null);
   const [requestOrderId, setRequestOrderId] = useState<string | null>(null);
   const [requestType, setRequestType] = useState<'cancel' | 'return'>('return');
+  const [requestMode, setRequestMode] = useState<'create' | 'edit'>('create');
   const [requestReason, setRequestReason] = useState('');
   const [requestBusy, setRequestBusy] = useState(false);
   const [requestFeedback, setRequestFeedback] = useState<{ orderId: string; type: 'ok' | 'err'; text: string } | null>(null);
+
+  // Delivery details inline edit state
+  const [deliveryEditOrderId, setDeliveryEditOrderId] = useState<string | null>(null);
+  const [deliveryForm, setDeliveryForm] = useState({
+    customerName: '',
+    customerPhone: '',
+    shippingAddress: '',
+  });
+  const [deliverySaving, setDeliverySaving] = useState(false);
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
+
+  // Withdraw / Hide confirmation dialogs
+  const [withdrawCandidate, setWithdrawCandidate] = useState<{
+    order: PlacedOrderReceipt;
+    req: OrderReturnRequest;
+  } | null>(null);
+  const [withdrawBusy, setWithdrawBusy] = useState(false);
+  const [hideOrderCandidate, setHideOrderCandidate] = useState<PlacedOrderReceipt | null>(null);
+  const [hideOrderBusy, setHideOrderBusy] = useState(false);
 
   // Coupons
   const [coupons, setCoupons] = useState<BoutiqueCoupon[]>([]);
@@ -175,6 +230,28 @@ export function AccountDashboard({
   // Payment Methods
   const [paymentSummary, setPaymentSummary] = useState<SavedPaymentMethodsSummary | null>(null);
   const [paymentLoading, setPaymentLoading] = useState(false);
+  const [paymentError, setPaymentError] = useState<string | null>(null);
+  const [paymentFeedback, setPaymentFeedback] = useState<string | null>(null);
+  const [paymentFormOpen, setPaymentFormOpen] = useState(false);
+  const [paymentForm, setPaymentForm] = useState<{
+    id: string;
+    methodType: 'card' | 'upi' | 'wallet';
+    label: string;
+    last4: string;
+    network: string;
+    expiry: string;
+  }>({
+    id: '',
+    methodType: 'card',
+    label: '',
+    last4: '',
+    network: '',
+    expiry: '',
+  });
+  const [paymentSaving, setPaymentSaving] = useState(false);
+  const [deletePaymentCandidate, setDeletePaymentCandidate] =
+    useState<CustomerPaymentMethod | null>(null);
+  const [deletePaymentBusy, setDeletePaymentBusy] = useState(false);
 
   // Addresses
   const [addresses, setAddresses] = useState<CustomerAddress[]>([]);
@@ -183,6 +260,8 @@ export function AccountDashboard({
   const [addressFormOpen, setAddressFormOpen] = useState(false);
   const [addressForm, setAddressForm] = useState(EMPTY_ADDRESS_FORM);
   const [addressSaving, setAddressSaving] = useState(false);
+  const [deleteAddressCandidate, setDeleteAddressCandidate] = useState<CustomerAddress | null>(null);
+  const [deleteAddressBusy, setDeleteAddressBusy] = useState(false);
 
   // Wishlist action notice
   const [movedProductId, setMovedProductId] = useState<string | null>(null);
@@ -198,28 +277,45 @@ export function AccountDashboard({
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [notificationsLoading, setNotificationsLoading] = useState(false);
   const [notificationsError, setNotificationsError] = useState<string | null>(null);
+  const [deleteNotifCandidate, setDeleteNotifCandidate] = useState<CustomerNotification | null>(null);
+  const [deleteNotifBusy, setDeleteNotifBusy] = useState(false);
 
   // Logout
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
 
+  const syncedUserIdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (user?.fullName !== undefined) {
-      setFullName(user.fullName);
-    }
-  }, [user?.fullName]);
-
-  const loadOrders = useCallback(async () => {
-    setOrdersLoading(true);
-    setOrdersError(null);
-    const res = await apiRequest<{ items?: PlacedOrderReceipt[] }>('/api/account/orders');
-    setOrdersLoading(false);
-    if (!res.ok) {
-      setOrdersError(res.error);
+    if (!user) {
+      syncedUserIdRef.current = null;
       return;
     }
-    setOrders(Array.isArray(res.data.items) ? res.data.items : []);
-  }, [apiRequest]);
+    if (syncedUserIdRef.current !== user.id) {
+      syncedUserIdRef.current = user.id;
+      setFullName(user.fullName || '');
+      setPhone(user.phone || '');
+      setNotifPrefs(user.notificationPrefs || DEFAULT_NOTIFICATION_PREFS);
+    }
+  }, [user]);
+
+  const loadOrders = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!options?.silent) {
+        setOrdersLoading(true);
+        setOrdersError(null);
+      }
+      const res = await apiRequest<{ items?: PlacedOrderReceipt[] }>('/api/account/orders');
+      if (!options?.silent) {
+        setOrdersLoading(false);
+      }
+      if (!res.ok) {
+        if (!options?.silent) setOrdersError(res.error);
+        return;
+      }
+      setOrders(Array.isArray(res.data.items) ? res.data.items : []);
+    },
+    [apiRequest]
+  );
 
   const loadCoupons = useCallback(async () => {
     setCouponsLoading(true);
@@ -245,47 +341,71 @@ export function AccountDashboard({
     setRewards(res.data);
   }, [apiRequest]);
 
-  const loadPaymentMethods = useCallback(async () => {
-    setPaymentLoading(true);
-    const res = await apiRequest<SavedPaymentMethodsSummary>('/api/account/payment-methods');
-    setPaymentLoading(false);
-    if (res.ok) {
-      setPaymentSummary(res.data);
-    }
-  }, [apiRequest]);
+  const loadPaymentMethods = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!options?.silent) {
+        setPaymentLoading(true);
+        setPaymentError(null);
+      }
+      const res = await apiRequest<SavedPaymentMethodsSummary>('/api/account/payment-methods');
+      if (!options?.silent) {
+        setPaymentLoading(false);
+      }
+      if (res.ok) {
+        setPaymentSummary(res.data);
+      } else if (!options?.silent) {
+        setPaymentError(res.error);
+      }
+    },
+    [apiRequest]
+  );
 
-  const loadAddresses = useCallback(async () => {
-    setAddressesLoading(true);
-    setAddressesError(null);
-    const res = await apiRequest<{ items?: CustomerAddress[] }>('/api/account/addresses');
-    setAddressesLoading(false);
-    if (!res.ok) {
-      setAddressesError(res.error);
-      return;
-    }
-    setAddresses(Array.isArray(res.data.items) ? res.data.items : []);
-  }, [apiRequest]);
+  const loadAddresses = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!options?.silent) {
+        setAddressesLoading(true);
+        setAddressesError(null);
+      }
+      const res = await apiRequest<{ items?: CustomerAddress[] }>('/api/account/addresses');
+      if (!options?.silent) {
+        setAddressesLoading(false);
+      }
+      if (!res.ok) {
+        if (!options?.silent) setAddressesError(res.error);
+        return;
+      }
+      setAddresses(Array.isArray(res.data.items) ? res.data.items : []);
+    },
+    [apiRequest]
+  );
 
-  const loadNotifications = useCallback(async () => {
-    setNotificationsLoading(true);
-    setNotificationsError(null);
-    const res = await apiRequest<{ items?: CustomerNotification[]; unreadCount?: number }>(
-      '/api/account/notifications'
-    );
-    setNotificationsLoading(false);
-    if (!res.ok) {
-      setNotificationsError(res.error);
-      return;
-    }
-    const items = Array.isArray(res.data.items) ? res.data.items : [];
-    setNotifications(items);
-    setUnreadNotifications(
-      typeof res.data.unreadCount === 'number'
-        ? res.data.unreadCount
-        : items.filter((n) => !n.read).length
-    );
-    window.dispatchEvent(new Event('sahithi:notifications-updated'));
-  }, [apiRequest]);
+  const loadNotifications = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!options?.silent) {
+        setNotificationsLoading(true);
+        setNotificationsError(null);
+      }
+      const res = await apiRequest<{ items?: CustomerNotification[]; unreadCount?: number }>(
+        '/api/account/notifications'
+      );
+      if (!options?.silent) {
+        setNotificationsLoading(false);
+      }
+      if (!res.ok) {
+        if (!options?.silent) setNotificationsError(res.error);
+        return;
+      }
+      const items = Array.isArray(res.data.items) ? res.data.items : [];
+      setNotifications(items);
+      setUnreadNotifications(
+        typeof res.data.unreadCount === 'number'
+          ? res.data.unreadCount
+          : items.filter((n) => !n.read).length
+      );
+      window.dispatchEvent(new Event('sahithi:notifications-updated'));
+    },
+    [apiRequest]
+  );
 
   useEffect(() => {
     if (!user) return;
@@ -311,28 +431,114 @@ export function AccountDashboard({
     loadNotifications,
   ]);
 
+  // Live background sync (polling every 6s + focus + visibilitychange + BroadcastChannel)
+  useEffect(() => {
+    if (!user) return;
+
+    const refreshActiveSilently = (topic?: string) => {
+      if (document.visibilityState === 'hidden') return;
+      void loadNotifications({ silent: true });
+      if (activeSection === 'orders' || topic === 'orders') {
+        void loadOrders({ silent: true });
+      }
+      if (activeSection === 'addresses' || topic === 'account') {
+        void loadAddresses({ silent: true });
+      }
+      if (activeSection === 'payments' || topic === 'account') {
+        void loadPaymentMethods({ silent: true });
+      }
+    };
+
+    const intervalId = window.setInterval(() => refreshActiveSilently(), 6000);
+    const onFocus = () => refreshActiveSilently();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') refreshActiveSilently();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+
+    let channel: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        channel = new BroadcastChannel('sahithi-boutique-sync');
+        channel.onmessage = (ev: MessageEvent<{ topic?: string }>) => {
+          refreshActiveSilently(ev.data?.topic);
+        };
+      }
+    } catch {
+      channel = null;
+    }
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+      channel?.close();
+    };
+  }, [user, activeSection, loadOrders, loadNotifications, loadAddresses, loadPaymentMethods]);
+
   if (!user) {
     return null;
   }
 
   const reauthActive = user.recentReauthValid;
 
-  const handleSaveName = async (e: FormEvent) => {
+  const handleSaveProfile = async (e: FormEvent) => {
     e.preventDefault();
+    if (profileSaving) return;
     setNameFeedback(null);
     const clean = fullName.trim();
     if (clean.length < 2) {
       setNameFeedback({ type: 'err', text: 'Full name must be at least 2 characters.' });
       return;
     }
-    setNameSaving(true);
-    const res = await updateProfileName(clean);
-    setNameSaving(false);
+    const cleanPhone = phone.trim();
+    setProfileSaving(true);
+    const res = await updateProfile({
+      fullName: clean,
+      phone: cleanPhone || null,
+      notificationPrefs: notifPrefs,
+    });
+    setProfileSaving(false);
     if (!res.ok) {
       setNameFeedback({ type: 'err', text: res.error });
       return;
     }
-    setNameFeedback({ type: 'ok', text: 'Profile name updated.' });
+    setFullName(res.data.user.fullName);
+    setPhone(res.data.user.phone || '');
+    if (res.data.user.notificationPrefs) {
+      setNotifPrefs(res.data.user.notificationPrefs);
+    }
+    emitBoutiqueSync('account');
+    setNameFeedback({
+      type: 'ok',
+      text: 'Profile details and notification preferences saved.',
+    });
+  };
+
+  const handleConfirmDeleteAccount = async (e: FormEvent) => {
+    e.preventDefault();
+    if (deleteAccountBusy) return;
+    setDeleteAccountError(null);
+    if (deleteConfirmInput.trim().toUpperCase() !== 'DELETE') {
+      setDeleteAccountError('Type DELETE in uppercase to confirm permanent account deletion.');
+      return;
+    }
+    setDeleteAccountBusy(true);
+    const res = await deleteAccount('DELETE');
+    setDeleteAccountBusy(false);
+    if (!res.ok) {
+      setDeleteAccountError(res.error);
+      return;
+    }
+    setDeleteAccountOpen(false);
+    setOrders([]);
+    setAddresses([]);
+    setNotifications([]);
+    setPaymentSummary(null);
+    emitBoutiqueSync('account');
+    window.dispatchEvent(new Event('sahithi:notifications-updated'));
+    onNavigate('/', { replace: true });
   };
 
   const handleReauthPassword = async (e: FormEvent) => {
@@ -414,7 +620,7 @@ export function AccountDashboard({
     const res = await apiRequest<{ order: PlacedOrderReceipt }>(
       `/api/account/orders/${encodeURIComponent(orderId)}/request`,
       {
-        method: 'POST',
+        method: requestMode === 'edit' ? 'PATCH' : 'POST',
         body: JSON.stringify({
           type: requestType,
           reason: requestReason.trim(),
@@ -429,11 +635,92 @@ export function AccountDashboard({
     setOrders((prev) => prev.map((o) => (o.id === orderId ? res.data.order : o)));
     setRequestOrderId(null);
     setRequestReason('');
+    emitBoutiqueSync('orders');
     setRequestFeedback({
       orderId,
       type: 'ok',
-      text: `${requestType === 'cancel' ? 'Cancellation' : 'Return'} request submitted to the boutique.`,
+      text:
+        requestMode === 'edit'
+          ? `${requestType === 'cancel' ? 'Cancellation' : 'Return'} reason updated.`
+          : `${requestType === 'cancel' ? 'Cancellation' : 'Return'} request submitted to the boutique.`,
     });
+  };
+
+  const handleConfirmWithdrawRequest = async () => {
+    if (!withdrawCandidate || withdrawBusy) return;
+    const { order, req } = withdrawCandidate;
+    setWithdrawBusy(true);
+    setRequestFeedback(null);
+    const res = await apiRequest<{ order: PlacedOrderReceipt }>(
+      `/api/account/orders/${encodeURIComponent(order.id)}/request/withdraw`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ type: req.type }),
+      }
+    );
+    setWithdrawBusy(false);
+    setWithdrawCandidate(null);
+    if (!res.ok) {
+      setRequestFeedback({ orderId: order.id, type: 'err', text: res.error });
+      return;
+    }
+    setOrders((prev) => prev.map((o) => (o.id === order.id ? res.data.order : o)));
+    emitBoutiqueSync('orders');
+    setRequestFeedback({
+      orderId: order.id,
+      type: 'ok',
+      text: `${req.type === 'cancel' ? 'Cancellation' : 'Return'} request withdrawn.`,
+    });
+  };
+
+  const handleSaveDeliveryDetails = async (e: FormEvent, orderId: string) => {
+    e.preventDefault();
+    if (deliverySaving) return;
+    setDeliveryError(null);
+    setDeliverySaving(true);
+    const res = await apiRequest<{ order: PlacedOrderReceipt }>(
+      `/api/account/orders/${encodeURIComponent(orderId)}/delivery`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({
+          customerName: deliveryForm.customerName.trim(),
+          customerPhone: deliveryForm.customerPhone.trim(),
+          shippingAddress: deliveryForm.shippingAddress.trim(),
+        }),
+      }
+    );
+    setDeliverySaving(false);
+    if (!res.ok) {
+      setDeliveryError(res.error);
+      return;
+    }
+    setOrders((prev) => prev.map((o) => (o.id === orderId ? res.data.order : o)));
+    setDeliveryEditOrderId(null);
+    emitBoutiqueSync('orders');
+    setRequestFeedback({
+      orderId,
+      type: 'ok',
+      text: 'Delivery details updated for this order.',
+    });
+  };
+
+  const handleConfirmHideOrder = async () => {
+    if (!hideOrderCandidate || hideOrderBusy) return;
+    const target = hideOrderCandidate;
+    setHideOrderBusy(true);
+    setOrdersError(null);
+    const res = await apiRequest<{ ok: boolean }>(
+      `/api/account/orders/${encodeURIComponent(target.id)}/hide`,
+      { method: 'POST', body: JSON.stringify({}) }
+    );
+    setHideOrderBusy(false);
+    setHideOrderCandidate(null);
+    if (!res.ok) {
+      setOrdersError(res.error);
+      return;
+    }
+    setOrders((prev) => prev.filter((o) => o.id !== target.id));
+    emitBoutiqueSync('orders');
   };
 
   const handleSaveAddress = async (e: FormEvent) => {
@@ -456,19 +743,26 @@ export function AccountDashboard({
     }
     setAddressFormOpen(false);
     setAddressForm(EMPTY_ADDRESS_FORM);
+    emitBoutiqueSync('account');
     await loadAddresses();
   };
 
-  const handleDeleteAddress = async (addrId: string) => {
+  const handleConfirmDeleteAddress = async () => {
+    if (!deleteAddressCandidate || deleteAddressBusy) return;
+    const target = deleteAddressCandidate;
+    setDeleteAddressBusy(true);
     setAddressesError(null);
     const res = await apiRequest<{ ok: boolean }>(
-      `/api/account/addresses/${encodeURIComponent(addrId)}`,
+      `/api/account/addresses/${encodeURIComponent(target.id)}`,
       { method: 'DELETE' }
     );
+    setDeleteAddressBusy(false);
+    setDeleteAddressCandidate(null);
     if (!res.ok) {
       setAddressesError(res.error);
       return;
     }
+    emitBoutiqueSync('account');
     await loadAddresses();
   };
 
@@ -485,7 +779,61 @@ export function AccountDashboard({
       setAddressesError(res.error);
       return;
     }
+    emitBoutiqueSync('account');
     await loadAddresses();
+  };
+
+  const handleSavePaymentMethod = async (e: FormEvent) => {
+    e.preventDefault();
+    if (paymentSaving) return;
+    setPaymentError(null);
+    setPaymentFeedback(null);
+    setPaymentSaving(true);
+    const isEditing = Boolean(paymentForm.id);
+    const endpoint = isEditing
+      ? `/api/account/payment-methods/${encodeURIComponent(paymentForm.id)}`
+      : '/api/account/payment-methods';
+    const res = await apiRequest<{ method: CustomerPaymentMethod }>(endpoint, {
+      method: isEditing ? 'PUT' : 'POST',
+      body: JSON.stringify({
+        methodType: paymentForm.methodType,
+        label: paymentForm.label.trim(),
+        last4: paymentForm.methodType === 'card' ? paymentForm.last4.trim() : undefined,
+        network: paymentForm.network.trim() || undefined,
+        expiry: paymentForm.methodType === 'card' ? paymentForm.expiry.trim() || undefined : undefined,
+      }),
+    });
+    setPaymentSaving(false);
+    if (!res.ok) {
+      setPaymentError(res.error);
+      return;
+    }
+    setPaymentFormOpen(false);
+    setPaymentForm({ id: '', methodType: 'card', label: '', last4: '', network: '', expiry: '' });
+    setPaymentFeedback(isEditing ? 'Payment reference updated.' : 'Payment reference saved.');
+    emitBoutiqueSync('account');
+    await loadPaymentMethods();
+  };
+
+  const handleConfirmDeletePaymentMethod = async () => {
+    if (!deletePaymentCandidate || deletePaymentBusy) return;
+    const target = deletePaymentCandidate;
+    setDeletePaymentBusy(true);
+    setPaymentError(null);
+    setPaymentFeedback(null);
+    const res = await apiRequest<{ ok: boolean }>(
+      `/api/account/payment-methods/${encodeURIComponent(target.id)}`,
+      { method: 'DELETE' }
+    );
+    setDeletePaymentBusy(false);
+    setDeletePaymentCandidate(null);
+    if (!res.ok) {
+      setPaymentError(res.error);
+      return;
+    }
+    setPaymentFeedback('Saved payment reference removed.');
+    emitBoutiqueSync('account');
+    await loadPaymentMethods();
   };
 
   const handleGiftCardLookup = async (e: FormEvent) => {
@@ -532,6 +880,28 @@ export function AccountDashboard({
     if (!res.ok) return;
     setNotifications((prev) => prev.map((n) => ({ ...n, read: true, readAt: Date.now() })));
     setUnreadNotifications(0);
+    window.dispatchEvent(new Event('sahithi:notifications-updated'));
+  };
+
+  const handleConfirmDeleteNotification = async () => {
+    if (!deleteNotifCandidate || deleteNotifBusy) return;
+    const target = deleteNotifCandidate;
+    setDeleteNotifBusy(true);
+    setNotificationsError(null);
+    const res = await apiRequest<{ ok: boolean }>(
+      `/api/account/notifications/${encodeURIComponent(target.id)}`,
+      { method: 'DELETE' }
+    );
+    setDeleteNotifBusy(false);
+    setDeleteNotifCandidate(null);
+    if (!res.ok) {
+      setNotificationsError(res.error);
+      return;
+    }
+    setNotifications((prev) => prev.filter((n) => n.id !== target.id));
+    if (!target.read) {
+      setUnreadNotifications((prev) => Math.max(0, prev - 1));
+    }
     window.dispatchEvent(new Event('sahithi:notifications-updated'));
   };
 
@@ -824,13 +1194,15 @@ export function AccountDashboard({
                     </div>
                     <div>
                       <h2 className="font-serif text-xl font-semibold text-[#49243E]">
-                        Profile Details
+                        Profile &amp; Communication Preferences
                       </h2>
-                      <p className="text-xs text-[#242124]/65">Your display name across the boutique</p>
+                      <p className="text-xs text-[#242124]/65">
+                        Your name, contact phone, and notification choices
+                      </p>
                     </div>
                   </div>
 
-                  <form onSubmit={handleSaveName} className="mt-5 space-y-4">
+                  <form onSubmit={handleSaveProfile} className="mt-5 space-y-4">
                     {nameFeedback && (
                       <div
                         role={nameFeedback.type === 'err' ? 'alert' : 'status'}
@@ -863,13 +1235,60 @@ export function AccountDashboard({
                       />
                     </div>
 
+                    <div>
+                      <label htmlFor={phoneId} className="block text-sm font-medium text-[#49243E]">
+                        Contact Phone Number
+                      </label>
+                      <input
+                        id={phoneId}
+                        type="tel"
+                        value={phone}
+                        onChange={(e) => setPhone(e.target.value)}
+                        placeholder="+91 98765 43210"
+                        className="mt-1.5 min-h-[44px] w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/65 px-3.5 text-base text-[#242124] focus:border-[#49243E] focus:bg-white focus:outline-none sm:text-sm"
+                      />
+                    </div>
+
+                    <div className="space-y-2 rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5]/75 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-wider text-[#49243E]">
+                        Notification Preferences
+                      </p>
+                      {(
+                        [
+                          { key: 'orderUpdates', label: 'Order confirmation & shipping status' },
+                          { key: 'cancelReturnUpdates', label: 'Cancellation & return updates' },
+                          { key: 'promotions', label: 'Coupons & atelier launch alerts' },
+                          { key: 'emailEnabled', label: 'Email notifications' },
+                          { key: 'smsWhatsappEnabled', label: 'SMS / WhatsApp notifications' },
+                        ] as const
+                      ).map((pref) => (
+                        <label
+                          key={pref.key}
+                          className="flex min-h-[34px] cursor-pointer items-center justify-between gap-2 text-xs text-[#242124]/85"
+                        >
+                          <span>{pref.label}</span>
+                          <input
+                            type="checkbox"
+                            checked={notifPrefs[pref.key]}
+                            onChange={(e) =>
+                              setNotifPrefs((prev) => ({
+                                ...prev,
+                                [pref.key]: e.target.checked,
+                              }))
+                            }
+                            className="h-4 w-4 accent-[#49243E]"
+                          />
+                        </label>
+                      ))}
+                    </div>
+
                     <button
                       type="submit"
-                      disabled={nameSaving}
+                      disabled={profileSaving}
                       className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-[#49243E] px-5 text-sm font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31] disabled:opacity-60"
                     >
-                      {nameSaving && <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />}
-                      <span>Save Name</span>
+                      {profileSaving && <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />}
+                      <span>{profileSaving ? 'Saving…' : 'Save Profile & Preferences'}</span>
                     </button>
                   </form>
                 </section>
@@ -1102,6 +1521,48 @@ export function AccountDashboard({
                     </button>
                   </form>
                 </section>
+
+                <section className="rounded-3xl border border-[#B76E79]/35 bg-white p-6">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#F3D5DF]/45 text-[#9B2C3E]">
+                      <Trash2 className="h-5 w-5" aria-hidden="true" />
+                    </div>
+                    <div>
+                      <h2 className="font-serif text-xl font-semibold text-[#49243E]">
+                        Delete Customer Account
+                      </h2>
+                      <p className="text-xs text-[#242124]/65">
+                        Permanently remove your account, saved addresses, payment references, wishlist, and notifications.
+                      </p>
+                    </div>
+                  </div>
+
+                  {user.isOwner ? (
+                    <p className="mt-4 rounded-xl border border-[#49243E]/15 bg-[#FFF9F5] px-3.5 py-3 text-xs leading-relaxed text-[#49243E]">
+                      The verified boutique owner account is protected and cannot be deleted from customer settings.
+                    </p>
+                  ) : (
+                    <div className="mt-4 space-y-3">
+                      <p className="text-xs leading-relaxed text-[#242124]/75">
+                        Past orders stay in boutique accounting records for legal and fulfillment tracking, while your personal account access and saved items are erased.
+                        {!reauthActive && ' Verify your current password above to enable account deletion.'}
+                      </p>
+                      <button
+                        type="button"
+                        disabled={!reauthActive}
+                        onClick={() => {
+                          setDeleteConfirmInput('');
+                          setDeleteAccountError(null);
+                          setDeleteAccountOpen(true);
+                        }}
+                        className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl border border-[#9B2C3E]/35 bg-[#FFF9F5] px-4 text-sm font-medium text-[#9B2C3E] transition-colors hover:bg-[#F3D5DF]/45 disabled:opacity-50"
+                      >
+                        <Trash2 className="h-4 w-4" aria-hidden="true" />
+                        <span>Delete Account</span>
+                      </button>
+                    </div>
+                  )}
+                </section>
               </div>
             </div>
           )}
@@ -1160,9 +1621,70 @@ export function AccountDashboard({
                     const payment =
                       order.paymentStatus || (order.razorpayPaymentId ? 'paid' : isCod ? 'unpaid' : 'pending');
                     const isUnpaidCod = isCod && payment !== 'paid';
-                    const canRequestCancel = ['placed', 'pending', 'confirmed', 'packed'].includes(fulfillment);
-                    const canRequestReturn = fulfillment === 'delivered';
-                    const hasOpenRequest = order.returnRequest?.status === 'pending';
+                    const cancelReq = order.cancelRequest || null;
+                    const returnReq = order.returnRequest || null;
+                    const canEditDelivery =
+                      ['pending', 'placed', 'confirmed'].includes(fulfillment) &&
+                      cancelReq?.status !== 'pending' &&
+                      cancelReq?.status !== 'approved';
+                    const canRequestCancel =
+                      ['placed', 'pending', 'confirmed', 'packed'].includes(fulfillment) &&
+                      cancelReq?.status !== 'pending' &&
+                      cancelReq?.status !== 'approved';
+                    const canRequestReturn =
+                      fulfillment === 'delivered' &&
+                      returnReq?.status !== 'pending' &&
+                      returnReq?.status !== 'approved';
+
+                    const renderRequestCard = (req: OrderReturnRequest) => {
+                      const titlePrefix = req.type === 'cancel' ? 'Cancellation' : 'Return';
+                      const statusLabel =
+                        req.status === 'pending'
+                          ? `${titlePrefix} requested · Pending`
+                          : `${titlePrefix} Request · ${req.status.toUpperCase()}`;
+                      return (
+                        <div
+                          key={req.id || req.type}
+                          className="space-y-2 rounded-2xl border border-[#B76E79]/35 bg-[#FFF9F5] p-3.5 text-xs"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <p className="font-semibold text-[#49243E]">{statusLabel}</p>
+                            <span className="tabular-nums text-[#242124]/60">
+                              {formatTimestamp(req.updatedAt || req.requestedAt)}
+                            </span>
+                          </div>
+                          <p className="text-[#242124]/80">Reason: {req.reason}</p>
+                          {req.resolutionNote && (
+                            <p className="text-[#49243E]">Atelier Note: {req.resolutionNote}</p>
+                          )}
+                          {req.status === 'pending' && (
+                            <div className="flex flex-wrap gap-2 pt-1">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setRequestType(req.type);
+                                  setRequestMode('edit');
+                                  setRequestOrderId(order.id);
+                                  setRequestReason(req.reason);
+                                  setRequestFeedback(null);
+                                }}
+                                className="inline-flex min-h-[36px] items-center gap-1 rounded-lg border border-[#49243E]/20 bg-white px-3 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/35"
+                              >
+                                <Edit3 className="h-3.5 w-3.5" aria-hidden="true" />
+                                <span>Edit Reason</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setWithdrawCandidate({ order, req })}
+                                className="inline-flex min-h-[36px] items-center rounded-lg border border-[#9B2C3E]/30 bg-white px-3 text-xs font-medium text-[#9B2C3E] hover:bg-[#F3D5DF]/40"
+                              >
+                                Withdraw Request
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    };
 
                     return (
                       <article
@@ -1188,6 +1710,11 @@ export function AccountDashboard({
                                   : payment}{' '}
                               · Fulfillment: {fulfillment.replace(/_/g, ' ')}
                             </p>
+                            {cancelReq?.status === 'pending' && (
+                              <p className="mt-1 text-xs font-semibold text-[#B76E79]">
+                                Cancellation requested · Pending review
+                              </p>
+                            )}
                             <p className="mt-1 text-xs text-[#242124]/65 tabular-nums">
                               Placed {formatTimestamp(order.createdAt)}
                               {order.razorpayPaymentId ? ` · Razorpay ${order.razorpayPaymentId}` : ''}
@@ -1243,10 +1770,86 @@ export function AccountDashboard({
                           </div>
                         )}
 
-                        {order.shippingAddress && (
-                          <p className="text-xs text-[#242124]/70">
-                            Delivery Address: {order.shippingAddress}
-                          </p>
+                        {deliveryEditOrderId === order.id ? (
+                          <form
+                            onSubmit={(e) => void handleSaveDeliveryDetails(e, order.id)}
+                            className="space-y-3 rounded-2xl border border-[#49243E]/15 bg-[#FFF9F5] p-4"
+                          >
+                            <p className="text-xs font-semibold text-[#49243E]">
+                              Edit Delivery Details (Pre-Dispatch)
+                            </p>
+                            {deliveryError && (
+                              <p role="alert" className="text-xs font-medium text-[#9B2C3E]">
+                                {deliveryError}
+                              </p>
+                            )}
+                            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                              <input
+                                type="text"
+                                required
+                                value={deliveryForm.customerName}
+                                onChange={(e) =>
+                                  setDeliveryForm((p) => ({ ...p, customerName: e.target.value }))
+                                }
+                                placeholder="Recipient Name"
+                                className="min-h-[42px] rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs"
+                              />
+                              <input
+                                type="tel"
+                                required
+                                value={deliveryForm.customerPhone}
+                                onChange={(e) =>
+                                  setDeliveryForm((p) => ({ ...p, customerPhone: e.target.value }))
+                                }
+                                placeholder="Recipient Phone"
+                                className="min-h-[42px] rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs"
+                              />
+                            </div>
+                            <textarea
+                              rows={2}
+                              required
+                              value={deliveryForm.shippingAddress}
+                              onChange={(e) =>
+                                setDeliveryForm((p) => ({ ...p, shippingAddress: e.target.value }))
+                              }
+                              placeholder="Full Delivery Address"
+                              className="w-full rounded-xl border border-[#49243E]/18 bg-white p-3 text-xs focus:border-[#49243E] focus:outline-none"
+                            />
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="submit"
+                                disabled={deliverySaving}
+                                className="inline-flex min-h-[40px] items-center rounded-xl bg-[#49243E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31] disabled:opacity-60"
+                              >
+                                {deliverySaving ? 'Saving…' : 'Save Delivery Details'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setDeliveryEditOrderId(null);
+                                  setDeliveryError(null);
+                                }}
+                                className="inline-flex min-h-[40px] items-center rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E]"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </form>
+                        ) : (
+                          order.shippingAddress && (
+                            <div className="space-y-0.5 text-xs text-[#242124]/70">
+                              <p>
+                                Delivery to <strong className="text-[#49243E]">{order.customerName}</strong>
+                                {order.customerPhone ? ` (${order.customerPhone})` : ''}:{' '}
+                                {order.shippingAddress}
+                              </p>
+                              {order.deliveryDetailsEditedAt && (
+                                <p className="text-[11px] text-[#B76E79] tabular-nums">
+                                  Delivery details updated {formatTimestamp(order.deliveryDetailsEditedAt)}
+                                </p>
+                              )}
+                            </div>
+                          )
                         )}
 
                         {Array.isArray(order.statusHistory) && order.statusHistory.length > 0 && (
@@ -1270,20 +1873,8 @@ export function AccountDashboard({
                           </div>
                         )}
 
-                        {order.returnRequest && (
-                          <div className="rounded-2xl border border-[#B76E79]/35 bg-[#FFF9F5] p-3.5 text-xs">
-                            <p className="font-semibold text-[#49243E]">
-                              {order.returnRequest.type === 'cancel' ? 'Cancellation' : 'Return'} Request ·{' '}
-                              <span className="uppercase">{order.returnRequest.status}</span>
-                            </p>
-                            <p className="mt-1 text-[#242124]/75">Reason: {order.returnRequest.reason}</p>
-                            {order.returnRequest.resolutionNote && (
-                              <p className="mt-1 text-[#49243E]">
-                                Atelier Note: {order.returnRequest.resolutionNote}
-                              </p>
-                            )}
-                          </div>
-                        )}
+                        {cancelReq && renderRequestCard(cancelReq)}
+                        {returnReq && renderRequestCard(returnReq)}
 
                         {requestFeedback?.orderId === order.id && (
                           <p
@@ -1296,74 +1887,106 @@ export function AccountDashboard({
                           </p>
                         )}
 
-                        {!hasOpenRequest && (canRequestCancel || canRequestReturn) && (
-                          <div>
-                            {requestOrderId === order.id ? (
-                              <form
-                                onSubmit={(e) => void handleSubmitOrderRequest(e, order.id)}
-                                className="space-y-3 rounded-2xl border border-[#49243E]/15 bg-[#FFF9F5] p-4"
+                        {requestOrderId === order.id ? (
+                          <form
+                            onSubmit={(e) => void handleSubmitOrderRequest(e, order.id)}
+                            className="space-y-3 rounded-2xl border border-[#49243E]/15 bg-[#FFF9F5] p-4"
+                          >
+                            <p className="text-xs font-semibold text-[#49243E]">
+                              {requestMode === 'edit' ? 'Edit' : 'Submit'}{' '}
+                              {requestType === 'cancel' ? 'Cancellation' : 'Return'} Request
+                            </p>
+                            <textarea
+                              rows={2}
+                              required
+                              value={requestReason}
+                              onChange={(e) => setRequestReason(e.target.value)}
+                              placeholder="Share details so our boutique team can review quickly…"
+                              className="w-full rounded-xl border border-[#49243E]/18 bg-white p-3 text-xs focus:border-[#49243E] focus:outline-none"
+                            />
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="submit"
+                                disabled={requestBusy}
+                                className="inline-flex min-h-[40px] items-center rounded-xl bg-[#49243E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31] disabled:opacity-60"
                               >
-                                <p className="text-xs font-semibold text-[#49243E]">
-                                  Submit {requestType === 'cancel' ? 'Cancellation' : 'Return'} Request
-                                </p>
-                                <textarea
-                                  rows={2}
-                                  required
-                                  value={requestReason}
-                                  onChange={(e) => setRequestReason(e.target.value)}
-                                  placeholder="Share details so our boutique team can review quickly…"
-                                  className="w-full rounded-xl border border-[#49243E]/18 bg-white p-3 text-xs focus:border-[#49243E] focus:outline-none"
-                                />
-                                <div className="flex flex-wrap gap-2">
-                                  <button
-                                    type="submit"
-                                    disabled={requestBusy}
-                                    className="inline-flex min-h-[40px] items-center rounded-xl bg-[#49243E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31] disabled:opacity-60"
-                                  >
-                                    {requestBusy ? 'Submitting…' : 'Submit Request'}
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setRequestOrderId(null);
-                                      setRequestReason('');
-                                    }}
-                                    className="inline-flex min-h-[40px] items-center rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E]"
-                                  >
-                                    Cancel
-                                  </button>
-                                </div>
-                              </form>
-                            ) : (
-                              <div className="flex flex-wrap gap-2">
-                                {canRequestCancel && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setRequestType('cancel');
-                                      setRequestOrderId(order.id);
-                                      setRequestReason('');
-                                    }}
-                                    className="inline-flex min-h-[40px] items-center rounded-xl border border-[#49243E]/20 bg-[#FFF9F5] px-4 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/40"
-                                  >
-                                    Request Cancellation
-                                  </button>
-                                )}
-                                {canRequestReturn && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setRequestType('return');
-                                      setRequestOrderId(order.id);
-                                      setRequestReason('');
-                                    }}
-                                    className="inline-flex min-h-[40px] items-center rounded-xl border border-[#49243E]/20 bg-[#FFF9F5] px-4 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/40"
-                                  >
-                                    Request Return
-                                  </button>
-                                )}
-                              </div>
-                            )}
+                                {requestBusy
+                                  ? 'Saving…'
+                                  : requestMode === 'edit'
+                                    ? 'Save Reason'
+                                    : 'Submit Request'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setRequestOrderId(null);
+                                  setRequestReason('');
+                                }}
+                                className="inline-flex min-h-[40px] items-center rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E]"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </form>
+                        ) : (
+                          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                            <div className="flex flex-wrap gap-2">
+                              {canEditDelivery && deliveryEditOrderId !== order.id && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setDeliveryEditOrderId(order.id);
+                                    setDeliveryError(null);
+                                    setDeliveryForm({
+                                      customerName: order.customerName || user.fullName || '',
+                                      customerPhone: order.customerPhone || user.phone || '',
+                                      shippingAddress: order.shippingAddress || '',
+                                    });
+                                  }}
+                                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-[#49243E]/20 bg-[#FFF9F5] px-4 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/40"
+                                >
+                                  <Edit3 className="h-3.5 w-3.5" aria-hidden="true" />
+                                  <span>Edit Delivery</span>
+                                </button>
+                              )}
+                              {canRequestCancel && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setRequestType('cancel');
+                                    setRequestMode('create');
+                                    setRequestOrderId(order.id);
+                                    setRequestReason('');
+                                  }}
+                                  className="inline-flex min-h-[40px] items-center rounded-xl border border-[#49243E]/20 bg-[#FFF9F5] px-4 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/40"
+                                >
+                                  Request Cancellation
+                                </button>
+                              )}
+                              {canRequestReturn && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setRequestType('return');
+                                    setRequestMode('create');
+                                    setRequestOrderId(order.id);
+                                    setRequestReason('');
+                                  }}
+                                  className="inline-flex min-h-[40px] items-center rounded-xl border border-[#49243E]/20 bg-[#FFF9F5] px-4 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/40"
+                                >
+                                  Request Return
+                                </button>
+                              )}
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => setHideOrderCandidate(order)}
+                              className="inline-flex min-h-[38px] items-center gap-1 rounded-xl px-3 text-xs font-medium text-[#242124]/65 hover:bg-[#F3D5DF]/35 hover:text-[#49243E]"
+                            >
+                              <EyeOff className="h-3.5 w-3.5" aria-hidden="true" />
+                              <span>Hide from my orders</span>
+                            </button>
                           </div>
                         )}
                       </article>
@@ -1611,17 +2234,141 @@ export function AccountDashboard({
                     </div>
                     <div>
                       <h2 className="font-serif text-xl font-semibold text-[#49243E]">
-                        Checkout Methods &amp; Saved Cards
+                        Checkout Methods &amp; Saved References
                       </h2>
                       <p className="text-xs text-[#242124]/65">
                         PCI-compliant payments via Razorpay Checkout &amp; Cash on Delivery
                       </p>
                     </div>
                   </div>
-                  <span className="rounded-lg border border-[#49243E]/18 bg-[#FFF9F5] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider text-[#49243E]">
-                    {paymentSummary?.enabled ? 'Vault Enabled' : 'Razorpay Standard'}
-                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPaymentError(null);
+                      setPaymentFeedback(null);
+                      setPaymentForm({
+                        id: '',
+                        methodType: 'card',
+                        label: '',
+                        last4: '',
+                        network: '',
+                        expiry: '',
+                      });
+                      setPaymentFormOpen(true);
+                    }}
+                    className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl bg-[#49243E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31]"
+                  >
+                    <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Add Payment Reference</span>
+                  </button>
                 </div>
+
+                {paymentError && (
+                  <div role="alert" className="rounded-2xl border border-[#B76E79]/45 bg-[#F3D5DF]/35 p-3.5 text-xs text-[#49243E]">
+                    {paymentError}
+                  </div>
+                )}
+
+                {paymentFeedback && (
+                  <div role="status" className="rounded-2xl border border-[#166534]/25 bg-[#F0FDF4] p-3.5 text-xs text-[#166534]">
+                    {paymentFeedback}
+                  </div>
+                )}
+
+                {paymentFormOpen && (
+                  <form
+                    onSubmit={handleSavePaymentMethod}
+                    className="space-y-3 rounded-2xl border border-[#49243E]/15 bg-[#FFF9F5] p-4"
+                  >
+                    <h3 className="font-serif text-lg font-semibold text-[#49243E]">
+                      {paymentForm.id ? 'Edit Saved Payment Reference' : 'Add Non-Sensitive Payment Reference'}
+                    </h3>
+                    <p className="text-[11px] text-[#242124]/70">
+                      Save only a friendly nickname and last 4 card digits or UPI app label. Never enter full card numbers or CVV here—actual payment entry stays inside encrypted Razorpay Checkout.
+                    </p>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <select
+                        aria-label="Payment method type"
+                        value={paymentForm.methodType}
+                        onChange={(e) =>
+                          setPaymentForm((p) => ({
+                            ...p,
+                            methodType: e.target.value as 'card' | 'upi' | 'wallet',
+                          }))
+                        }
+                        className="min-h-[44px] rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs text-[#49243E]"
+                      >
+                        <option value="card">Card Reference</option>
+                        <option value="upi">UPI Reference</option>
+                        <option value="wallet">Wallet Reference</option>
+                      </select>
+                      <input
+                        type="text"
+                        required
+                        value={paymentForm.label}
+                        onChange={(e) => setPaymentForm((p) => ({ ...p, label: e.target.value }))}
+                        placeholder="Label (e.g. HDFC Silk Card or GPay Personal)"
+                        className="min-h-[44px] rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs"
+                      />
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                      {paymentForm.methodType === 'card' && (
+                        <>
+                          <input
+                            type="text"
+                            maxLength={4}
+                            value={paymentForm.last4}
+                            onChange={(e) =>
+                              setPaymentForm((p) => ({
+                                ...p,
+                                last4: e.target.value.replace(/\D/g, '').slice(0, 4),
+                              }))
+                            }
+                            placeholder="Last 4 digits (optional)"
+                            className="min-h-[44px] rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs"
+                          />
+                          <input
+                            type="text"
+                            value={paymentForm.expiry}
+                            onChange={(e) => setPaymentForm((p) => ({ ...p, expiry: e.target.value }))}
+                            placeholder="Expiry MM/YY (optional)"
+                            className="min-h-[44px] rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs"
+                          />
+                        </>
+                      )}
+                      <input
+                        type="text"
+                        value={paymentForm.network}
+                        onChange={(e) => setPaymentForm((p) => ({ ...p, network: e.target.value }))}
+                        placeholder={
+                          paymentForm.methodType === 'card'
+                            ? 'Network (Visa / Mastercard)'
+                            : 'Provider (GPay / PhonePe / Paytm)'
+                        }
+                        className="min-h-[44px] rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs"
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="submit"
+                        disabled={paymentSaving}
+                        className="inline-flex min-h-[42px] items-center rounded-xl bg-[#49243E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31] disabled:opacity-60"
+                      >
+                        {paymentSaving ? 'Saving…' : 'Save Reference'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPaymentFormOpen(false);
+                          setPaymentError(null);
+                        }}
+                        className="inline-flex min-h-[42px] items-center rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E]"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                )}
 
                 {paymentLoading ? (
                   <div className="h-28 animate-pulse rounded-2xl bg-[#FFF9F5]" />
@@ -1648,16 +2395,16 @@ export function AccountDashboard({
                       </div>
                     </div>
 
-                    {paymentSummary?.enabled && paymentSummary.methods.length > 0 ? (
+                    {paymentSummary && paymentSummary.methods.length > 0 ? (
                       <div className="space-y-2.5">
                         <h3 className="text-xs font-semibold uppercase tracking-wider text-[#49243E]/75">
-                          Tokenized Saved Methods
+                          Your Saved Payment References
                         </h3>
                         <ul className="space-y-2">
                           {paymentSummary.methods.map((method) => (
                             <li
                               key={method.id}
-                              className="flex items-center justify-between rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5] px-4 py-3 text-xs"
+                              className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5] px-4 py-3 text-xs"
                             >
                               <div>
                                 <p className="font-semibold text-[#49243E]">
@@ -1670,7 +2417,35 @@ export function AccountDashboard({
                                     .join(' · ') || method.methodType.toUpperCase()}
                                 </p>
                               </div>
-                              <span className="font-medium text-[#166534]">Tokenized via Razorpay</span>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setPaymentForm({
+                                      id: method.id,
+                                      methodType: method.methodType,
+                                      label: method.label,
+                                      last4: method.last4 || '',
+                                      network: method.network || '',
+                                      expiry: method.expiry || '',
+                                    });
+                                    setPaymentFormOpen(true);
+                                    setPaymentError(null);
+                                  }}
+                                  className="inline-flex min-h-[34px] items-center gap-1 rounded-lg border border-[#49243E]/18 bg-white px-2.5 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/30"
+                                >
+                                  <Edit3 className="h-3 w-3" aria-hidden="true" />
+                                  <span>Edit</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeletePaymentCandidate(method)}
+                                  className="inline-flex min-h-[34px] items-center gap-1 rounded-lg px-2.5 text-xs font-medium text-[#9B2C3E] hover:bg-[#F3D5DF]/40"
+                                >
+                                  <Trash2 className="h-3 w-3" aria-hidden="true" />
+                                  <span>Remove</span>
+                                </button>
+                              </div>
                             </li>
                           ))}
                         </ul>
@@ -1678,13 +2453,11 @@ export function AccountDashboard({
                     ) : (
                       <div className="rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5] p-4 space-y-1.5">
                         <p className="text-xs font-semibold uppercase tracking-wider text-[#B76E79]">
-                          {paymentSummary?.enabled
-                            ? 'No Saved Cards on File Yet'
-                            : 'Saved Card Tokenization · Pending Merchant Activation'}
+                          No Saved Payment References Yet
                         </p>
                         <p className="text-sm leading-relaxed text-[#242124]/80">
                           {paymentSummary?.reason ||
-                            'Sahithi Collections processes all cards inside PCI-compliant Razorpay Checkout without collecting raw card details on this site. Tokenized saved-card vaulting will activate here once Razorpay Customer Vault is enabled on the merchant account.'}
+                            'Sahithi Collections processes all cards inside PCI-compliant Razorpay Checkout without collecting raw card details on this site. You may add a non-sensitive label above for quick reference.'}
                         </p>
                       </div>
                     )}
@@ -1917,7 +2690,7 @@ export function AccountDashboard({
                         </button>
                         <button
                           type="button"
-                          onClick={() => void handleDeleteAddress(addr.id)}
+                          onClick={() => setDeleteAddressCandidate(addr)}
                           className="inline-flex min-h-[38px] items-center gap-1 rounded-lg px-3 text-xs font-medium text-[#9B2C3E] hover:bg-[#F3D5DF]/40"
                         >
                           <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
@@ -2142,15 +2915,26 @@ export function AccountDashboard({
                           {notif.message}
                         </p>
                       </div>
-                      {!notif.read && (
+                      <div className="flex shrink-0 items-center gap-2">
+                        {!notif.read && (
+                          <button
+                            type="button"
+                            onClick={() => void handleMarkNotificationRead(notif.id)}
+                            className="inline-flex min-h-[38px] shrink-0 items-center rounded-xl border border-[#49243E]/20 bg-white px-3.5 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/40"
+                          >
+                            Mark Read
+                          </button>
+                        )}
                         <button
                           type="button"
-                          onClick={() => void handleMarkNotificationRead(notif.id)}
-                          className="inline-flex min-h-[38px] shrink-0 items-center rounded-xl border border-[#49243E]/20 bg-white px-3.5 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/40"
+                          onClick={() => setDeleteNotifCandidate(notif)}
+                          aria-label={`Delete notification ${notif.title}`}
+                          className="inline-flex min-h-[38px] shrink-0 items-center gap-1 rounded-xl px-3 text-xs font-medium text-[#9B2C3E] hover:bg-[#F3D5DF]/40"
                         >
-                          Mark Read
+                          <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>Delete</span>
                         </button>
-                      )}
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -2159,6 +2943,237 @@ export function AccountDashboard({
           )}
         </main>
       </div>
+
+      {/* Delete Account Confirmation Modal */}
+      {deleteAccountOpen && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="delete-account-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[#242124]/55 p-4"
+        >
+          <form
+            onSubmit={(e) => void handleConfirmDeleteAccount(e)}
+            className="w-full max-w-md space-y-4 rounded-3xl border border-[#49243E]/15 bg-[#FFF9F5] p-6 shadow-2xl"
+          >
+            <h2 id="delete-account-title" className="font-serif text-2xl font-semibold text-[#49243E]">
+              Delete Your Account?
+            </h2>
+            <p className="text-xs leading-relaxed text-[#242124]/80">
+              This permanently removes your profile, saved addresses, payment references, wishlist, and notifications. Existing orders remain in boutique fulfillment logs without account access.
+            </p>
+            {deleteAccountError && (
+              <p role="alert" className="text-xs font-medium text-[#9B2C3E]">
+                {deleteAccountError}
+              </p>
+            )}
+            <div>
+              <label htmlFor="delete-account-confirm-input" className="block text-xs font-medium text-[#49243E]">
+                Type <span className="font-mono font-bold">DELETE</span> to confirm
+              </label>
+              <input
+                id="delete-account-confirm-input"
+                type="text"
+                value={deleteConfirmInput}
+                onChange={(e) => setDeleteConfirmInput(e.target.value)}
+                placeholder="DELETE"
+                className="mt-1.5 min-h-[42px] w-full rounded-xl border border-[#49243E]/20 bg-white px-3 text-sm"
+              />
+            </div>
+            <div className="flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setDeleteAccountOpen(false)}
+                className="min-h-[42px] rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E]"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={deleteAccountBusy || deleteConfirmInput.trim().toUpperCase() !== 'DELETE'}
+                className="min-h-[42px] rounded-xl bg-[#9B2C3E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#7D2231] disabled:opacity-50"
+              >
+                {deleteAccountBusy ? 'Deleting…' : 'Permanently Delete Account'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Withdraw Request Confirmation Modal */}
+      {withdrawCandidate && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[#242124]/55 p-4"
+        >
+          <div className="w-full max-w-md space-y-4 rounded-3xl border border-[#49243E]/15 bg-[#FFF9F5] p-6 shadow-2xl">
+            <h2 className="font-serif text-2xl font-semibold text-[#49243E]">
+              Withdraw {withdrawCandidate.req.type === 'cancel' ? 'Cancellation' : 'Return'} Request?
+            </h2>
+            <p className="text-xs leading-relaxed text-[#242124]/80">
+              Your order {withdrawCandidate.order.orderNumber} will continue under its active fulfillment stage without interruption.
+            </p>
+            <div className="flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setWithdrawCandidate(null)}
+                className="min-h-[42px] rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E]"
+              >
+                Keep Request
+              </button>
+              <button
+                type="button"
+                disabled={withdrawBusy}
+                onClick={() => void handleConfirmWithdrawRequest()}
+                className="min-h-[42px] rounded-xl bg-[#49243E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31] disabled:opacity-60"
+              >
+                {withdrawBusy ? 'Withdrawing…' : 'Confirm Withdraw'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hide Order Confirmation Modal */}
+      {hideOrderCandidate && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[#242124]/55 p-4"
+        >
+          <div className="w-full max-w-md space-y-4 rounded-3xl border border-[#49243E]/15 bg-[#FFF9F5] p-6 shadow-2xl">
+            <h2 className="font-serif text-2xl font-semibold text-[#49243E]">
+              Hide Order {hideOrderCandidate.orderNumber}?
+            </h2>
+            <p className="text-xs leading-relaxed text-[#242124]/80">
+              This removes the order from your personal order list while preserving fulfillment and payment records in boutique accounting.
+            </p>
+            <div className="flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setHideOrderCandidate(null)}
+                className="min-h-[42px] rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={hideOrderBusy}
+                onClick={() => void handleConfirmHideOrder()}
+                className="min-h-[42px] rounded-xl bg-[#49243E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31] disabled:opacity-60"
+              >
+                {hideOrderBusy ? 'Hiding…' : 'Hide Order'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Address Confirmation Modal */}
+      {deleteAddressCandidate && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[#242124]/55 p-4"
+        >
+          <div className="w-full max-w-md space-y-4 rounded-3xl border border-[#49243E]/15 bg-[#FFF9F5] p-6 shadow-2xl">
+            <h2 className="font-serif text-2xl font-semibold text-[#49243E]">
+              Delete Saved Address?
+            </h2>
+            <p className="text-xs leading-relaxed text-[#242124]/80">
+              Remove &ldquo;{deleteAddressCandidate.label}&rdquo; ({deleteAddressCandidate.line1}) from your saved addresses? Existing placed orders keep their delivery snapshot.
+            </p>
+            <div className="flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setDeleteAddressCandidate(null)}
+                className="min-h-[42px] rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deleteAddressBusy}
+                onClick={() => void handleConfirmDeleteAddress()}
+                className="min-h-[42px] rounded-xl bg-[#9B2C3E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#7D2231] disabled:opacity-60"
+              >
+                {deleteAddressBusy ? 'Deleting…' : 'Delete Address'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Payment Reference Confirmation Modal */}
+      {deletePaymentCandidate && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[#242124]/55 p-4"
+        >
+          <div className="w-full max-w-md space-y-4 rounded-3xl border border-[#49243E]/15 bg-[#FFF9F5] p-6 shadow-2xl">
+            <h2 className="font-serif text-2xl font-semibold text-[#49243E]">
+              Remove Payment Reference?
+            </h2>
+            <p className="text-xs leading-relaxed text-[#242124]/80">
+              Remove &ldquo;{deletePaymentCandidate.label}&rdquo; from your saved checkout references?
+            </p>
+            <div className="flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setDeletePaymentCandidate(null)}
+                className="min-h-[42px] rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deletePaymentBusy}
+                onClick={() => void handleConfirmDeletePaymentMethod()}
+                className="min-h-[42px] rounded-xl bg-[#9B2C3E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#7D2231] disabled:opacity-60"
+              >
+                {deletePaymentBusy ? 'Removing…' : 'Remove Reference'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Notification Confirmation Modal */}
+      {deleteNotifCandidate && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[#242124]/55 p-4"
+        >
+          <div className="w-full max-w-md space-y-4 rounded-3xl border border-[#49243E]/15 bg-[#FFF9F5] p-6 shadow-2xl">
+            <h2 className="font-serif text-2xl font-semibold text-[#49243E]">
+              Delete Notification?
+            </h2>
+            <p className="text-xs leading-relaxed text-[#242124]/80">
+              Remove &ldquo;{deleteNotifCandidate.title}&rdquo; from your notifications list?
+            </p>
+            <div className="flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setDeleteNotifCandidate(null)}
+                className="min-h-[42px] rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deleteNotifBusy}
+                onClick={() => void handleConfirmDeleteNotification()}
+                className="min-h-[42px] rounded-xl bg-[#9B2C3E] px-4 text-xs font-medium text-[#FFF9F5] hover:bg-[#7D2231] disabled:opacity-60"
+              >
+                {deleteNotifBusy ? 'Deleting…' : 'Delete Notification'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

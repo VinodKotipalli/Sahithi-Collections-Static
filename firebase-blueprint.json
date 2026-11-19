@@ -11,6 +11,8 @@
         "email_verified": { "type": "boolean" },
         "phone_e164": { "type": "string", "maxLength": 24 },
         "phone_verified": { "type": "boolean" },
+        "notification_prefs_json": { "type": "string", "maxLength": 2000 },
+        "deleted_at": { "type": "number" },
         "created_at": { "type": "number" },
         "updated_at": { "type": "number" }
       },
@@ -58,6 +60,12 @@
         "fulfillment_status": { "type": "string" },
         "idempotency_key": { "type": "string", "maxLength": 128 },
         "payment_collected_at": { "type": "number" },
+        "cancel_request_json": { "type": "string" },
+        "return_request_json": { "type": "string" },
+        "hidden_by_customer": { "type": "boolean" },
+        "hidden_at": { "type": "number" },
+        "stock_restored_at": { "type": "number" },
+        "delivery_details_edited_at": { "type": "number" },
         "total_paise": { "type": "number" },
         "created_at": { "type": "number" }
       },
@@ -151,6 +159,22 @@
         "active": { "type": "boolean" }
       },
       "required": ["id", "code", "balance_paise", "active"]
+    },
+    "CustomerPaymentMethod": {
+      "title": "CustomerPaymentMethod",
+      "description": "Non-sensitive saved payment method reference owned by customer.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "method_type": { "type": "string", "enum": ["card", "upi", "wallet"] },
+        "label": { "type": "string" },
+        "last4": { "type": "string" },
+        "network": { "type": "string" },
+        "expiry": { "type": "string" },
+        "created_at": { "type": "number" },
+        "updated_at": { "type": "number" }
+      },
+      "required": ["id", "method_type", "label", "created_at", "updated_at"]
     }
   },
   "firestore": {
@@ -161,6 +185,10 @@
     "/environments/{envKey}/users/{userId}/addresses/{addressId}": {
       "schema": { "$ref": "#/entities/CustomerAddress" },
       "description": "Private customer saved delivery addresses."
+    },
+    "/environments/{envKey}/users/{userId}/payment_methods/{methodId}": {
+      "schema": { "$ref": "#/entities/CustomerPaymentMethod" },
+      "description": "Private non-sensitive saved payment method references."
     },
     "/environments/{envKey}/users/{userId}/notifications/{notifId}": {
       "schema": { "$ref": "#/entities/CustomerNotification" },

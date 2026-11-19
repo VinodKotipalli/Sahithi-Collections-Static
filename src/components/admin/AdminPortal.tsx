@@ -592,22 +592,49 @@ export function AdminPortal({
     if (activeTab === 'coupons') setActivityRefreshTick((t) => t + 1);
   }, [gate, activeTab, loadOrders, loadAudit, loadOverview]);
 
-  // Periodically refresh live customer/order/activity views while owner dashboard is open
+  // Periodically & reactively refresh live customer/order/activity views while owner dashboard is open
   useEffect(() => {
     if (gate !== 'authorized') return;
-    if (activeTab !== 'overview' && activeTab !== 'orders' && activeTab !== 'coupons') return;
 
-    const timer = window.setInterval(() => {
-      if (activeTab === 'overview') {
+    const refreshLive = (topic?: string) => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (activeTab === 'overview' || topic === 'orders') {
         void loadOverview({ silent: true });
-      } else if (activeTab === 'orders') {
+      }
+      if (activeTab === 'orders' || topic === 'orders') {
         void loadOrders({ silent: true });
-      } else if (activeTab === 'coupons') {
+      }
+      if (activeTab === 'coupons' || topic === 'account' || topic === 'orders') {
         setActivityRefreshTick((t) => t + 1);
       }
-    }, 12000);
+    };
 
-    return () => window.clearInterval(timer);
+    const timer = window.setInterval(() => refreshLive(), 6000);
+    const onFocus = () => refreshLive();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') refreshLive();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+
+    let channel: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        channel = new BroadcastChannel('sahithi-boutique-sync');
+        channel.onmessage = (ev: MessageEvent<{ topic?: string }>) => {
+          refreshLive(ev.data?.topic);
+        };
+      }
+    } catch {
+      channel = null;
+    }
+
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+      channel?.close();
+    };
   }, [gate, activeTab, loadOverview, loadOrders]);
 
   const refreshCatalogAndMetrics = useCallback(async () => {
@@ -974,6 +1001,18 @@ export function AdminPortal({
     }
   };
 
+  const emitOrdersSync = () => {
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        const ch = new BroadcastChannel('sahithi-boutique-sync');
+        ch.postMessage({ topic: 'orders', at: Date.now() });
+        ch.close();
+      }
+    } catch {
+      // Ignore BroadcastChannel unavailability
+    }
+  };
+
   const handleUpdateOrderStatus = async (
     orderId: string,
     status: string,
@@ -991,6 +1030,7 @@ export function AdminPortal({
       return { ok: false, error: res.error };
     }
     showToast('ok', `Order marked as ${status}.`);
+    emitOrdersSync();
     await Promise.all([loadOrders({ silent: true }), loadOverview({ silent: true })]);
     return { ok: true };
   };
@@ -1011,6 +1051,7 @@ export function AdminPortal({
       return { ok: false, error: res.error };
     }
     showToast('ok', 'Payment marked as collected.');
+    emitOrdersSync();
     await Promise.all([loadOrders({ silent: true }), loadOverview({ silent: true })]);
     setActivityRefreshTick((t) => t + 1);
     return { ok: true };
@@ -1019,13 +1060,18 @@ export function AdminPortal({
   const handleResolveReturnRequest = async (
     orderId: string,
     decision: 'approved' | 'rejected',
-    note?: string
+    note?: string,
+    requestType?: 'cancel' | 'return'
   ): Promise<{ ok: boolean; error?: string }> => {
     const res = await apiRequest<{ order: AdminOrder }>(
       `/api/admin/orders/${encodeURIComponent(orderId)}/resolve-request`,
       {
         method: 'POST',
-        body: JSON.stringify(note ? { decision, note } : { decision }),
+        body: JSON.stringify({
+          decision,
+          ...(note ? { note } : {}),
+          ...(requestType ? { requestType } : {}),
+        }),
       }
     );
     if (!res.ok) {
@@ -1035,9 +1081,10 @@ export function AdminPortal({
     showToast(
       'ok',
       decision === 'approved'
-        ? 'Customer request approved and recorded.'
-        : 'Customer request rejected with note.'
+        ? `${requestType === 'cancel' ? 'Cancellation' : 'Customer'} request approved and recorded.`
+        : `${requestType === 'cancel' ? 'Cancellation' : 'Customer'} request rejected with note.`
     );
+    emitOrdersSync();
     await Promise.all([loadOrders({ silent: true }), loadOverview({ silent: true })]);
     setActivityRefreshTick((t) => t + 1);
     return { ok: true };

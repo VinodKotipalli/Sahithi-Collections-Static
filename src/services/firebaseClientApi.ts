@@ -9,6 +9,16 @@ import {
   mergeSiteSettings,
   mergeStorefrontContent,
 } from '../../server/storefront-defaults.ts';
+import {
+  normalizeOrderRequestsAndStatus,
+  parseNotificationPrefs,
+  parseOrderHistory,
+  PRE_CUTOFF_DELIVERY_EDIT_STATES,
+  PRE_SHIPPING_CANCEL_STATES,
+  RETURN_ELIGIBLE_STATES,
+  validateNonSensitivePaymentMethodInput,
+  type NotificationPreferencesData,
+} from '../../server/order-utils.ts';
 import { PRODUCTS } from '../config/products';
 import type { AuthCapabilities, AuthUser, ApiResult } from '../context/AuthContext';
 import type {
@@ -34,6 +44,8 @@ interface ClientFirebaseSession {
   uid: string;
   email: string;
   fullName: string;
+  phone?: string | null;
+  notificationPrefs?: NotificationPreferencesData;
   emailVerified: boolean;
   lastReauthAt: number;
   issuedAt: number;
@@ -60,6 +72,7 @@ interface FirestoreFieldValue {
 
 interface FirestoreDocResponse {
   name?: string;
+  updateTime?: string;
   fields?: Record<string, FirestoreFieldValue>;
 }
 
@@ -107,6 +120,18 @@ let memorySession: ClientFirebaseSession | null = null;
 let inFlightSessionPromise: Promise<ClientFirebaseSession | null> | null = null;
 const memoryPendingVerify = new Map<string, PendingVerifyRecord>();
 
+function emitBoutiqueSyncEvent(topic: 'orders' | 'account' | 'catalog'): void {
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      const channel = new BroadcastChannel('sahithi-boutique-sync');
+      channel.postMessage({ topic, at: Date.now() });
+      channel.close();
+    }
+  } catch {
+    // Ignore BroadcastChannel unavailability in tests/non-browser runtimes
+  }
+}
+
 function loadStoredSession(): ClientFirebaseSession | null {
   if (memorySession) return memorySession;
   if (typeof window === 'undefined') return null;
@@ -129,6 +154,10 @@ function loadStoredSession(): ClientFirebaseSession | null {
         uid: parsed.uid,
         email: parsed.email.toLowerCase(),
         fullName: parsed.fullName || 'Member',
+        phone: typeof parsed.phone === 'string' ? parsed.phone : null,
+        notificationPrefs: parsed.notificationPrefs
+          ? parseNotificationPrefs(parsed.notificationPrefs)
+          : undefined,
         emailVerified: Boolean(parsed.emailVerified),
         lastReauthAt: Number(parsed.lastReauthAt || Date.now()),
         issuedAt: Number(parsed.issuedAt || Date.now()),
@@ -671,6 +700,8 @@ function buildPublicAuthUser(session: ClientFirebaseSession): AuthUser {
     id: session.uid,
     fullName: session.fullName || (isOwner ? 'Store Owner' : 'Member'),
     email: session.email,
+    phone: session.phone ?? null,
+    notificationPrefs: parseNotificationPrefs(session.notificationPrefs),
     emailVerified: session.emailVerified,
     hasPassword: true,
     isOwner,
@@ -691,19 +722,29 @@ function firestoreBaseUrl(): string {
   )}/documents/environments/${encodeURIComponent(resolveClientTargetEnv())}`;
 }
 
+async function firestoreGetDocWithMeta<T>(
+  collectionName: string,
+  docId: string,
+  idToken?: string
+): Promise<{ data: T; updateTime?: string } | null> {
+  const url = `${firestoreBaseUrl()}/${collectionName}/${encodeURIComponent(docId)}`;
+  const headers: Record<string, string> = {};
+  if (idToken) headers.Authorization = `Bearer ${idToken}`;
+  const res = await fetch(url, { headers, cache: 'no-store' });
+  if (res.status === 404 || !res.ok) return null;
+  const doc = (await res.json()) as FirestoreDocResponse;
+  const data = docToRecord<T>(doc);
+  if (!data) return null;
+  return { data, updateTime: doc.updateTime };
+}
+
 async function firestoreGetDoc<T>(
   collectionName: string,
   docId: string,
   idToken?: string
 ): Promise<T | null> {
-  const url = `${firestoreBaseUrl()}/${collectionName}/${encodeURIComponent(docId)}`;
-  const headers: Record<string, string> = {};
-  if (idToken) headers.Authorization = `Bearer ${idToken}`;
-  const res = await fetch(url, { headers, cache: 'no-store' });
-  if (res.status === 404) return null;
-  if (!res.ok) return null;
-  const doc = (await res.json()) as FirestoreDocResponse;
-  return docToRecord<T>(doc);
+  const meta = await firestoreGetDocWithMeta<T>(collectionName, docId, idToken);
+  return meta ? meta.data : null;
 }
 
 async function parseFirestoreHttpError(
@@ -736,8 +777,17 @@ async function parseFirestoreHttpError(
       `Invalid Firestore payload: ${fsMessage}`
     );
   }
-  if (res.status === 409 || fsStatus === 'ABORTED' || fsStatus === 'FAILED_PRECONDITION') {
-    return new ClientFirebaseError(409, 'FIRESTORE_CONFLICT', fsMessage);
+  if (
+    res.status === 409 ||
+    res.status === 412 ||
+    fsStatus === 'ABORTED' ||
+    fsStatus === 'FAILED_PRECONDITION'
+  ) {
+    return new ClientFirebaseError(
+      409,
+      'CONCURRENCY_CONFLICT',
+      'This record was updated elsewhere. Please refresh and try again.'
+    );
   }
   return new ClientFirebaseError(res.status || 502, fsStatus || 'FIRESTORE_ERROR', fsMessage);
 }
@@ -747,15 +797,20 @@ async function firestoreSetDoc(
   docId: string,
   data: Record<string, unknown>,
   idToken?: string,
-  updateMaskFields?: string[]
+  updateMaskFields?: string[],
+  options?: { updateTime?: string }
 ): Promise<void> {
-  const maskQuery =
-    Array.isArray(updateMaskFields) && updateMaskFields.length > 0
-      ? `?${updateMaskFields
-          .map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`)
-          .join('&')}`
-      : '';
-  const url = `${firestoreBaseUrl()}/${collectionName}/${encodeURIComponent(docId)}${maskQuery}`;
+  const params = new URLSearchParams();
+  if (Array.isArray(updateMaskFields) && updateMaskFields.length > 0) {
+    for (const f of updateMaskFields) {
+      params.append('updateMask.fieldPaths', f);
+    }
+  }
+  if (options?.updateTime) {
+    params.set('currentDocument.updateTime', options.updateTime);
+  }
+  const qs = params.toString();
+  const url = `${firestoreBaseUrl()}/${collectionName}/${encodeURIComponent(docId)}${qs ? `?${qs}` : ''}`;
   const fields: Record<string, FirestoreFieldValue> = {};
   for (const [k, v] of Object.entries(data)) {
     if (v !== undefined) fields[k] = toFirestoreValue(v);
@@ -862,21 +917,28 @@ function parseJsonOrValue<T>(raw: unknown, fallback: T): T {
 function serializeClientOrderDoc(o: Record<string, unknown>) {
   const createdAt = Number(o.created_at || Date.now());
   const updatedAt = Number(o.updated_at || createdAt);
-  const status = String(o.status || 'pending');
-  const fulfillmentStatus = String(o.fulfillment_status || status);
   const rzPaymentId =
     typeof o.razorpay_payment_id === 'string' && o.razorpay_payment_id ? o.razorpay_payment_id : null;
   const rzOrderId =
     typeof o.razorpay_order_id === 'string' && o.razorpay_order_id ? o.razorpay_order_id : null;
+  const paymentMethod = String(o.payment_method || (rzOrderId || rzPaymentId ? 'razorpay' : 'cod'));
   const paymentStatus = String(o.payment_status || (rzPaymentId ? 'paid' : 'unpaid'));
-  const statusHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
-    o.status_history ?? o.status_history_json,
-    [{ status: fulfillmentStatus, note: 'Order placed', actor: 'system', at: createdAt }]
-  );
-  const returnRequest = parseJsonOrValue<OrderReturnRequest | null>(
-    o.return_request ?? o.return_request_json,
-    null
-  );
+  const parsedHistory = parseOrderHistory(o.status_history ?? o.status_history_json);
+  const statusHistory: OrderStatusHistoryEntry[] =
+    parsedHistory.length > 0
+      ? (parsedHistory as OrderStatusHistoryEntry[])
+      : [{ status: paymentMethod === 'cod' ? 'placed' : 'confirmed', note: 'Order placed', actor: 'system', at: createdAt }];
+
+  const norm = normalizeOrderRequestsAndStatus({
+    rawStatus: typeof o.status === 'string' ? o.status : undefined,
+    rawFulfillmentStatus:
+      typeof o.fulfillment_status === 'string' ? o.fulfillment_status : undefined,
+    rawCancelRequest: o.cancel_request ?? o.cancel_request_json,
+    rawReturnRequest: o.return_request ?? o.return_request_json,
+    history: statusHistory,
+    paymentMethod,
+  });
+
   const subtotalPaise = Number(o.subtotal_paise || 0);
   const totalPaise = Number(o.total_paise || 0);
   const items = Array.isArray(o.items) ? (o.items as Array<Record<string, unknown>>) : [];
@@ -889,10 +951,10 @@ function serializeClientOrderDoc(o: Record<string, unknown>) {
     customerPhone: String(o.customer_phone || ''),
     customerEmail: String(o.customer_email || ''),
     shippingAddress: String(o.shipping_address || ''),
-    status,
+    status: norm.status,
     paymentStatus,
-    fulfillmentStatus,
-    paymentMethod: String(o.payment_method || (rzOrderId || rzPaymentId ? 'razorpay' : 'cod')),
+    fulfillmentStatus: norm.fulfillmentStatus,
+    paymentMethod,
     paymentCollectedAt:
       typeof o.payment_collected_at === 'number' ? Number(o.payment_collected_at) : null,
     idempotencyKey: typeof o.idempotency_key === 'string' ? o.idempotency_key : null,
@@ -908,7 +970,18 @@ function serializeClientOrderDoc(o: Record<string, unknown>) {
     total: Number((totalPaise / 100).toFixed(2)),
     currency: String(o.currency || 'INR'),
     statusHistory,
-    returnRequest,
+    cancelRequest: norm.cancelRequest,
+    returnRequest: norm.returnRequest,
+    hiddenByCustomer: Boolean(o.hidden_by_customer === true || o.hidden_by_customer === 1),
+    hiddenAt: typeof o.hidden_at === 'number' ? Number(o.hidden_at) : null,
+    deliveryDetailsEditedAt:
+      typeof o.delivery_details_edited_at === 'number'
+        ? Number(o.delivery_details_edited_at)
+        : null,
+    stockRestoredAt:
+      typeof o.stock_restored_at === 'number' ? Number(o.stock_restored_at) : null,
+    needsAdminReview: norm.needsAdminReview,
+    legacyCollisionNote: norm.legacyCollisionNote,
     notes: typeof o.notes === 'string' ? o.notes : '',
     createdAt,
     updatedAt,
@@ -2344,6 +2417,8 @@ async function ensureCompletedClientSignIn(params: {
     created_at?: number;
     phone_e164?: string | null;
     phone_verified?: boolean;
+    notification_prefs_json?: string | null;
+    notification_prefs?: unknown;
   }>('users', account.uid, signIn.idToken).catch(() => null);
 
   const fullName =
@@ -2351,6 +2426,10 @@ async function ensureCompletedClientSignIn(params: {
     signIn.displayName ||
     existingUserDoc?.full_name ||
     (isOwner ? 'Store Owner' : 'Member');
+
+  const notificationPrefs = parseNotificationPrefs(
+    existingUserDoc?.notification_prefs ?? existingUserDoc?.notification_prefs_json
+  );
 
   await firestoreSetDoc(
     'users',
@@ -2365,6 +2444,7 @@ async function ensureCompletedClientSignIn(params: {
         typeof existingUserDoc?.phone_verified === 'boolean'
           ? existingUserDoc.phone_verified
           : false,
+      notification_prefs_json: JSON.stringify(notificationPrefs),
       created_at: Number(existingUserDoc?.created_at || now),
       updated_at: now,
     },
@@ -2418,6 +2498,8 @@ async function ensureCompletedClientSignIn(params: {
     uid: account.uid,
     email: account.email,
     fullName,
+    phone: existingUserDoc?.phone_e164 ?? null,
+    notificationPrefs,
     emailVerified: true,
     lastReauthAt: now,
     issuedAt: now,
@@ -3024,14 +3106,37 @@ export async function handleClientlessApiRequest<T>(
         };
       }
       if (upperMethod === 'GET') {
+        const userDoc = await firestoreGetDoc<{
+          full_name?: string;
+          phone_e164?: string | null;
+          notification_prefs_json?: string | null;
+          notification_prefs?: unknown;
+        }>('users', session.uid, session.idToken).catch(() => null);
+        if (userDoc) {
+          const synced: ClientFirebaseSession = {
+            ...session,
+            fullName: userDoc.full_name || session.fullName,
+            phone: userDoc.phone_e164 !== undefined ? userDoc.phone_e164 : (session.phone ?? null),
+            notificationPrefs: parseNotificationPrefs(
+              userDoc.notification_prefs ?? userDoc.notification_prefs_json ?? session.notificationPrefs
+            ),
+          };
+          saveStoredSession(synced);
+          return {
+            ok: true,
+            data: { user: buildPublicAuthUser(synced) } as unknown as T,
+          };
+        }
         return {
           ok: true,
           data: { user: buildPublicAuthUser(session) } as unknown as T,
         };
       }
       if (upperMethod === 'PATCH') {
-        const fullName = typeof body.fullName === 'string' ? body.fullName.trim() : '';
-        if (fullName.length < 2 || fullName.length > 100) {
+        const hasFullName = body.fullName !== undefined;
+        const fullName =
+          typeof body.fullName === 'string' ? body.fullName.trim() : session.fullName;
+        if (hasFullName && (fullName.length < 2 || fullName.length > 100)) {
           return {
             ok: false,
             status: 400,
@@ -3039,17 +3144,69 @@ export async function handleClientlessApiRequest<T>(
             error: 'Please enter a valid full name (2–100 characters).',
           };
         }
-        await callIdentityToolkit('accounts:update', {
-          idToken: session.idToken,
-          displayName: fullName,
-          returnSecureToken: false,
-        });
-        const now = Date.now();
+
+        let nextPhone = session.phone ?? null;
+        if (body.phone !== undefined) {
+          if (body.phone === null || String(body.phone).trim() === '') {
+            nextPhone = null;
+          } else {
+            const rawPhone = String(body.phone).trim();
+            const digits = rawPhone.replace(/[\s()-]/g, '');
+            if (!/^\+?[0-9]{7,15}$/.test(digits)) {
+              return {
+                ok: false,
+                status: 400,
+                code: 'VALIDATION_ERROR',
+                error: 'Please enter a valid phone number (7–15 digits) or leave it blank.',
+              };
+            }
+            nextPhone = rawPhone.slice(0, 24);
+          }
+        }
+
         const existingUserDoc = await firestoreGetDoc<{
           created_at?: number;
           phone_e164?: string | null;
           phone_verified?: boolean;
+          notification_prefs_json?: string | null;
+          notification_prefs?: unknown;
         }>('users', session.uid, session.idToken).catch(() => null);
+
+        const basePrefs = parseNotificationPrefs(
+          existingUserDoc?.notification_prefs ??
+            existingUserDoc?.notification_prefs_json ??
+            session.notificationPrefs
+        );
+
+        let nextPrefs = basePrefs;
+        if (body.notificationPrefs !== undefined) {
+          if (
+            !body.notificationPrefs ||
+            typeof body.notificationPrefs !== 'object' ||
+            Array.isArray(body.notificationPrefs)
+          ) {
+            return {
+              ok: false,
+              status: 400,
+              code: 'VALIDATION_ERROR',
+              error: 'Invalid notification preferences format.',
+            };
+          }
+          nextPrefs = parseNotificationPrefs({
+            ...basePrefs,
+            ...(body.notificationPrefs as Record<string, unknown>),
+          });
+        }
+
+        if (hasFullName && fullName !== session.fullName) {
+          await callIdentityToolkit('accounts:update', {
+            idToken: session.idToken,
+            displayName: fullName,
+            returnSecureToken: false,
+          });
+        }
+
+        const now = Date.now();
         await firestoreSetDoc(
           'users',
           session.uid,
@@ -3058,24 +3215,114 @@ export async function handleClientlessApiRequest<T>(
             full_name: fullName,
             email: session.email,
             email_verified: Boolean(session.emailVerified),
-            phone_e164: existingUserDoc?.phone_e164 ?? null,
+            phone_e164: body.phone !== undefined ? nextPhone : (existingUserDoc?.phone_e164 ?? nextPhone),
             phone_verified:
               typeof existingUserDoc?.phone_verified === 'boolean'
                 ? existingUserDoc.phone_verified
                 : false,
+            notification_prefs_json: JSON.stringify(nextPrefs),
             created_at: Number(existingUserDoc?.created_at || session.issuedAt || now),
             updated_at: now,
           },
           session.idToken
         );
+
         const updatedSession: ClientFirebaseSession = {
           ...session,
           fullName,
+          phone: body.phone !== undefined ? nextPhone : (existingUserDoc?.phone_e164 ?? nextPhone),
+          notificationPrefs: nextPrefs,
         };
         saveStoredSession(updatedSession);
+        emitBoutiqueSyncEvent('account');
         return {
           ok: true,
           data: { user: buildPublicAuthUser(updatedSession) } as unknown as T,
+        };
+      }
+      if (upperMethod === 'DELETE') {
+        if (session.email.toLowerCase() === AUTHORIZED_OWNER_EMAIL) {
+          return {
+            ok: false,
+            status: 403,
+            code: 'OWNER_ACCOUNT_PROTECTED',
+            error: 'The verified store owner account cannot be deleted from customer settings.',
+          };
+        }
+        if (Date.now() - session.lastReauthAt > REAUTH_WINDOW_MS) {
+          return {
+            ok: false,
+            status: 403,
+            code: 'REAUTH_REQUIRED',
+            error: 'Please verify your current password before permanently deleting your account.',
+          };
+        }
+        const confirmText = typeof body.confirmText === 'string' ? body.confirmText.trim() : '';
+        if (confirmText !== 'DELETE') {
+          return {
+            ok: false,
+            status: 400,
+            code: 'CONFIRMATION_REQUIRED',
+            error: 'Type DELETE to confirm permanent account deletion.',
+          };
+        }
+
+        const [addresses, paymentMethods, notifications, customerOrders] = await Promise.all([
+          firestoreListDocs<{ id?: string }>(`users/${encodeURIComponent(session.uid)}/addresses`, session.idToken).catch(() => []),
+          firestoreListDocs<{ id?: string }>(`users/${encodeURIComponent(session.uid)}/payment_methods`, session.idToken).catch(() => []),
+          firestoreListDocs<{ id?: string }>(`users/${encodeURIComponent(session.uid)}/notifications`, session.idToken).catch(() => []),
+          firestoreRunQuery<{ id?: string }>(
+            'orders',
+            [{ field: 'customer_user_id', value: session.uid }],
+            session.idToken
+          ).catch(() => []),
+        ]);
+
+        const delNow = Date.now();
+        await Promise.all([
+          ...addresses
+            .filter((a) => typeof a.id === 'string' && a.id)
+            .map((a) =>
+              firestoreDeleteDoc(`users/${encodeURIComponent(session.uid)}/addresses`, String(a.id), session.idToken).catch(() => undefined)
+            ),
+          ...paymentMethods
+            .filter((p) => typeof p.id === 'string' && p.id)
+            .map((p) =>
+              firestoreDeleteDoc(`users/${encodeURIComponent(session.uid)}/payment_methods`, String(p.id), session.idToken).catch(() => undefined)
+            ),
+          ...notifications
+            .filter((n) => typeof n.id === 'string' && n.id)
+            .map((n) =>
+              firestoreDeleteDoc(`users/${encodeURIComponent(session.uid)}/notifications`, String(n.id), session.idToken).catch(() => undefined)
+            ),
+          ...customerOrders
+            .filter((o) => typeof o.id === 'string' && o.id)
+            .map((o) =>
+              firestoreSetDoc(
+                'orders',
+                String(o.id),
+                { customer_user_id: null, updated_at: delNow },
+                session.idToken,
+                ['customer_user_id', 'updated_at']
+              ).catch(() => undefined)
+            ),
+          firestoreDeleteDoc(`users/${encodeURIComponent(session.uid)}/wishlist`, 'items', session.idToken).catch(() => undefined),
+        ]);
+
+        await firestoreDeleteDoc('users', session.uid, session.idToken);
+        await callIdentityToolkit('accounts:delete', { idToken: session.idToken }).catch(
+          () => undefined
+        );
+        clearClientFirebaseSession();
+        emitBoutiqueSyncEvent('account');
+        return {
+          ok: true,
+          data: {
+            ok: true,
+            deletedUserId: session.uid,
+            csrfToken: randomHex(16),
+            message: 'Your account and saved personal data have been permanently deleted.',
+          } as unknown as T,
         };
       }
     }
@@ -3192,6 +3439,7 @@ export async function handleClientlessApiRequest<T>(
       );
       const items = docs
         .map((d) => serializeClientOrderDoc(d))
+        .filter((o) => !o.hiddenByCustomer)
         .sort((a, b) => b.createdAt - a.createdAt);
       const pendingRzpItems = items
         .filter(
@@ -3224,8 +3472,137 @@ export async function handleClientlessApiRequest<T>(
 
     if (
       cleanPath.startsWith('/api/account/orders/') &&
-      cleanPath.endsWith('/request') &&
+      cleanPath.endsWith('/request/withdraw') &&
       upperMethod === 'POST'
+    ) {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const orderId = decodeURIComponent(
+        cleanPath.slice('/api/account/orders/'.length, -'/request/withdraw'.length)
+      );
+      const meta = await firestoreGetDocWithMeta<Record<string, unknown>>(
+        'orders',
+        orderId,
+        session.idToken
+      );
+      if (!meta) {
+        return {
+          ok: false,
+          status: 404,
+          code: 'ORDER_NOT_FOUND',
+          error: 'Order not found.',
+        };
+      }
+      const existing = meta.data;
+      if (existing.customer_user_id !== session.uid) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'FORBIDDEN',
+          error: 'You can only withdraw requests on your own orders.',
+        };
+      }
+      const prevHistory = parseOrderHistory(existing.status_history ?? existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: typeof existing.status === 'string' ? existing.status : undefined,
+        rawFulfillmentStatus:
+          typeof existing.fulfillment_status === 'string' ? existing.fulfillment_status : undefined,
+        rawCancelRequest: existing.cancel_request ?? existing.cancel_request_json,
+        rawReturnRequest: existing.return_request ?? existing.return_request_json,
+        history: prevHistory,
+        paymentMethod:
+          typeof existing.payment_method === 'string' ? existing.payment_method : undefined,
+      });
+      const reqType: 'cancel' | 'return' | null =
+        body.type === 'cancel'
+          ? 'cancel'
+          : body.type === 'return'
+            ? 'return'
+            : norm.cancelRequest?.status === 'pending'
+              ? 'cancel'
+              : norm.returnRequest?.status === 'pending'
+                ? 'return'
+                : null;
+      const target = reqType === 'cancel' ? norm.cancelRequest : reqType === 'return' ? norm.returnRequest : null;
+      if (!target || !reqType) {
+        return {
+          ok: false,
+          status: 404,
+          code: 'REQUEST_NOT_FOUND',
+          error: 'No active request found on this order.',
+        };
+      }
+      if (target.status !== 'pending') {
+        return {
+          ok: false,
+          status: 409,
+          code: 'CONCURRENCY_CONFLICT',
+          error: `Cannot withdraw ${reqType} request because it has already been ${target.status}.`,
+        };
+      }
+      const now = Date.now();
+      const updatedReq: OrderReturnRequest = {
+        ...target,
+        status: 'withdrawn',
+        updatedAt: now,
+        resolvedAt: now,
+        resolutionNote: 'Withdrawn by customer',
+      };
+      const nextHistory: OrderStatusHistoryEntry[] = [
+        ...(prevHistory as OrderStatusHistoryEntry[]),
+        {
+          status: `${reqType}_withdrawn`,
+          note: `${reqType === 'cancel' ? 'Cancellation' : 'Return'} request withdrawn by customer`,
+          actor: 'customer',
+          at: now,
+        },
+      ];
+      const patchFields =
+        reqType === 'cancel'
+          ? {
+              cancel_request: updatedReq,
+              cancel_request_json: JSON.stringify(updatedReq),
+              return_request: norm.returnRequest ?? null,
+              return_request_json: norm.returnRequest ? JSON.stringify(norm.returnRequest) : null,
+            }
+          : {
+              return_request: updatedReq,
+              return_request_json: JSON.stringify(updatedReq),
+            };
+      const patch: Record<string, unknown> = {
+        status: norm.fulfillmentStatus,
+        fulfillment_status: norm.fulfillmentStatus,
+        ...patchFields,
+        status_history: nextHistory,
+        status_history_json: JSON.stringify(nextHistory),
+        updated_at: now,
+      };
+      await firestoreSetDoc(
+        'orders',
+        orderId,
+        patch,
+        session.idToken,
+        Object.keys(patch),
+        { updateTime: meta.updateTime }
+      );
+      emitBoutiqueSyncEvent('orders');
+      return {
+        ok: true,
+        data: { order: serializeClientOrderDoc({ ...existing, ...patch }) } as unknown as T,
+      };
+    }
+
+    if (
+      cleanPath.startsWith('/api/account/orders/') &&
+      cleanPath.endsWith('/request') &&
+      (upperMethod === 'POST' || upperMethod === 'PATCH' || upperMethod === 'DELETE')
     ) {
       const session = await getValidClientSession();
       if (!session) {
@@ -3239,8 +3616,123 @@ export async function handleClientlessApiRequest<T>(
       const orderId = decodeURIComponent(
         cleanPath.slice('/api/account/orders/'.length, -'/request'.length)
       );
+      const meta = await firestoreGetDocWithMeta<Record<string, unknown>>(
+        'orders',
+        orderId,
+        session.idToken
+      );
+      if (!meta) {
+        return {
+          ok: false,
+          status: 404,
+          code: 'ORDER_NOT_FOUND',
+          error: 'Order not found.',
+        };
+      }
+      const existing = meta.data;
+      if (existing.customer_user_id !== session.uid) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'FORBIDDEN',
+          error: 'You can only manage requests for your own orders.',
+        };
+      }
+      const prevHistory = parseOrderHistory(existing.status_history ?? existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: typeof existing.status === 'string' ? existing.status : undefined,
+        rawFulfillmentStatus:
+          typeof existing.fulfillment_status === 'string' ? existing.fulfillment_status : undefined,
+        rawCancelRequest: existing.cancel_request ?? existing.cancel_request_json,
+        rawReturnRequest: existing.return_request ?? existing.return_request_json,
+        history: prevHistory,
+        paymentMethod:
+          typeof existing.payment_method === 'string' ? existing.payment_method : undefined,
+      });
+
+      if (upperMethod === 'DELETE') {
+        const reqType: 'cancel' | 'return' | null =
+          body.type === 'cancel'
+            ? 'cancel'
+            : body.type === 'return'
+              ? 'return'
+              : norm.cancelRequest?.status === 'pending'
+                ? 'cancel'
+                : norm.returnRequest?.status === 'pending'
+                  ? 'return'
+                  : null;
+        const target =
+          reqType === 'cancel' ? norm.cancelRequest : reqType === 'return' ? norm.returnRequest : null;
+        if (!target || !reqType) {
+          return {
+            ok: false,
+            status: 404,
+            code: 'REQUEST_NOT_FOUND',
+            error: 'No active pending request found on this order.',
+          };
+        }
+        if (target.status !== 'pending') {
+          return {
+            ok: false,
+            status: 409,
+            code: 'CONCURRENCY_CONFLICT',
+            error: `Cannot withdraw ${reqType} request because it has already been ${target.status}.`,
+          };
+        }
+        const now = Date.now();
+        const updatedReq: OrderReturnRequest = {
+          ...target,
+          status: 'withdrawn',
+          updatedAt: now,
+          resolvedAt: now,
+          resolutionNote: 'Withdrawn by customer',
+        };
+        const nextHistory: OrderStatusHistoryEntry[] = [
+          ...(prevHistory as OrderStatusHistoryEntry[]),
+          {
+            status: `${reqType}_withdrawn`,
+            note: `${reqType === 'cancel' ? 'Cancellation' : 'Return'} request withdrawn by customer`,
+            actor: 'customer',
+            at: now,
+          },
+        ];
+        const patchFields =
+          reqType === 'cancel'
+            ? {
+                cancel_request: updatedReq,
+                cancel_request_json: JSON.stringify(updatedReq),
+                return_request: norm.returnRequest ?? null,
+                return_request_json: norm.returnRequest ? JSON.stringify(norm.returnRequest) : null,
+              }
+            : {
+                return_request: updatedReq,
+                return_request_json: JSON.stringify(updatedReq),
+              };
+        const patch: Record<string, unknown> = {
+          status: norm.fulfillmentStatus,
+          fulfillment_status: norm.fulfillmentStatus,
+          ...patchFields,
+          status_history: nextHistory,
+          status_history_json: JSON.stringify(nextHistory),
+          updated_at: now,
+        };
+        await firestoreSetDoc(
+          'orders',
+          orderId,
+          patch,
+          session.idToken,
+          Object.keys(patch),
+          { updateTime: meta.updateTime }
+        );
+        emitBoutiqueSyncEvent('orders');
+        return {
+          ok: true,
+          data: { order: serializeClientOrderDoc({ ...existing, ...patch }) } as unknown as T,
+        };
+      }
+
       const reqType = body.type === 'cancel' ? 'cancel' : body.type === 'return' ? 'return' : null;
-      const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+      const reason = typeof body.reason === 'string' ? body.reason.trim().slice(0, 500) : '';
       if (!reqType) {
         return {
           ok: false,
@@ -3249,14 +3741,321 @@ export async function handleClientlessApiRequest<T>(
           error: 'Request type must be "cancel" or "return".',
         };
       }
-      if (reason.length < 5 || reason.length > 500) {
+      if (reason.length < 3 || reason.length > 500) {
         return {
           ok: false,
           status: 400,
           code: 'VALIDATION_ERROR',
-          error: 'Please provide a reason between 5 and 500 characters.',
+          error: 'Please provide a reason between 3 and 500 characters.',
         };
       }
+
+      if (upperMethod === 'PATCH') {
+        const target = reqType === 'cancel' ? norm.cancelRequest : norm.returnRequest;
+        if (!target) {
+          return {
+            ok: false,
+            status: 404,
+            code: 'REQUEST_NOT_FOUND',
+            error: 'No existing request found on this order.',
+          };
+        }
+        if (target.status !== 'pending') {
+          return {
+            ok: false,
+            status: 409,
+            code: 'CONCURRENCY_CONFLICT',
+            error: `Cannot edit ${reqType} request because it is already "${target.status}".`,
+          };
+        }
+        if (reqType === 'cancel' && !PRE_SHIPPING_CANCEL_STATES.has(norm.fulfillmentStatus)) {
+          return {
+            ok: false,
+            status: 409,
+            code: 'CANCELLATION_CUTOFF_PASSED',
+            error: `Cancellation is no longer available because the order is ${norm.fulfillmentStatus}.`,
+          };
+        }
+        const now = Date.now();
+        const updatedReq: OrderReturnRequest = {
+          ...target,
+          reason,
+          updatedAt: now,
+        };
+        const nextHistory: OrderStatusHistoryEntry[] = [
+          ...(prevHistory as OrderStatusHistoryEntry[]),
+          {
+            status: `${reqType}_request_updated`,
+            note: `${reqType === 'cancel' ? 'Cancellation' : 'Return'} reason updated: ${reason}`,
+            actor: 'customer',
+            at: now,
+          },
+        ];
+        const patchFields =
+          reqType === 'cancel'
+            ? {
+                cancel_request: updatedReq,
+                cancel_request_json: JSON.stringify(updatedReq),
+                return_request: norm.returnRequest ?? null,
+                return_request_json: norm.returnRequest ? JSON.stringify(norm.returnRequest) : null,
+              }
+            : {
+                return_request: updatedReq,
+                return_request_json: JSON.stringify(updatedReq),
+              };
+        const patch: Record<string, unknown> = {
+          status: norm.fulfillmentStatus,
+          fulfillment_status: norm.fulfillmentStatus,
+          ...patchFields,
+          status_history: nextHistory,
+          status_history_json: JSON.stringify(nextHistory),
+          updated_at: now,
+        };
+        await firestoreSetDoc(
+          'orders',
+          orderId,
+          patch,
+          session.idToken,
+          Object.keys(patch),
+          { updateTime: meta.updateTime }
+        );
+        emitBoutiqueSyncEvent('orders');
+        return {
+          ok: true,
+          data: { order: serializeClientOrderDoc({ ...existing, ...patch }) } as unknown as T,
+        };
+      }
+
+      // POST submit new request
+      if (reqType === 'cancel') {
+        if (!PRE_SHIPPING_CANCEL_STATES.has(norm.fulfillmentStatus)) {
+          return {
+            ok: false,
+            status: 409,
+            code: 'CANCELLATION_CUTOFF_PASSED',
+            error: `Cancellation is unavailable once an order is ${norm.fulfillmentStatus}.`,
+          };
+        }
+        if (norm.cancelRequest?.status === 'pending') {
+          if (norm.cancelRequest.reason === reason) {
+            return {
+              ok: true,
+              data: { order: serializeClientOrderDoc(existing) } as unknown as T,
+            };
+          }
+          return {
+            ok: false,
+            status: 409,
+            code: 'REQUEST_ALREADY_PENDING',
+            error: 'A cancellation request is already pending for this order.',
+          };
+        }
+      } else {
+        if (!RETURN_ELIGIBLE_STATES.has(norm.fulfillmentStatus)) {
+          return {
+            ok: false,
+            status: 409,
+            code: 'RETURN_NOT_ELIGIBLE',
+            error: 'Returns can only be requested after an order has been delivered.',
+          };
+        }
+        if (norm.returnRequest?.status === 'pending') {
+          if (norm.returnRequest.reason === reason) {
+            return {
+              ok: true,
+              data: { order: serializeClientOrderDoc(existing) } as unknown as T,
+            };
+          }
+          return {
+            ok: false,
+            status: 409,
+            code: 'REQUEST_ALREADY_PENDING',
+            error: 'A return request is already pending for this order.',
+          };
+        }
+      }
+
+      const now = Date.now();
+      const newReq: OrderReturnRequest = {
+        id: `req_${now.toString(36)}_${randomHex(3)}`,
+        type: reqType,
+        reason,
+        status: 'pending',
+        requestedAt: now,
+        updatedAt: now,
+        resolvedAt: null,
+      };
+      const nextHistory: OrderStatusHistoryEntry[] = [
+        ...(prevHistory as OrderStatusHistoryEntry[]),
+        {
+          status: reqType === 'cancel' ? 'cancel_requested' : 'return_requested',
+          note: `${reqType === 'cancel' ? 'Cancellation' : 'Return'} requested: ${reason}`,
+          actor: 'customer',
+          at: now,
+        },
+      ];
+      const patchFields =
+        reqType === 'cancel'
+          ? {
+              cancel_request: newReq,
+              cancel_request_json: JSON.stringify(newReq),
+            }
+          : {
+              return_request: newReq,
+              return_request_json: JSON.stringify(newReq),
+            };
+      const patch: Record<string, unknown> = {
+        status: norm.fulfillmentStatus,
+        fulfillment_status: norm.fulfillmentStatus,
+        ...patchFields,
+        status_history: nextHistory,
+        status_history_json: JSON.stringify(nextHistory),
+        updated_at: now,
+      };
+      await firestoreSetDoc(
+        'orders',
+        orderId,
+        patch,
+        session.idToken,
+        Object.keys(patch),
+        { updateTime: meta.updateTime }
+      );
+      emitBoutiqueSyncEvent('orders');
+      return {
+        ok: true,
+        data: { order: serializeClientOrderDoc({ ...existing, ...patch }) } as unknown as T,
+      };
+    }
+
+    if (
+      cleanPath.startsWith('/api/account/orders/') &&
+      cleanPath.endsWith('/delivery') &&
+      upperMethod === 'PATCH'
+    ) {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const orderId = decodeURIComponent(
+        cleanPath.slice('/api/account/orders/'.length, -'/delivery'.length)
+      );
+      const meta = await firestoreGetDocWithMeta<Record<string, unknown>>(
+        'orders',
+        orderId,
+        session.idToken
+      );
+      if (!meta) {
+        return {
+          ok: false,
+          status: 404,
+          code: 'ORDER_NOT_FOUND',
+          error: 'Order not found.',
+        };
+      }
+      const existing = meta.data;
+      if (existing.customer_user_id !== session.uid) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'FORBIDDEN',
+          error: 'You can only edit delivery details for your own orders.',
+        };
+      }
+      const prevHistory = parseOrderHistory(existing.status_history ?? existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: typeof existing.status === 'string' ? existing.status : undefined,
+        rawFulfillmentStatus:
+          typeof existing.fulfillment_status === 'string' ? existing.fulfillment_status : undefined,
+        rawCancelRequest: existing.cancel_request ?? existing.cancel_request_json,
+        rawReturnRequest: existing.return_request ?? existing.return_request_json,
+        history: prevHistory,
+        paymentMethod:
+          typeof existing.payment_method === 'string' ? existing.payment_method : undefined,
+      });
+      if (!PRE_CUTOFF_DELIVERY_EDIT_STATES.has(norm.fulfillmentStatus)) {
+        return {
+          ok: false,
+          status: 409,
+          code: 'DELIVERY_EDIT_CUTOFF_PASSED',
+          error: `Delivery details cannot be edited once an order is ${norm.fulfillmentStatus}.`,
+        };
+      }
+      const nextName =
+        typeof body.customerName === 'string'
+          ? body.customerName.trim()
+          : String(existing.customer_name || '');
+      const nextPhone =
+        typeof body.customerPhone === 'string'
+          ? body.customerPhone.trim()
+          : String(existing.customer_phone || '');
+      const nextAddress =
+        typeof body.shippingAddress === 'string'
+          ? body.shippingAddress.trim()
+          : String(existing.shipping_address || '');
+      if (nextName.length < 2 || nextPhone.length < 7 || nextAddress.length < 10) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          error: 'Please enter a valid recipient name, phone number, and delivery address.',
+        };
+      }
+      const now = Date.now();
+      const nextHistory: OrderStatusHistoryEntry[] = [
+        ...(prevHistory as OrderStatusHistoryEntry[]),
+        {
+          status: 'delivery_updated',
+          note: 'Delivery contact/address updated by customer before dispatch',
+          actor: 'customer',
+          at: now,
+        },
+      ];
+      const patch: Record<string, unknown> = {
+        customer_name: nextName.slice(0, 120),
+        customer_phone: nextPhone.slice(0, 32),
+        shipping_address: nextAddress.slice(0, 600),
+        delivery_details_edited_at: now,
+        status_history: nextHistory,
+        status_history_json: JSON.stringify(nextHistory),
+        updated_at: now,
+      };
+      await firestoreSetDoc(
+        'orders',
+        orderId,
+        patch,
+        session.idToken,
+        Object.keys(patch),
+        { updateTime: meta.updateTime }
+      );
+      emitBoutiqueSyncEvent('orders');
+      return {
+        ok: true,
+        data: { order: serializeClientOrderDoc({ ...existing, ...patch }) } as unknown as T,
+      };
+    }
+
+    if (
+      cleanPath.startsWith('/api/account/orders/') &&
+      cleanPath.endsWith('/hide') &&
+      upperMethod === 'POST'
+    ) {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const orderId = decodeURIComponent(
+        cleanPath.slice('/api/account/orders/'.length, -'/hide'.length)
+      );
       const existing = await firestoreGetDoc<Record<string, unknown>>(
         'orders',
         orderId,
@@ -3275,58 +4074,25 @@ export async function handleClientlessApiRequest<T>(
           ok: false,
           status: 403,
           code: 'FORBIDDEN',
-          error: 'You can only submit requests for your own orders.',
-        };
-      }
-      const currentReq = parseJsonOrValue<OrderReturnRequest | null>(
-        existing.return_request ?? existing.return_request_json,
-        null
-      );
-      if (currentReq && currentReq.status === 'pending') {
-        return {
-          ok: false,
-          status: 409,
-          code: 'REQUEST_ALREADY_PENDING',
-          error: 'A cancel/return request is already pending for this order.',
+          error: 'You can only hide orders from your own account.',
         };
       }
       const now = Date.now();
-      const newReq: OrderReturnRequest = {
-        id: `req_${now.toString(36)}_${randomHex(3)}`,
-        type: reqType,
-        reason,
-        status: 'pending',
-        requestedAt: now,
-        resolvedAt: null,
-        resolutionNote: undefined,
-      };
-      const prevHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
-        existing.status_history ?? existing.status_history_json,
-        []
-      );
-      const nextHistory: OrderStatusHistoryEntry[] = [
-        ...prevHistory,
+      await firestoreSetDoc(
+        'orders',
+        orderId,
         {
-          status: 'return_requested',
-          note: `${reqType === 'cancel' ? 'Cancellation' : 'Return'} requested: ${reason}`,
-          actor: 'customer',
-          at: now,
+          hidden_by_customer: true,
+          hidden_at: now,
+          updated_at: now,
         },
-      ];
-      const updated = {
-        ...existing,
-        status: 'return_requested',
-        fulfillment_status: 'return_requested',
-        return_request: newReq,
-        return_request_json: JSON.stringify(newReq),
-        status_history: nextHistory,
-        status_history_json: JSON.stringify(nextHistory),
-        updated_at: now,
-      };
-      await firestoreSetDoc('orders', orderId, updated, session.idToken);
+        session.idToken,
+        ['hidden_by_customer', 'hidden_at', 'updated_at']
+      );
+      emitBoutiqueSyncEvent('orders');
       return {
         ok: true,
-        data: { order: serializeClientOrderDoc(updated) } as unknown as T,
+        data: { ok: true, hiddenOrderId: orderId } as unknown as T,
       };
     }
 
@@ -3695,6 +4461,43 @@ export async function handleClientlessApiRequest<T>(
       return { ok: true, data: { ok: true, id: notifId } as unknown as T };
     }
 
+    if (
+      cleanPath.startsWith('/api/account/notifications/') &&
+      upperMethod === 'DELETE'
+    ) {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const notifId = decodeURIComponent(
+        cleanPath.slice('/api/account/notifications/'.length)
+      );
+      const existing = await firestoreGetDoc<Record<string, unknown>>(
+        `users/${encodeURIComponent(session.uid)}/notifications`,
+        notifId,
+        session.idToken
+      );
+      if (!existing) {
+        return {
+          ok: false,
+          status: 404,
+          code: 'NOTIFICATION_NOT_FOUND',
+          error: 'Notification not found.',
+        };
+      }
+      await firestoreDeleteDoc(
+        `users/${encodeURIComponent(session.uid)}/notifications`,
+        notifId,
+        session.idToken
+      );
+      return { ok: true, data: { ok: true, deletedId: notifId } as unknown as T };
+    }
+
     if (cleanPath === '/api/account/coupons' && upperMethod === 'GET') {
       const session = await getValidClientSession();
       if (!session) {
@@ -3793,7 +4596,7 @@ export async function handleClientlessApiRequest<T>(
       };
     }
 
-    if (cleanPath === '/api/account/payment-methods' && upperMethod === 'GET') {
+    if (cleanPath === '/api/account/payment-methods') {
       const session = await getValidClientSession();
       if (!session) {
         return {
@@ -3803,16 +4606,162 @@ export async function handleClientlessApiRequest<T>(
           error: 'Authentication required.',
         };
       }
-      return {
-        ok: true,
-        data: {
-          enabled: false,
-          provider: 'razorpay',
-          reason:
-            'Sahithi Collections uses PCI-compliant Razorpay Standard Checkout. Saved card tokens require Razorpay Customer Vault configuration; all UPI, Cards, Wallets, and NetBanking options remain available at checkout.',
-          methods: [],
-        } as unknown as T,
-      };
+      const colPath = `users/${encodeURIComponent(session.uid)}/payment_methods`;
+      if (upperMethod === 'GET') {
+        const docs = await firestoreListDocs<Record<string, unknown>>(colPath, session.idToken);
+        const methods = docs
+          .map((m) => ({
+            id: String(m.id || ''),
+            methodType: (m.method_type === 'upi' || m.method_type === 'wallet'
+              ? m.method_type
+              : 'card') as 'card' | 'upi' | 'wallet',
+            label: String(m.label || ''),
+            last4: typeof m.last4 === 'string' && m.last4 ? m.last4 : null,
+            network: typeof m.network === 'string' && m.network ? m.network : null,
+            expiry: typeof m.expiry === 'string' && m.expiry ? m.expiry : null,
+            createdAt: Number(m.created_at || Date.now()),
+            updatedAt: Number(m.updated_at || Date.now()),
+          }))
+          .sort((a, b) => b.updatedAt - a.updatedAt);
+        return {
+          ok: true,
+          data: {
+            enabled: false,
+            provider: 'razorpay',
+            reason:
+              'Full card entry stays inside PCI-compliant Razorpay Checkout. Save non-sensitive card, UPI, or wallet nicknames below for quick reference.',
+            methods,
+          } as unknown as T,
+        };
+      }
+      if (upperMethod === 'POST') {
+        const validated = validateNonSensitivePaymentMethodInput(body);
+        if (!validated.ok) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'VALIDATION_ERROR',
+            error: validated.error,
+          };
+        }
+        const now = Date.now();
+        const methodId =
+          typeof body.id === 'string' && /^[a-zA-Z0-9_-]{3,80}$/.test(body.id)
+            ? body.id
+            : `pm_${now.toString(36)}_${randomHex(3)}`;
+        const prev = await firestoreGetDoc<Record<string, unknown>>(
+          colPath,
+          methodId,
+          session.idToken
+        ).catch(() => null);
+        const row = {
+          id: methodId,
+          user_id: session.uid,
+          method_type: validated.methodType,
+          label: validated.label,
+          last4: validated.last4,
+          network: validated.network,
+          expiry: validated.expiry,
+          created_at: Number(prev?.created_at || now),
+          updated_at: now,
+        };
+        await firestoreSetDoc(colPath, methodId, row, session.idToken);
+        return {
+          ok: true,
+          data: {
+            method: {
+              id: row.id,
+              methodType: row.method_type,
+              label: row.label,
+              last4: row.last4,
+              network: row.network,
+              expiry: row.expiry,
+              createdAt: row.created_at,
+              updatedAt: row.updated_at,
+            },
+          } as unknown as T,
+        };
+      }
+    }
+
+    if (cleanPath.startsWith('/api/account/payment-methods/')) {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const methodId = decodeURIComponent(
+        cleanPath.slice('/api/account/payment-methods/'.length)
+      );
+      const colPath = `users/${encodeURIComponent(session.uid)}/payment_methods`;
+      if (upperMethod === 'PUT' || upperMethod === 'PATCH') {
+        const validated = validateNonSensitivePaymentMethodInput(body);
+        if (!validated.ok) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'VALIDATION_ERROR',
+            error: validated.error,
+          };
+        }
+        const now = Date.now();
+        const prev = await firestoreGetDoc<Record<string, unknown>>(
+          colPath,
+          methodId,
+          session.idToken
+        ).catch(() => null);
+        const row = {
+          id: methodId,
+          user_id: session.uid,
+          method_type: validated.methodType,
+          label: validated.label,
+          last4: validated.last4,
+          network: validated.network,
+          expiry: validated.expiry,
+          created_at: Number(prev?.created_at || now),
+          updated_at: now,
+        };
+        await firestoreSetDoc(colPath, methodId, row, session.idToken);
+        return {
+          ok: true,
+          data: {
+            method: {
+              id: row.id,
+              methodType: row.method_type,
+              label: row.label,
+              last4: row.last4,
+              network: row.network,
+              expiry: row.expiry,
+              createdAt: row.created_at,
+              updatedAt: row.updated_at,
+            },
+          } as unknown as T,
+        };
+      }
+      if (upperMethod === 'DELETE') {
+        const existing = await firestoreGetDoc<Record<string, unknown>>(
+          colPath,
+          methodId,
+          session.idToken
+        );
+        if (!existing) {
+          return {
+            ok: false,
+            status: 404,
+            code: 'PAYMENT_METHOD_NOT_FOUND',
+            error: 'Saved payment method was not found.',
+          };
+        }
+        await firestoreDeleteDoc(colPath, methodId, session.idToken);
+        return {
+          ok: true,
+          data: { ok: true, deletedId: methodId } as unknown as T,
+        };
+      }
     }
 
     if (cleanPath === '/api/coupons/validate' && upperMethod === 'POST') {
@@ -4661,7 +5610,9 @@ export async function handleClientlessApiRequest<T>(
           0
         );
         const openReturnRequests = serializedOrders.filter(
-          (o) => o.returnRequest && o.returnRequest.status === 'pending'
+          (o) =>
+            o.cancelRequest?.status === 'pending' ||
+            o.returnRequest?.status === 'pending'
         ).length;
 
         return {
@@ -5988,18 +6939,46 @@ export async function handleClientlessApiRequest<T>(
               error: 'Decision must be "approved" or "rejected".',
             };
           }
-          const existing = await firestoreGetDoc<Record<string, unknown>>(
+          const meta = await firestoreGetDocWithMeta<Record<string, unknown>>(
             'orders',
             orderId,
             idToken
           );
-          if (!existing) {
+          if (!meta) {
             return { ok: false, status: 404, code: 'ORDER_NOT_FOUND', error: 'Order not found.' };
           }
-          const currentReq = parseJsonOrValue<OrderReturnRequest | null>(
-            existing.return_request ?? existing.return_request_json,
-            null
+          const existing = meta.data;
+          const prevHistory = parseOrderHistory(
+            existing.status_history ?? existing.status_history_json
           );
+          const norm = normalizeOrderRequestsAndStatus({
+            rawStatus: typeof existing.status === 'string' ? existing.status : undefined,
+            rawFulfillmentStatus:
+              typeof existing.fulfillment_status === 'string'
+                ? existing.fulfillment_status
+                : undefined,
+            rawCancelRequest: existing.cancel_request ?? existing.cancel_request_json,
+            rawReturnRequest: existing.return_request ?? existing.return_request_json,
+            history: prevHistory,
+            paymentMethod:
+              typeof existing.payment_method === 'string' ? existing.payment_method : undefined,
+          });
+          const reqType =
+            body.requestType === 'cancel'
+              ? 'cancel'
+              : body.requestType === 'return'
+                ? 'return'
+                : undefined;
+          const currentReq =
+            reqType === 'cancel'
+              ? norm.cancelRequest
+              : reqType === 'return'
+                ? norm.returnRequest
+                : norm.cancelRequest?.status === 'pending'
+                  ? norm.cancelRequest
+                  : norm.returnRequest?.status === 'pending'
+                    ? norm.returnRequest
+                    : norm.cancelRequest || norm.returnRequest;
           if (!currentReq) {
             return {
               ok: false,
@@ -6008,72 +6987,143 @@ export async function handleClientlessApiRequest<T>(
               error: 'No return or cancellation request found on this order.',
             };
           }
+          if (currentReq.status !== 'pending') {
+            return {
+              ok: false,
+              status: 409,
+              code: 'CONCURRENCY_CONFLICT',
+              error: `Cannot ${decision === 'approved' ? 'approve' : 'reject'} request because its status is already "${currentReq.status}".`,
+            };
+          }
           const now = Date.now();
           const note = typeof body.note === 'string' ? body.note.trim().slice(0, 300) : '';
           const updatedReq: OrderReturnRequest = {
             ...currentReq,
             status: decision,
+            updatedAt: now,
             resolvedAt: now,
             resolutionNote: note || undefined,
           };
-          const nextStatus =
+          const nextFulfillment =
             decision === 'approved'
-              ? currentReq.type === 'cancel'
+              ? updatedReq.type === 'cancel'
                 ? 'cancelled'
                 : 'returned'
-              : 'confirmed';
-          const prevHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
-            existing.status_history ?? existing.status_history_json,
-            []
-          );
+              : norm.fulfillmentStatus;
           const nextHistory: OrderStatusHistoryEntry[] = [
-            ...prevHistory,
+            ...(prevHistory as OrderStatusHistoryEntry[]),
             {
-              status: `${currentReq.type}_${decision}`,
+              status: `${updatedReq.type}_${decision}`,
               note: note || `Request ${decision} by store owner`,
               actor: 'owner',
               at: now,
             },
           ];
-          const updated = {
-            ...existing,
-            status: nextStatus,
-            fulfillment_status: nextStatus,
-            return_request: updatedReq,
-            return_request_json: JSON.stringify(updatedReq),
+          const shouldRestoreStock =
+            decision === 'approved' &&
+            updatedReq.type === 'cancel' &&
+            !existing.stock_restored_at;
+          const patch: Record<string, unknown> = {
+            status: nextFulfillment,
+            fulfillment_status: nextFulfillment,
+            cancel_request: updatedReq.type === 'cancel' ? updatedReq : (norm.cancelRequest ?? null),
+            cancel_request_json:
+              updatedReq.type === 'cancel'
+                ? JSON.stringify(updatedReq)
+                : norm.cancelRequest
+                  ? JSON.stringify(norm.cancelRequest)
+                  : null,
+            return_request: updatedReq.type === 'return' ? updatedReq : (norm.returnRequest ?? null),
+            return_request_json:
+              updatedReq.type === 'return'
+                ? JSON.stringify(updatedReq)
+                : norm.returnRequest
+                  ? JSON.stringify(norm.returnRequest)
+                  : null,
+            stock_restored_at: shouldRestoreStock ? now : (existing.stock_restored_at ?? null),
             status_history: nextHistory,
             status_history_json: JSON.stringify(nextHistory),
             updated_at: now,
           };
-          await firestoreSetDoc('orders', orderId, updated, idToken);
+          await firestoreSetDoc(
+            'orders',
+            orderId,
+            patch,
+            idToken,
+            Object.keys(patch),
+            { updateTime: meta.updateTime }
+          );
+
+          // Idempotent stock restoration AFTER optimistic lock succeeds
+          if (shouldRestoreStock && Array.isArray(existing.items)) {
+            const qtyByProduct = new Map<string, Map<string | null, number>>();
+            for (const item of existing.items as Array<Record<string, unknown>>) {
+              const pid = typeof item.product_id === 'string' ? item.product_id : '';
+              if (!pid) continue;
+              const vid = typeof item.variant_id === 'string' && item.variant_id ? item.variant_id : null;
+              const qty = Math.max(0, Number(item.quantity ?? item.qty ?? 0));
+              if (!qty) continue;
+              const inner = qtyByProduct.get(pid) || new Map<string | null, number>();
+              inner.set(vid, (inner.get(vid) || 0) + qty);
+              qtyByProduct.set(pid, inner);
+            }
+            for (const [pid, varMap] of qtyByProduct.entries()) {
+              const prodDoc = await firestoreGetDoc<StoredProductDoc>('products', pid, idToken).catch(() => null);
+              if (!prodDoc || !Array.isArray(prodDoc.variants)) continue;
+              const cloned = prodDoc.variants.map((v) => ({ ...v }));
+              for (const [vid, qty] of varMap.entries()) {
+                const idx = vid ? cloned.findIndex((v) => v.id === vid) : 0;
+                if (idx >= 0) cloned[idx].stock_qty += qty;
+              }
+              const totalStock = cloned.reduce((sum, v) => sum + Number(v.stock_qty || 0), 0);
+              await firestoreSetDoc(
+                'products',
+                pid,
+                { variants: cloned, stock_qty: totalStock, updated_at: now },
+                idToken,
+                ['variants', 'stock_qty', 'updated_at']
+              ).catch(() => undefined);
+            }
+          }
+
           const customerUid =
             typeof existing.customer_user_id === 'string' ? existing.customer_user_id : null;
           if (customerUid) {
-            const notifId = `notif_req_${orderId}_${decision}_${now}`;
-            await firestoreSetDoc(
-              `users/${encodeURIComponent(customerUid)}/notifications`,
-              notifId,
-              {
-                id: notifId,
-                user_id: customerUid,
-                type: 'request_update',
-                title: `${currentReq.type === 'cancel' ? 'Cancellation' : 'Return'} request ${decision}`,
-                message:
-                  note ||
-                  `Your ${currentReq.type} request for order ${String(existing.order_number || orderId)} was ${decision}.`,
-                order_id: orderId,
-                order_number: String(existing.order_number || ''),
-                is_read: 0,
-                read: false,
-                read_at: null,
-                created_at: now,
-              },
-              idToken
-            ).catch(() => undefined);
+            const custDoc = await firestoreGetDoc<{
+              notification_prefs_json?: string | null;
+              notification_prefs?: unknown;
+            }>('users', customerUid, idToken).catch(() => null);
+            const prefs = parseNotificationPrefs(
+              custDoc?.notification_prefs ?? custDoc?.notification_prefs_json
+            );
+            if (prefs.cancelReturnUpdates) {
+              const notifId = `notif_req_${orderId}_${updatedReq.id}_${decision}`;
+              await firestoreSetDoc(
+                `users/${encodeURIComponent(customerUid)}/notifications`,
+                notifId,
+                {
+                  id: notifId,
+                  user_id: customerUid,
+                  type: 'request_update',
+                  title: `${updatedReq.type === 'cancel' ? 'Cancellation' : 'Return'} request ${decision}`,
+                  message:
+                    note ||
+                    `Your ${updatedReq.type} request for order ${String(existing.order_number || orderId)} was ${decision}.`,
+                  order_id: orderId,
+                  order_number: String(existing.order_number || ''),
+                  is_read: 0,
+                  read: false,
+                  read_at: null,
+                  created_at: now,
+                },
+                idToken
+              ).catch(() => undefined);
+            }
           }
+          emitBoutiqueSyncEvent('orders');
           return {
             ok: true,
-            data: { order: serializeClientOrderDoc(updated) } as unknown as T,
+            data: { order: serializeClientOrderDoc({ ...existing, ...patch }) } as unknown as T,
           };
         }
 
@@ -6141,26 +7191,36 @@ export async function handleClientlessApiRequest<T>(
         const customerUid =
           typeof existing.customer_user_id === 'string' ? existing.customer_user_id : null;
         if (customerUid) {
-          const notifId = `notif_st_${orderId}_${nextStatus}_${now}`;
-          await firestoreSetDoc(
-            `users/${encodeURIComponent(customerUid)}/notifications`,
-            notifId,
-            {
-              id: notifId,
-              user_id: customerUid,
-              type: 'order_status',
-              title: `Order ${String(existing.order_number || orderId)} updated`,
-              message: note || `Order status updated to ${nextStatus.replace(/_/g, ' ')}.`,
-              order_id: orderId,
-              order_number: String(existing.order_number || ''),
-              is_read: 0,
-              read: false,
-              read_at: null,
-              created_at: now,
-            },
-            idToken
-          ).catch(() => undefined);
+          const custDoc = await firestoreGetDoc<{
+            notification_prefs_json?: string | null;
+            notification_prefs?: unknown;
+          }>('users', customerUid, idToken).catch(() => null);
+          const prefs = parseNotificationPrefs(
+            custDoc?.notification_prefs ?? custDoc?.notification_prefs_json
+          );
+          if (prefs.orderUpdates) {
+            const notifId = `notif_st_${orderId}_${nextStatus}_${now}`;
+            await firestoreSetDoc(
+              `users/${encodeURIComponent(customerUid)}/notifications`,
+              notifId,
+              {
+                id: notifId,
+                user_id: customerUid,
+                type: 'order_status',
+                title: `Order ${String(existing.order_number || orderId)} updated`,
+                message: note || `Order status updated to ${nextStatus.replace(/_/g, ' ')}.`,
+                order_id: orderId,
+                order_number: String(existing.order_number || ''),
+                is_read: 0,
+                read: false,
+                read_at: null,
+                created_at: now,
+              },
+              idToken
+            ).catch(() => undefined);
+          }
         }
+        emitBoutiqueSyncEvent('orders');
         const serialized = serializeClientOrderDoc(updated);
         return {
           ok: true,
@@ -6226,26 +7286,36 @@ export async function handleClientlessApiRequest<T>(
         const customerUid =
           typeof existing.customer_user_id === 'string' ? existing.customer_user_id : null;
         if (customerUid) {
-          const notifId = `notif_paid_${orderId}_${now}`;
-          await firestoreSetDoc(
-            `users/${encodeURIComponent(customerUid)}/notifications`,
-            notifId,
-            {
-              id: notifId,
-              user_id: customerUid,
-              type: 'order_status',
-              title: `Payment collected for ${String(existing.order_number || orderId)}`,
-              message: `We have recorded Cash on Delivery payment for order ${String(existing.order_number || orderId)}.`,
-              order_id: orderId,
-              order_number: String(existing.order_number || ''),
-              is_read: 0,
-              read: false,
-              read_at: null,
-              created_at: now,
-            },
-            idToken
-          ).catch(() => undefined);
+          const custDoc = await firestoreGetDoc<{
+            notification_prefs_json?: string | null;
+            notification_prefs?: unknown;
+          }>('users', customerUid, idToken).catch(() => null);
+          const prefs = parseNotificationPrefs(
+            custDoc?.notification_prefs ?? custDoc?.notification_prefs_json
+          );
+          if (prefs.orderUpdates) {
+            const notifId = `notif_paid_${orderId}_${now}`;
+            await firestoreSetDoc(
+              `users/${encodeURIComponent(customerUid)}/notifications`,
+              notifId,
+              {
+                id: notifId,
+                user_id: customerUid,
+                type: 'order_status',
+                title: `Payment collected for ${String(existing.order_number || orderId)}`,
+                message: `We have recorded Cash on Delivery payment for order ${String(existing.order_number || orderId)}.`,
+                order_id: orderId,
+                order_number: String(existing.order_number || ''),
+                is_read: 0,
+                read: false,
+                read_at: null,
+                created_at: now,
+              },
+              idToken
+            ).catch(() => undefined);
+          }
         }
+        emitBoutiqueSyncEvent('orders');
         const serialized = serializeClientOrderDoc(updated);
         return {
           ok: true,
@@ -6493,7 +7563,12 @@ export async function handleClientlessApiRequest<T>(
             full_name?: string;
             email?: string;
             email_verified?: boolean;
+            phone_e164?: string | null;
+            notification_prefs_json?: string | null;
+            notification_prefs?: unknown;
+            deleted_at?: number | null;
             created_at?: number;
+            updated_at?: number;
           }>('users', idToken).catch(() => []),
           firestoreListDocs<Record<string, unknown>>('orders', idToken).catch(() => []),
           firestoreListDocs<{
@@ -6509,13 +7584,36 @@ export async function handleClientlessApiRequest<T>(
           firestoreListDocs<Record<string, unknown>>('gift_cards', idToken).catch(() => []),
         ]);
 
-        const users = usersDocs
+        const activeUserDocs = usersDocs.filter((u) => !u.deleted_at);
+        const addrByUser = new Map<string, ReturnType<typeof serializeClientAddressDoc>[]>();
+        await Promise.all(
+          activeUserDocs.slice(0, 60).map(async (u) => {
+            const addrDocs = await firestoreListDocs<Record<string, unknown>>(
+              `users/${encodeURIComponent(u.id)}/addresses`,
+              idToken
+            ).catch(() => []);
+            addrByUser.set(
+              u.id,
+              addrDocs
+                .map((d) => serializeClientAddressDoc(d))
+                .sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || b.updatedAt - a.updatedAt)
+            );
+          })
+        );
+
+        const users = activeUserDocs
           .map((u) => ({
             id: u.id,
             fullName: u.full_name || 'Member',
             email: u.email || '',
+            phone: u.phone_e164 || null,
+            notificationPrefs: parseNotificationPrefs(
+              u.notification_prefs ?? u.notification_prefs_json
+            ),
+            addresses: addrByUser.get(u.id) || [],
             emailVerified: Boolean(u.email_verified),
             createdAt: Number(u.created_at || 0),
+            updatedAt: Number(u.updated_at || u.created_at || 0),
           }))
           .sort((a, b) => b.createdAt - a.createdAt);
 
@@ -6567,24 +7665,25 @@ export async function handleClientlessApiRequest<T>(
             status: ord.fulfillmentStatus,
             createdAt: ord.createdAt,
           });
-          if (ord.returnRequest) {
+          for (const rr of [ord.cancelRequest, ord.returnRequest]) {
+            if (!rr) continue;
             returnRequests.push({
               orderId: ord.id,
               orderNumber: ord.orderNumber,
               customerName: ord.customerName,
               customerEmail: ord.customerEmail,
               totalPaise: ord.totalPaise,
-              request: ord.returnRequest,
+              request: rr as OrderReturnRequest,
             });
             events.push({
-              id: `ret_${ord.returnRequest.id || ord.id}`,
+              id: `ret_${rr.id || ord.id}_${rr.type}`,
               type: 'return_request',
-              title: `${ord.returnRequest.type === 'cancel' ? 'Cancellation' : 'Return'} Request (${ord.orderNumber})`,
-              detail: ord.returnRequest.reason,
+              title: `${rr.type === 'cancel' ? 'Cancellation' : 'Return'} Request (${ord.orderNumber})`,
+              detail: rr.reason,
               actorLabel: ord.customerEmail,
               refId: ord.id,
-              status: ord.returnRequest.status,
-              createdAt: ord.returnRequest.requestedAt || ord.updatedAt,
+              status: rr.status,
+              createdAt: rr.updatedAt || rr.requestedAt || ord.updatedAt,
             });
           }
           if (ord.couponCode) {

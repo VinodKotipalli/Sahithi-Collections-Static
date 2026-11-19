@@ -34,7 +34,8 @@ interface AdminOrdersPanelProps {
   onResolveReturnRequest: (
     orderId: string,
     decision: 'approved' | 'rejected',
-    note?: string
+    note?: string,
+    requestType?: 'cancel' | 'return'
   ) => Promise<{ ok: boolean; error?: string }>;
   onRecoverOrder: (
     razorpayOrderId: string,
@@ -50,7 +51,6 @@ const ORDER_STATUSES = [
   'shipped',
   'delivered',
   'cancelled',
-  'return_requested',
   'returned',
 ] as const;
 
@@ -67,7 +67,7 @@ export function AdminOrdersPanel({
 }: AdminOrdersPanelProps) {
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [collectingId, setCollectingId] = useState<string | null>(null);
-  const [resolvingId, setResolvingId] = useState<string | null>(null);
+  const [resolvingKey, setResolvingKey] = useState<string | null>(null);
   const [resolutionNotes, setResolutionNotes] = useState<Record<string, string>>({});
   const [statusNotes, setStatusNotes] = useState<Record<string, string>>({});
   const [orderErrors, setOrderErrors] = useState<Record<string, string>>({});
@@ -223,6 +223,11 @@ export function AdminOrdersPanel({
                         <span className="rounded-md border border-[#49243E]/20 bg-white px-2 py-0.5 text-[11px] font-medium text-[#49243E]">
                           {isCod ? 'Cash on Delivery' : 'Online · Razorpay'}
                         </span>
+                        {order.hiddenByCustomer && (
+                          <span className="rounded-md border border-[#B76E79]/40 bg-[#F3D5DF]/40 px-2 py-0.5 text-[11px] font-medium text-[#49243E]">
+                            Hidden by customer
+                          </span>
+                        )}
                       </div>
                       <h3 className="mt-0.5 font-serif text-xl font-semibold text-[#49243E]">
                         {order.customerName}
@@ -230,11 +235,32 @@ export function AdminOrdersPanel({
                       <p className="mt-0.5 text-xs font-semibold uppercase tracking-wider text-[#49243E] tabular-nums">
                         Payment: {paymentDisplay} · Fulfillment: {fulfillment.replace(/_/g, ' ')}
                       </p>
+                      {order.cancelRequest?.status === 'pending' && (
+                        <p className="mt-1 text-xs font-semibold text-[#9B2C3E]">
+                          Cancellation requested · Pending review
+                        </p>
+                      )}
+                      {order.returnRequest?.status === 'pending' && (
+                        <p className="mt-1 text-xs font-semibold text-[#B76E79]">
+                          Return requested · Pending review
+                        </p>
+                      )}
+                      {order.needsAdminReview && (
+                        <p className="mt-1 rounded-lg border border-[#B76E79]/40 bg-[#F3D5DF]/30 px-2.5 py-1 text-[11px] font-medium text-[#49243E]">
+                          Legacy Status Review: {order.legacyCollisionNote || 'Recovered pre-update cancellation state.'}
+                        </p>
+                      )}
                       <p className="mt-1 text-xs tabular-nums text-[#242124]/65">
                         {order.customerEmail} · {order.customerPhone} · Placed{' '}
                         {formatTimestamp(order.createdAt)}
                         {order.paymentCollectedAt
                           ? ` · Collected ${formatTimestamp(order.paymentCollectedAt)}`
+                          : ''}
+                        {order.deliveryDetailsEditedAt
+                          ? ` · Delivery edited ${formatTimestamp(order.deliveryDetailsEditedAt)}`
+                          : ''}
+                        {order.stockRestoredAt
+                          ? ` · Stock restored ${formatTimestamp(order.stockRestoredAt)}`
                           : ''}
                       </p>
                       {order.razorpayOrderId && (
@@ -425,85 +451,96 @@ export function AdminOrdersPanel({
                     </div>
                   )}
 
-                  {order.returnRequest && (
-                    <div className="space-y-2.5 rounded-xl border border-[#B76E79]/40 bg-white p-3.5 text-xs">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <p className="font-semibold text-[#49243E]">
-                          Customer {order.returnRequest.type === 'cancel' ? 'Cancellation' : 'Return'}{' '}
-                          Request · <span className="uppercase">{order.returnRequest.status}</span>
-                        </p>
-                        <span className="tabular-nums text-[#242124]/60">
-                          {formatTimestamp(order.returnRequest.requestedAt)}
-                        </span>
-                      </div>
-                      <p className="text-[#242124]/80">Reason: {order.returnRequest.reason}</p>
-                      {order.returnRequest.resolutionNote && (
-                        <p className="text-[#49243E]">
-                          Owner Note: {order.returnRequest.resolutionNote}
-                        </p>
-                      )}
-                      {order.returnRequest.status === 'pending' && (
-                        <div className="flex flex-wrap items-center gap-2 pt-1">
-                          <input
-                            type="text"
-                            value={resolutionNotes[order.id] || ''}
-                            onChange={(e) =>
-                              setResolutionNotes((prev) => ({
-                                ...prev,
-                                [order.id]: e.target.value,
-                              }))
-                            }
-                            placeholder="Resolution note for customer"
-                            className="min-h-[38px] flex-1 rounded-lg border border-[#49243E]/18 bg-[#FFF9F5]/65 px-3 text-xs"
-                          />
-                          <button
-                            type="button"
-                            disabled={resolvingId === order.id}
-                            onClick={async () => {
-                              setResolvingId(order.id);
-                              const res = await onResolveReturnRequest(
-                                order.id,
-                                'approved',
-                                resolutionNotes[order.id]?.trim() || undefined
-                              );
-                              setResolvingId(null);
-                              if (!res.ok) {
-                                setOrderErrors((prev) => ({
-                                  ...prev,
-                                  [order.id]: res.error || 'Could not approve request.',
-                                }));
-                              }
-                            }}
-                            className="inline-flex min-h-[38px] items-center rounded-lg bg-[#49243E] px-3.5 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31] disabled:opacity-60"
-                          >
-                            Approve
-                          </button>
-                          <button
-                            type="button"
-                            disabled={resolvingId === order.id}
-                            onClick={async () => {
-                              setResolvingId(order.id);
-                              const res = await onResolveReturnRequest(
-                                order.id,
-                                'rejected',
-                                resolutionNotes[order.id]?.trim() || undefined
-                              );
-                              setResolvingId(null);
-                              if (!res.ok) {
-                                setOrderErrors((prev) => ({
-                                  ...prev,
-                                  [order.id]: res.error || 'Could not reject request.',
-                                }));
-                              }
-                            }}
-                            className="inline-flex min-h-[38px] items-center rounded-lg border border-[#B76E79]/40 bg-[#FFF9F5] px-3.5 text-xs font-medium text-[#9B2C3E] hover:bg-[#F3D5DF]/40 disabled:opacity-60"
-                          >
-                            Reject
-                          </button>
+                  {[order.cancelRequest, order.returnRequest]
+                    .filter((req): req is NonNullable<typeof req> => Boolean(req))
+                    .map((req) => {
+                      const noteKey = `${order.id}:${req.type}`;
+                      const isBusy = resolvingKey === noteKey;
+                      const heading =
+                        req.status === 'pending'
+                          ? `${req.type === 'cancel' ? 'Cancellation' : 'Return'} requested · Pending`
+                          : `Customer ${req.type === 'cancel' ? 'Cancellation' : 'Return'} Request · ${req.status.toUpperCase()}`;
+
+                      return (
+                        <div
+                          key={req.id || noteKey}
+                          className="space-y-2.5 rounded-xl border border-[#B76E79]/40 bg-white p-3.5 text-xs"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <p className="font-semibold text-[#49243E]">{heading}</p>
+                            <span className="tabular-nums text-[#242124]/60">
+                              {formatTimestamp(req.updatedAt || req.requestedAt)}
+                            </span>
+                          </div>
+                          <p className="text-[#242124]/80">Reason: {req.reason}</p>
+                          {req.resolutionNote && (
+                            <p className="text-[#49243E]">Owner Note: {req.resolutionNote}</p>
+                          )}
+                          {req.status === 'pending' && (
+                            <div className="flex flex-wrap items-center gap-2 pt-1">
+                              <input
+                                type="text"
+                                value={resolutionNotes[noteKey] || ''}
+                                onChange={(e) =>
+                                  setResolutionNotes((prev) => ({
+                                    ...prev,
+                                    [noteKey]: e.target.value,
+                                  }))
+                                }
+                                placeholder="Resolution note for customer"
+                                className="min-h-[38px] flex-1 rounded-lg border border-[#49243E]/18 bg-[#FFF9F5]/65 px-3 text-xs"
+                              />
+                              <button
+                                type="button"
+                                disabled={isBusy}
+                                onClick={async () => {
+                                  setResolvingKey(noteKey);
+                                  const res = await onResolveReturnRequest(
+                                    order.id,
+                                    'approved',
+                                    resolutionNotes[noteKey]?.trim() || undefined,
+                                    req.type
+                                  );
+                                  setResolvingKey(null);
+                                  if (!res.ok) {
+                                    setOrderErrors((prev) => ({
+                                      ...prev,
+                                      [order.id]: res.error || 'Could not approve request.',
+                                    }));
+                                  }
+                                }}
+                                className="inline-flex min-h-[38px] items-center rounded-lg bg-[#49243E] px-3.5 text-xs font-medium text-[#FFF9F5] hover:bg-[#3A1B31] disabled:opacity-60"
+                              >
+                                Approve
+                              </button>
+                              <button
+                                type="button"
+                                disabled={isBusy}
+                                onClick={async () => {
+                                  setResolvingKey(noteKey);
+                                  const res = await onResolveReturnRequest(
+                                    order.id,
+                                    'rejected',
+                                    resolutionNotes[noteKey]?.trim() || undefined,
+                                    req.type
+                                  );
+                                  setResolvingKey(null);
+                                  if (!res.ok) {
+                                    setOrderErrors((prev) => ({
+                                      ...prev,
+                                      [order.id]: res.error || 'Could not reject request.',
+                                    }));
+                                  }
+                                }}
+                                className="inline-flex min-h-[38px] items-center rounded-lg border border-[#B76E79]/40 bg-[#FFF9F5] px-3.5 text-xs font-medium text-[#9B2C3E] hover:bg-[#F3D5DF]/40 disabled:opacity-60"
+                              >
+                                Reject
+                              </button>
+                            </div>
+                          )}
                         </div>
-                      )}
-                    </div>
-                  )}
+                      );
+                    })}
                 </div>
               );
             })}

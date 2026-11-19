@@ -27,10 +27,12 @@ import {
   type CouponRow,
   type CustomerAddressRow,
   type CustomerNotificationRow,
+  type CustomerPaymentMethodRow,
   type EmailTokenRow,
   type GiftCardRow,
   type LegacyPhoneOnlyAccount,
   type LoyaltyConfigData,
+  type NotificationPreferencesData,
   type OrderItemRow,
   type OrderReturnRequestRecord,
   type OrderRow,
@@ -58,6 +60,15 @@ import {
   mergeSiteSettings,
   mergeStorefrontContent,
 } from './storefront-defaults.ts';
+import {
+  normalizeOrderRequestsAndStatus,
+  parseNotificationPrefs,
+  parseOrderHistory,
+  PRE_CUTOFF_DELIVERY_EDIT_STATES,
+  PRE_SHIPPING_CANCEL_STATES,
+  RETURN_ELIGIBLE_STATES,
+  validateNonSensitivePaymentMethodInput,
+} from './order-utils.ts';
 
 const INLINE_MEDIA_THRESHOLD_BYTES = 450_000;
 const MEDIA_CHUNK_BYTES = 500_000;
@@ -117,7 +128,12 @@ interface FirestoreOrderDoc {
   discount_paise?: number;
   gift_card_paise?: number;
   status_history_json?: string;
+  cancel_request_json?: string | null;
   return_request_json?: string | null;
+  hidden_by_customer?: boolean | number;
+  hidden_at?: number | null;
+  stock_restored_at?: number | null;
+  delivery_details_edited_at?: number | null;
   idempotency_key?: string | null;
   payment_collected_at?: number | null;
   payment_collected_by?: string | null;
@@ -152,7 +168,14 @@ function normalizeFirestoreOrderRow(doc: FirestoreOrderDoc): OrderRow {
     discount_paise: Number(doc.discount_paise || 0),
     gift_card_paise: Number(doc.gift_card_paise || 0),
     status_history_json: doc.status_history_json || '[]',
+    cancel_request_json: doc.cancel_request_json ?? null,
     return_request_json: doc.return_request_json ?? null,
+    hidden_by_customer: doc.hidden_by_customer ? 1 : 0,
+    hidden_at: typeof doc.hidden_at === 'number' ? doc.hidden_at : null,
+    stock_restored_at:
+      typeof doc.stock_restored_at === 'number' ? doc.stock_restored_at : null,
+    delivery_details_edited_at:
+      typeof doc.delivery_details_edited_at === 'number' ? doc.delivery_details_edited_at : null,
     idempotency_key: doc.idempotency_key ?? null,
     payment_collected_at:
       typeof doc.payment_collected_at === 'number' ? doc.payment_collected_at : null,
@@ -238,6 +261,13 @@ function toUserRow(data: Record<string, unknown>): UserRow {
     password_hash: typeof data.password_hash === 'string' ? data.password_hash : null,
     phone_e164: typeof data.phone_e164 === 'string' ? data.phone_e164 : null,
     phone_verified: data.phone_verified ? 1 : 0,
+    notification_prefs_json:
+      typeof data.notification_prefs_json === 'string'
+        ? data.notification_prefs_json
+        : data.notification_prefs && typeof data.notification_prefs === 'object'
+          ? JSON.stringify(data.notification_prefs)
+          : null,
+    deleted_at: typeof data.deleted_at === 'number' ? data.deleted_at : null,
     created_at: Number(data.created_at || 0),
     updated_at: Number(data.updated_at || 0),
   };
@@ -397,6 +427,10 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     return this.usersCol().doc(userId).collection('addresses');
   }
 
+  private paymentMethodsCol(userId: string) {
+    return this.usersCol().doc(userId).collection('payment_methods');
+  }
+
   private wishlistDoc(userId: string) {
     return this.usersCol().doc(userId).collection('wishlist').doc('items');
   }
@@ -529,6 +563,89 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     const updated = await this.getUserById(userId);
     if (!updated) throw new Error(`User ${userId} not found.`);
     return updated;
+  }
+
+  async updateCustomerProfile(
+    userId: string,
+    input: {
+      fullName?: string;
+      phone?: string | null;
+      notificationPrefs?: NotificationPreferencesData;
+    },
+    now: number
+  ): Promise<UserRow> {
+    const ref = this.usersCol().doc(userId);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      throw new StoreHttpError(404, 'USER_NOT_FOUND', 'Customer account was not found.');
+    }
+    const existing = snap.data() as Record<string, unknown>;
+    const nextName =
+      typeof input.fullName === 'string' && input.fullName.trim().length >= 2
+        ? input.fullName.trim().slice(0, 100)
+        : String(existing.full_name || '');
+    const nextPhone =
+      input.phone === null
+        ? null
+        : typeof input.phone === 'string'
+          ? input.phone.trim() || null
+          : typeof existing.phone_e164 === 'string'
+            ? existing.phone_e164
+            : null;
+    const nextPrefsJson = input.notificationPrefs
+      ? JSON.stringify(parseNotificationPrefs(input.notificationPrefs))
+      : typeof existing.notification_prefs_json === 'string'
+        ? existing.notification_prefs_json
+        : null;
+
+    await ref.update({
+      full_name: nextName,
+      phone_e164: nextPhone,
+      notification_prefs_json: nextPrefsJson,
+      updated_at: now,
+    });
+    const updated = await this.getUserById(userId);
+    if (!updated) throw new Error(`User ${userId} not found.`);
+    return updated;
+  }
+
+  async deleteCustomerAccount(
+    userId: string,
+    now: number
+  ): Promise<{ deleted: boolean; preservedOrdersCount: number }> {
+    const user = await this.getUserById(userId);
+    if (!user) return { deleted: false, preservedOrdersCount: 0 };
+
+    const boundOwner = await this.resolveBoundOwner();
+    if (boundOwner && boundOwner.owner_user_id === userId) {
+      throw new StoreHttpError(
+        403,
+        'OWNER_ACCOUNT_PROTECTED',
+        'The primary store owner account cannot be deleted from customer settings.'
+      );
+    }
+
+    const ordersSnap = await this.ordersCol().where('customer_user_id', '==', userId).get();
+    const preservedOrdersCount = ordersSnap.size;
+    const batch = this.firestore.batch();
+    for (const oDoc of ordersSnap.docs) {
+      batch.update(oDoc.ref, { customer_user_id: null, updated_at: now });
+    }
+
+    const [addrSnap, pmSnap, notifSnap, sessionsSnap, tokensSnap] = await Promise.all([
+      this.addressesCol(userId).get(),
+      this.paymentMethodsCol(userId).get(),
+      this.notificationsCol(userId).get(),
+      this.sessionsCol().where('user_id', '==', userId).get(),
+      this.emailTokensCol().where('user_id', '==', userId).get(),
+    ]);
+    for (const d of [...addrSnap.docs, ...pmSnap.docs, ...notifSnap.docs, ...sessionsSnap.docs, ...tokensSnap.docs]) {
+      batch.delete(d.ref);
+    }
+    batch.delete(this.wishlistDoc(userId));
+    batch.delete(this.usersCol().doc(userId));
+    await batch.commit();
+    return { deleted: true, preservedOrdersCount };
   }
 
   async updateUserPasswordHash(userId: string, passwordHash: string, now: number): Promise<void> {
@@ -970,14 +1087,24 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
       if (!isCancelled && isPaid) {
         totalRevenuePaise += Number(orderDoc.total_paise || 0);
       }
+      let pendingReqCount = 0;
       if (orderDoc.return_request_json) {
         try {
           const parsedReq = JSON.parse(orderDoc.return_request_json) as { status?: string };
-          if (parsedReq?.status === 'pending') openReturnRequests += 1;
+          if (parsedReq?.status === 'pending') pendingReqCount += 1;
         } catch {
           // ignore
         }
       }
+      if (orderDoc.cancel_request_json) {
+        try {
+          const parsedCancel = JSON.parse(orderDoc.cancel_request_json) as { status?: string };
+          if (parsedCancel?.status === 'pending') pendingReqCount += 1;
+        } catch {
+          // ignore
+        }
+      }
+      if (pendingReqCount > 0) openReturnRequests += 1;
       for (const item of orderDoc.items || []) {
         orderCounts.set(item.product_id, (orderCounts.get(item.product_id) || 0) + 1);
       }
@@ -1966,6 +2093,7 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     const snap = await this.ordersCol().where('customer_user_id', '==', userId).get();
     return snap.docs
       .map((d) => d.data() as FirestoreOrderDoc)
+      .filter((doc) => !doc.hidden_by_customer)
       .sort((a, b) => Number(b.created_at) - Number(a.created_at))
       .map((doc) => ({ order: normalizeFirestoreOrderRow(doc), items: doc.items || [] }));
   }
@@ -2064,128 +2192,462 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     type: 'cancel' | 'return';
     reason: string;
   }): Promise<OrderWithItems | null> {
-    const ref = this.ordersCol().doc(input.orderId);
-    const snap = await ref.get();
-    if (!snap.exists) return null;
+    return this.submitOrderRequest(input);
+  }
 
-    const existing = snap.data() as FirestoreOrderDoc;
-    if (existing.customer_user_id !== input.userId) {
-      throw new StoreHttpError(403, 'FORBIDDEN', 'You can only request changes for your own orders.');
+  async submitOrderRequest(input: {
+    orderId: string;
+    userId: string;
+    type: 'cancel' | 'return';
+    reason: string;
+  }): Promise<OrderWithItems | null> {
+    const cleanReason = input.reason.trim().slice(0, 500);
+    if (cleanReason.length < 3) {
+      throw new StoreHttpError(
+        400,
+        'VALIDATION_ERROR',
+        'Please provide a brief reason (at least 3 characters).'
+      );
     }
 
-    const now = Date.now();
-    const requestRecord: OrderReturnRequestRecord = {
-      id: `req_${crypto.randomUUID().slice(0, 12)}`,
-      type: input.type,
-      reason: input.reason.trim().slice(0, 500),
-      status: 'pending',
-      requestedAt: now,
-      resolvedAt: null,
-    };
+    return this.firestore.runTransaction(async (tx) => {
+      const ref = this.ordersCol().doc(input.orderId);
+      const snap = await tx.get(ref);
+      if (!snap.exists) return null;
 
-    let history: OrderStatusHistoryEntry[] = [];
-    try {
-      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
-      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
-    } catch {
-      history = [];
-    }
-    history.push({
-      status: input.type === 'cancel' ? 'cancellation_requested' : 'return_requested',
-      note: requestRecord.reason,
-      actor: 'customer',
-      at: now,
+      const existing = snap.data() as FirestoreOrderDoc;
+      if (existing.customer_user_id !== input.userId) {
+        throw new StoreHttpError(
+          403,
+          'FORBIDDEN',
+          'You can only request changes for your own orders.'
+        );
+      }
+
+      const history = parseOrderHistory(existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.status,
+        rawFulfillmentStatus: existing.fulfillment_status,
+        rawCancelRequest: existing.cancel_request_json,
+        rawReturnRequest: existing.return_request_json,
+        history,
+        paymentMethod: existing.payment_method,
+      });
+
+      if (input.type === 'cancel') {
+        if (!PRE_SHIPPING_CANCEL_STATES.has(norm.fulfillmentStatus)) {
+          throw new StoreHttpError(
+            409,
+            'CANCELLATION_CUTOFF_PASSED',
+            `Cancellation is unavailable once an order is ${norm.fulfillmentStatus}.`
+          );
+        }
+        if (norm.cancelRequest?.status === 'pending') {
+          if (norm.cancelRequest.reason === cleanReason) {
+            return { order: normalizeFirestoreOrderRow(existing), items: existing.items || [] };
+          }
+          throw new StoreHttpError(
+            409,
+            'REQUEST_ALREADY_PENDING',
+            'A cancellation request is already pending for this order. You can edit or withdraw it below.'
+          );
+        }
+      } else {
+        if (!RETURN_ELIGIBLE_STATES.has(norm.fulfillmentStatus)) {
+          throw new StoreHttpError(
+            409,
+            'RETURN_NOT_ELIGIBLE',
+            'Return requests can only be submitted after your order is delivered.'
+          );
+        }
+        if (norm.returnRequest?.status === 'pending') {
+          if (norm.returnRequest.reason === cleanReason) {
+            return { order: normalizeFirestoreOrderRow(existing), items: existing.items || [] };
+          }
+          throw new StoreHttpError(
+            409,
+            'REQUEST_ALREADY_PENDING',
+            'A return request is already pending for this order. You can edit or withdraw it below.'
+          );
+        }
+      }
+
+      const now = Date.now();
+      const requestRecord: OrderReturnRequestRecord = {
+        id: `req_${crypto.randomUUID().slice(0, 12)}`,
+        type: input.type,
+        reason: cleanReason,
+        status: 'pending',
+        requestedAt: now,
+        updatedAt: now,
+        resolvedAt: null,
+      };
+
+      history.push({
+        status: input.type === 'cancel' ? 'cancellation_requested' : 'return_requested',
+        note: cleanReason,
+        actor: 'customer',
+        at: now,
+      });
+
+      const patch: Partial<FirestoreOrderDoc> = {
+        status: norm.fulfillmentStatus,
+        fulfillment_status: norm.fulfillmentStatus,
+        ...(input.type === 'cancel'
+          ? { cancel_request_json: JSON.stringify(requestRecord) }
+          : { return_request_json: JSON.stringify(requestRecord) }),
+        status_history_json: JSON.stringify(history),
+        updated_at: now,
+      };
+      tx.update(ref, patch);
+
+      const updatedDoc: FirestoreOrderDoc = { ...existing, ...patch };
+      return { order: normalizeFirestoreOrderRow(updatedDoc), items: updatedDoc.items || [] };
     });
+  }
 
-    const patch = {
-      return_request_json: JSON.stringify(requestRecord),
-      status_history_json: JSON.stringify(history),
+  async updateOrderRequest(input: {
+    orderId: string;
+    userId: string;
+    type: 'cancel' | 'return';
+    action: 'edit' | 'withdraw';
+    reason?: string;
+  }): Promise<OrderWithItems | null> {
+    return this.firestore.runTransaction(async (tx) => {
+      const ref = this.ordersCol().doc(input.orderId);
+      const snap = await tx.get(ref);
+      if (!snap.exists) return null;
+
+      const existing = snap.data() as FirestoreOrderDoc;
+      if (existing.customer_user_id !== input.userId) {
+        throw new StoreHttpError(403, 'FORBIDDEN', 'You can only update requests for your own orders.');
+      }
+
+      const history = parseOrderHistory(existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.status,
+        rawFulfillmentStatus: existing.fulfillment_status,
+        rawCancelRequest: existing.cancel_request_json,
+        rawReturnRequest: existing.return_request_json,
+        history,
+        paymentMethod: existing.payment_method,
+      });
+
+      const target = input.type === 'cancel' ? norm.cancelRequest : norm.returnRequest;
+      if (!target) {
+        throw new StoreHttpError(404, 'REQUEST_NOT_FOUND', 'No request was found on this order.');
+      }
+      if (target.status !== 'pending') {
+        throw new StoreHttpError(
+          409,
+          'CONCURRENCY_CONFLICT',
+          `This request is already ${target.status} and can no longer be changed.`
+        );
+      }
+
+      const now = Date.now();
+      let updatedTarget: OrderReturnRequestRecord;
+
+      if (input.action === 'withdraw') {
+        updatedTarget = {
+          ...target,
+          status: 'withdrawn',
+          updatedAt: now,
+          resolvedAt: now,
+        };
+        history.push({
+          status: `${input.type}_withdrawn`,
+          note: 'Customer withdrew pending request',
+          actor: 'customer',
+          at: now,
+        });
+      } else {
+        const cleanReason = (input.reason || '').trim().slice(0, 500);
+        if (cleanReason.length < 3) {
+          throw new StoreHttpError(
+            400,
+            'VALIDATION_ERROR',
+            'Please provide a reason of at least 3 characters.'
+          );
+        }
+        updatedTarget = {
+          ...target,
+          reason: cleanReason,
+          updatedAt: now,
+        };
+        history.push({
+          status: `${input.type}_request_updated`,
+          note: cleanReason,
+          actor: 'customer',
+          at: now,
+        });
+      }
+
+      const patch: Partial<FirestoreOrderDoc> = {
+        status: norm.fulfillmentStatus,
+        fulfillment_status: norm.fulfillmentStatus,
+        cancel_request_json:
+          input.type === 'cancel'
+            ? JSON.stringify(updatedTarget)
+            : norm.cancelRequest
+              ? JSON.stringify(norm.cancelRequest)
+              : null,
+        return_request_json:
+          input.type === 'return'
+            ? JSON.stringify(updatedTarget)
+            : norm.returnRequest
+              ? JSON.stringify(norm.returnRequest)
+              : null,
+        status_history_json: JSON.stringify(history),
+        updated_at: now,
+      };
+      tx.update(ref, patch);
+
+      const updatedDoc: FirestoreOrderDoc = { ...existing, ...patch };
+      return { order: normalizeFirestoreOrderRow(updatedDoc), items: updatedDoc.items || [] };
+    });
+  }
+
+  async updateOrderDeliveryDetails(input: {
+    orderId: string;
+    userId: string;
+    customerName?: string;
+    customerPhone?: string;
+    shippingAddress?: string;
+  }): Promise<OrderWithItems | null> {
+    return this.firestore.runTransaction(async (tx) => {
+      const ref = this.ordersCol().doc(input.orderId);
+      const snap = await tx.get(ref);
+      if (!snap.exists) return null;
+
+      const existing = snap.data() as FirestoreOrderDoc;
+      if (existing.customer_user_id !== input.userId) {
+        throw new StoreHttpError(403, 'FORBIDDEN', 'You can only edit delivery details for your own orders.');
+      }
+
+      const history = parseOrderHistory(existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.status,
+        rawFulfillmentStatus: existing.fulfillment_status,
+        rawCancelRequest: existing.cancel_request_json,
+        rawReturnRequest: existing.return_request_json,
+        history,
+        paymentMethod: existing.payment_method,
+      });
+
+      if (!PRE_CUTOFF_DELIVERY_EDIT_STATES.has(norm.fulfillmentStatus)) {
+        throw new StoreHttpError(
+          409,
+          'DELIVERY_CUTOFF_PASSED',
+          `Delivery details cannot be changed once your order is ${norm.fulfillmentStatus}.`
+        );
+      }
+
+      const cleanName =
+        typeof input.customerName === 'string'
+          ? input.customerName.trim()
+          : String(existing.customer_name || '').trim();
+      const cleanPhone =
+        typeof input.customerPhone === 'string'
+          ? input.customerPhone.trim()
+          : String(existing.customer_phone || '').trim();
+      const cleanAddress =
+        typeof input.shippingAddress === 'string'
+          ? input.shippingAddress.trim()
+          : String(existing.shipping_address || '').trim();
+      if (cleanName.length < 2 || cleanPhone.length < 6 || cleanAddress.length < 5) {
+        throw new StoreHttpError(
+          400,
+          'VALIDATION_ERROR',
+          'Please provide valid recipient name, phone number, and delivery address.'
+        );
+      }
+
+      const now = Date.now();
+      history.push({
+        status: 'delivery_updated',
+        note: 'Customer updated recipient / delivery address before dispatch',
+        actor: 'customer',
+        at: now,
+      });
+
+      const patch: Partial<FirestoreOrderDoc> = {
+        customer_name: cleanName.slice(0, 120),
+        customer_phone: cleanPhone.slice(0, 32),
+        shipping_address: cleanAddress.slice(0, 600),
+        delivery_details_edited_at: now,
+        status_history_json: JSON.stringify(history),
+        updated_at: now,
+      };
+      tx.update(ref, patch);
+
+      const updatedDoc: FirestoreOrderDoc = { ...existing, ...patch };
+      return { order: normalizeFirestoreOrderRow(updatedDoc), items: updatedDoc.items || [] };
+    });
+  }
+
+  async hideOrderForCustomer(orderId: string, userId: string): Promise<boolean> {
+    const ref = this.ordersCol().doc(orderId);
+    const snap = await ref.get();
+    if (!snap.exists) return false;
+    const existing = snap.data() as FirestoreOrderDoc;
+    if (existing.customer_user_id !== userId) {
+      throw new StoreHttpError(403, 'FORBIDDEN', 'You can only hide orders from your own account.');
+    }
+    const now = Date.now();
+    await ref.update({
+      hidden_by_customer: true,
+      hidden_at: now,
       updated_at: now,
-    };
-    await ref.update(patch);
-
-    const updatedDoc: FirestoreOrderDoc = { ...existing, ...patch };
-    return { order: normalizeFirestoreOrderRow(updatedDoc), items: updatedDoc.items || [] };
+    });
+    return true;
   }
 
   async resolveOrderReturnRequest(input: {
     orderId: string;
+    requestType?: 'cancel' | 'return';
     decision: 'approved' | 'rejected';
     note?: string;
   }): Promise<OrderWithItems | null> {
-    const ref = this.ordersCol().doc(input.orderId);
-    const snap = await ref.get();
-    if (!snap.exists) return null;
+    const result = await this.firestore.runTransaction(async (tx) => {
+      const ref = this.ordersCol().doc(input.orderId);
+      const snap = await tx.get(ref);
+      if (!snap.exists) return null;
 
-    const existing = snap.data() as FirestoreOrderDoc;
-    if (!existing.return_request_json) return null;
+      const existing = snap.data() as FirestoreOrderDoc;
+      const history = parseOrderHistory(existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.status,
+        rawFulfillmentStatus: existing.fulfillment_status,
+        rawCancelRequest: existing.cancel_request_json,
+        rawReturnRequest: existing.return_request_json,
+        history,
+        paymentMethod: existing.payment_method,
+      });
 
-    let reqRecord: OrderReturnRequestRecord;
-    try {
-      reqRecord = JSON.parse(existing.return_request_json) as OrderReturnRequestRecord;
-    } catch {
-      return null;
-    }
+      const target =
+        input.requestType === 'cancel'
+          ? norm.cancelRequest
+          : input.requestType === 'return'
+            ? norm.returnRequest
+            : norm.cancelRequest?.status === 'pending'
+              ? norm.cancelRequest
+              : norm.returnRequest?.status === 'pending'
+                ? norm.returnRequest
+                : norm.cancelRequest || norm.returnRequest;
 
-    const now = Date.now();
-    reqRecord.status = input.decision;
-    reqRecord.resolvedAt = now;
-    if (input.note?.trim()) {
-      reqRecord.resolutionNote = input.note.trim().slice(0, 300);
-    }
+      if (!target) return null;
+      if (target.status !== 'pending') {
+        throw new StoreHttpError(
+          409,
+          'CONCURRENCY_CONFLICT',
+          `Cannot ${input.decision === 'approved' ? 'approve' : 'reject'} request because its status is already "${target.status}".`
+        );
+      }
 
-    const nextFulfillment =
-      input.decision === 'approved'
-        ? reqRecord.type === 'cancel'
-          ? 'cancelled'
-          : 'returned'
-        : existing.fulfillment_status || existing.status;
-    const nextStatus =
-      input.decision === 'approved'
-        ? reqRecord.type === 'cancel'
-          ? 'cancelled'
-          : 'returned'
-        : existing.status;
+      const now = Date.now();
+      const updatedReq: OrderReturnRequestRecord = {
+        ...target,
+        status: input.decision,
+        updatedAt: now,
+        resolvedAt: now,
+        ...(input.note?.trim() ? { resolutionNote: input.note.trim().slice(0, 300) } : {}),
+      };
 
-    let history: OrderStatusHistoryEntry[] = [];
-    try {
-      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
-      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
-    } catch {
-      history = [];
-    }
-    history.push({
-      status: `${reqRecord.type}_${input.decision}`,
-      note: reqRecord.resolutionNote || `Request ${input.decision} by store owner`,
-      actor: 'owner',
-      at: now,
+      const nextFulfillment =
+        input.decision === 'approved'
+          ? updatedReq.type === 'cancel'
+            ? 'cancelled'
+            : 'returned'
+          : norm.fulfillmentStatus;
+      const nextStatus = nextFulfillment;
+
+      history.push({
+        status: `${updatedReq.type}_${input.decision}`,
+        note: updatedReq.resolutionNote || `Request ${input.decision} by store owner`,
+        actor: 'owner',
+        at: now,
+      });
+
+      let stockRestoredAt = existing.stock_restored_at ?? null;
+      if (input.decision === 'approved' && updatedReq.type === 'cancel' && !stockRestoredAt) {
+        const productIds = Array.from(new Set((existing.items || []).map((it) => it.product_id)));
+        const prodSnaps = new Map<string, FirestoreProductDoc>();
+        for (const pid of productIds) {
+          const pSnap = await tx.get(this.productsCol().doc(pid));
+          if (pSnap.exists) {
+            prodSnaps.set(pid, pSnap.data() as FirestoreProductDoc);
+          }
+        }
+        for (const item of existing.items || []) {
+          const pDoc = prodSnaps.get(item.product_id);
+          if (!pDoc) continue;
+          const clonedVariants = pDoc.variants.map((v) => ({ ...v }));
+          const vIdx = item.variant_id
+            ? clonedVariants.findIndex((v) => v.id === item.variant_id)
+            : 0;
+          if (vIdx >= 0) {
+            clonedVariants[vIdx].stock_qty += Number(item.quantity || 0);
+          }
+          pDoc.variants = clonedVariants;
+          pDoc.stock_qty = clonedVariants.reduce((sum, v) => sum + v.stock_qty, 0);
+          pDoc.updated_at = now;
+        }
+        for (const [pid, updatedProd] of prodSnaps.entries()) {
+          tx.set(this.productsCol().doc(pid), updatedProd);
+        }
+        stockRestoredAt = now;
+      }
+
+      const patch: Partial<FirestoreOrderDoc> = {
+        status: nextStatus,
+        fulfillment_status: nextFulfillment,
+        cancel_request_json:
+          updatedReq.type === 'cancel'
+            ? JSON.stringify(updatedReq)
+            : norm.cancelRequest
+              ? JSON.stringify(norm.cancelRequest)
+              : null,
+        return_request_json:
+          updatedReq.type === 'return'
+            ? JSON.stringify(updatedReq)
+            : norm.returnRequest
+              ? JSON.stringify(norm.returnRequest)
+              : null,
+        stock_restored_at: stockRestoredAt,
+        status_history_json: JSON.stringify(history),
+        updated_at: now,
+      };
+      tx.update(ref, patch);
+
+      const updatedDoc: FirestoreOrderDoc = { ...existing, ...patch };
+      return {
+        orderWithItems: { order: normalizeFirestoreOrderRow(updatedDoc), items: updatedDoc.items || [] },
+        updatedReq,
+      };
     });
 
-    const patch = {
-      status: nextStatus,
-      fulfillment_status: nextFulfillment,
-      return_request_json: JSON.stringify(reqRecord),
-      status_history_json: JSON.stringify(history),
-      updated_at: now,
-    };
-    await ref.update(patch);
+    if (!result) return null;
 
-    if (existing.customer_user_id) {
-      await this.createCustomerNotification({
-        id: `notif_req_${existing.id}_${input.decision}_${now}`,
-        userId: existing.customer_user_id,
-        type: 'request_update',
-        title: `${reqRecord.type === 'cancel' ? 'Cancellation' : 'Return'} request ${input.decision}`,
-        message:
-          reqRecord.resolutionNote ||
-          `Your ${reqRecord.type} request for order ${existing.order_number} was ${input.decision}.`,
-        orderId: existing.id,
-        orderNumber: existing.order_number,
-      });
+    if (result.orderWithItems.order.customer_user_id) {
+      const customerRow = await this.getUserById(result.orderWithItems.order.customer_user_id);
+      const prefs = parseNotificationPrefs(customerRow?.notification_prefs_json);
+      if (prefs.cancelReturnUpdates) {
+        await this.createCustomerNotification({
+          id: `notif_req_${result.orderWithItems.order.id}_${result.updatedReq.id}_${input.decision}`,
+          userId: result.orderWithItems.order.customer_user_id,
+          type: 'request_update',
+          title: `${result.updatedReq.type === 'cancel' ? 'Cancellation' : 'Return'} request ${input.decision}`,
+          message:
+            result.updatedReq.resolutionNote ||
+            `Your ${result.updatedReq.type} request for order ${result.orderWithItems.order.order_number} was ${input.decision}.`,
+          orderId: result.orderWithItems.order.id,
+          orderNumber: result.orderWithItems.order.order_number,
+        });
+      }
     }
 
-    const updatedDoc: FirestoreOrderDoc = { ...existing, ...patch };
-    return { order: normalizeFirestoreOrderRow(updatedDoc), items: updatedDoc.items || [] };
+    return result.orderWithItems;
   }
 
   async collectOrderPayment(input: {
@@ -2399,6 +2861,59 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     return true;
   }
 
+  async listCustomerPaymentMethods(userId: string): Promise<CustomerPaymentMethodRow[]> {
+    const snap = await this.paymentMethodsCol(userId).get();
+    return snap.docs
+      .map((d) => d.data() as CustomerPaymentMethodRow)
+      .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0));
+  }
+
+  async upsertCustomerPaymentMethod(
+    userId: string,
+    input: {
+      id?: string;
+      methodType: 'card' | 'upi' | 'wallet';
+      label: string;
+      last4?: string | null;
+      network?: string | null;
+      expiry?: string | null;
+    }
+  ): Promise<CustomerPaymentMethodRow> {
+    const validated = validateNonSensitivePaymentMethodInput(input);
+    if (!validated.ok) {
+      throw new StoreHttpError(400, 'VALIDATION_ERROR', validated.error);
+    }
+    const now = Date.now();
+    const id =
+      input.id && /^[a-zA-Z0-9_-]{3,80}$/.test(input.id)
+        ? input.id
+        : `pm_${crypto.randomUUID().slice(0, 12)}`;
+    const ref = this.paymentMethodsCol(userId).doc(id);
+    const snap = await ref.get();
+    const prev = snap.exists ? (snap.data() as CustomerPaymentMethodRow) : null;
+    const row: CustomerPaymentMethodRow = {
+      id,
+      user_id: userId,
+      method_type: validated.methodType,
+      label: validated.label,
+      last4: validated.last4,
+      network: validated.network,
+      expiry: validated.expiry,
+      created_at: prev?.created_at || now,
+      updated_at: now,
+    };
+    await ref.set(row);
+    return row;
+  }
+
+  async deleteCustomerPaymentMethod(userId: string, methodId: string): Promise<boolean> {
+    const ref = this.paymentMethodsCol(userId).doc(methodId);
+    const snap = await ref.get();
+    if (!snap.exists) return false;
+    await ref.delete();
+    return true;
+  }
+
   async markAllCustomerNotificationsRead(userId: string): Promise<void> {
     const snap = await this.notificationsCol(userId).where('is_read', '==', 0).get();
     if (snap.empty) return;
@@ -2408,6 +2923,14 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
       batch.update(d.ref, { is_read: 1, read_at: now });
     }
     await batch.commit();
+  }
+
+  async deleteCustomerNotification(userId: string, notificationId: string): Promise<boolean> {
+    const ref = this.notificationsCol(userId).doc(notificationId);
+    const snap = await ref.get();
+    if (!snap.exists) return false;
+    await ref.delete();
+    return true;
   }
 
   async listCoupons(activeOnly = false): Promise<CouponRow[]> {
@@ -2549,18 +3072,25 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
 
   async listUsersSummary(): Promise<StoreUserSummary[]> {
     const snap = await this.usersCol().get();
-    return snap.docs
+    const verifiedUsers = snap.docs
       .map((d) => toUserRow(d.data() as Record<string, unknown>))
-      .filter((u) => Boolean(u.email_verified))
+      .filter((u) => Boolean(u.email_verified) && !u.deleted_at)
       .sort((a, b) => b.created_at - a.created_at)
-      .slice(0, 100)
-      .map((u) => ({
+      .slice(0, 100);
+
+    return Promise.all(
+      verifiedUsers.map(async (u) => ({
         id: u.id,
         fullName: u.full_name,
         email: u.email || '',
         emailVerified: Boolean(u.email_verified),
+        phone: u.phone_e164 || null,
+        notificationPrefs: parseNotificationPrefs(u.notification_prefs_json),
+        addresses: await this.listCustomerAddresses(u.id).catch(() => []),
         createdAt: u.created_at,
-      }));
+        updatedAt: u.updated_at,
+      }))
+    );
   }
 
   async listAuditLogs(params: { productId?: string; page: number; pageSize: number }) {
