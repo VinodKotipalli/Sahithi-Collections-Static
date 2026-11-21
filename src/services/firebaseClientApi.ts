@@ -1322,6 +1322,8 @@ interface StoredProductDoc {
   title: string;
   description: string;
   fabric_note: string;
+  included_pieces?: string;
+  care_note?: string;
   category: string;
   status: 'draft' | 'active' | 'published' | 'archived';
   featured: number | boolean;
@@ -1331,6 +1333,10 @@ interface StoredProductDoc {
   low_stock_threshold: number;
   colors_json: string;
   sizes_json: string;
+  import_key?: string | null;
+  source_image_filename?: string | null;
+  pending_fields_json?: string | null;
+  catalog_batch?: string | null;
   version: number;
   published_at: number | null;
   archived_at: number | null;
@@ -1614,12 +1620,33 @@ function sanitizeProductDocForFirestore(
   const safeSizesJson = String(raw.sizes_json || '[]').slice(0, 5_000);
   const safeVersion = Math.max(1, Math.round(Number(raw.version || 1)));
 
+  const safeIncludedPieces = String(raw.included_pieces || '').slice(0, 300);
+  const safeCareNote = String(raw.care_note || '').slice(0, 300);
+  const safeImportKey =
+    typeof raw.import_key === 'string' && raw.import_key.trim()
+      ? raw.import_key.trim().slice(0, 80)
+      : null;
+  const safeSourceImageFilename =
+    typeof raw.source_image_filename === 'string' && raw.source_image_filename.trim()
+      ? raw.source_image_filename.trim().slice(0, 140)
+      : null;
+  const safePendingFieldsJson =
+    typeof raw.pending_fields_json === 'string' && raw.pending_fields_json.trim()
+      ? raw.pending_fields_json.trim().slice(0, 1500)
+      : null;
+  const safeCatalogBatch =
+    typeof raw.catalog_batch === 'string' && raw.catalog_batch.trim()
+      ? raw.catalog_batch.trim().slice(0, 80)
+      : null;
+
   return {
     id: safeId,
     slug: safeSlug,
     title: safeTitlePadded,
     description: safeDescription,
     fabric_note: safeFabricNote,
+    ...(safeIncludedPieces ? { included_pieces: safeIncludedPieces } : {}),
+    ...(safeCareNote ? { care_note: safeCareNote } : {}),
     category: safeCategory,
     sku: safeSku,
     price_paise: safePricePaise,
@@ -1630,6 +1657,10 @@ function sanitizeProductDocForFirestore(
     status: safeStatus,
     colors_json: safeColorsJson,
     sizes_json: safeSizesJson,
+    ...(safeImportKey ? { import_key: safeImportKey } : {}),
+    ...(safeSourceImageFilename ? { source_image_filename: safeSourceImageFilename } : {}),
+    ...(safePendingFieldsJson ? { pending_fields_json: safePendingFieldsJson } : {}),
+    ...(safeCatalogBatch ? { catalog_batch: safeCatalogBatch } : {}),
     version: safeVersion,
     published_at: safePublishedAt,
     archived_at: safeArchivedAt,
@@ -1713,6 +1744,7 @@ interface ClientCatalogVisibilityMeta {
   hiddenIds: Set<string>;
   hiddenSlugs: Set<string>;
   deletedIds: Set<string>;
+  suppressLegacySeed: boolean;
 }
 
 async function getClientCatalogVisibilityMeta(
@@ -1721,6 +1753,7 @@ async function getClientCatalogVisibilityMeta(
   const hiddenIds = new Set<string>();
   const hiddenSlugs = new Set<string>();
   const deletedIds = new Set<string>();
+  let suppressLegacySeed = false;
 
   if (typeof window !== 'undefined') {
     try {
@@ -1730,6 +1763,7 @@ async function getClientCatalogVisibilityMeta(
           hiddenIds?: string[];
           hiddenSlugs?: string[];
           deletedIds?: string[];
+          suppressLegacySeed?: boolean;
         };
         (parsed.hiddenIds || []).forEach((id) => hiddenIds.add(id));
         (parsed.hiddenSlugs || []).forEach((slug) => hiddenSlugs.add(slug));
@@ -1737,6 +1771,9 @@ async function getClientCatalogVisibilityMeta(
           deletedIds.add(id);
           hiddenIds.add(id);
         });
+        if (parsed.suppressLegacySeed === true) {
+          suppressLegacySeed = true;
+        }
       }
     } catch {
       // Ignore storage read errors
@@ -1748,8 +1785,21 @@ async function getClientCatalogVisibilityMeta(
       hidden_product_ids?: string[];
       hidden_product_slugs?: string[];
       deleted_product_ids?: string[];
+      suppress_legacy_seed?: boolean;
+      value?: { catalogControl?: { suppressLegacySeed?: boolean } };
     }>('site_documents', 'settings', idToken);
     if (settingsDoc) {
+      if (
+        settingsDoc.suppress_legacy_seed === true ||
+        settingsDoc.value?.catalogControl?.suppressLegacySeed === true
+      ) {
+        suppressLegacySeed = true;
+      } else if (
+        settingsDoc.suppress_legacy_seed === false ||
+        settingsDoc.value?.catalogControl?.suppressLegacySeed === false
+      ) {
+        suppressLegacySeed = false;
+      }
       (settingsDoc.hidden_product_ids || []).forEach((id) => hiddenIds.add(id));
       (settingsDoc.hidden_product_slugs || []).forEach((slug) => hiddenSlugs.add(slug));
       (settingsDoc.deleted_product_ids || []).forEach((id) => {
@@ -1761,7 +1811,7 @@ async function getClientCatalogVisibilityMeta(
     // Ignore transient Firestore error
   }
 
-  return { hiddenIds, hiddenSlugs, deletedIds };
+  return { hiddenIds, hiddenSlugs, deletedIds, suppressLegacySeed };
 }
 
 async function saveClientCatalogVisibilityMeta(
@@ -1780,6 +1830,7 @@ async function saveClientCatalogVisibilityMeta(
       {
         key: 'settings',
         value: existing?.value ?? DEFAULT_SITE_SETTINGS,
+        suppress_legacy_seed: Boolean(meta.suppressLegacySeed),
         hidden_product_ids: Array.from(meta.hiddenIds),
         hidden_product_slugs: Array.from(meta.hiddenSlugs),
         deleted_product_ids: Array.from(meta.deletedIds),
@@ -1796,6 +1847,7 @@ async function saveClientCatalogVisibilityMeta(
           hiddenIds: Array.from(meta.hiddenIds),
           hiddenSlugs: Array.from(meta.hiddenSlugs),
           deletedIds: Array.from(meta.deletedIds),
+          suppressLegacySeed: Boolean(meta.suppressLegacySeed),
         })
       );
     } catch {
@@ -1869,19 +1921,21 @@ async function getMergedProductDocs(idToken?: string): Promise<StoredProductDoc[
     }
   }
 
-  const seenIds = new Set(byId.keys());
-  const seenSlugs = new Set(Array.from(byId.values()).map((d) => d.slug));
+  if (!meta.suppressLegacySeed) {
+    const seenIds = new Set(byId.keys());
+    const seenSlugs = new Set(Array.from(byId.values()).map((d) => d.slug));
 
-  for (const seed of buildSeedProductsDocs()) {
-    if (meta.deletedIds.has(seed.id)) continue;
-    if (!seenIds.has(seed.id) && !seenSlugs.has(seed.slug)) {
-      if (meta.hiddenIds.has(seed.id) || meta.hiddenSlugs.has(seed.slug)) {
-        byId.set(seed.id, { ...seed, status: 'draft' });
-      } else {
-        byId.set(seed.id, seed);
+    for (const seed of buildSeedProductsDocs()) {
+      if (meta.deletedIds.has(seed.id)) continue;
+      if (!seenIds.has(seed.id) && !seenSlugs.has(seed.slug)) {
+        if (meta.hiddenIds.has(seed.id) || meta.hiddenSlugs.has(seed.slug)) {
+          byId.set(seed.id, { ...seed, status: 'draft' });
+        } else {
+          byId.set(seed.id, seed);
+        }
+        seenIds.add(seed.id);
+        seenSlugs.add(seed.slug);
       }
-      seenIds.add(seed.id);
-      seenSlugs.add(seed.slug);
     }
   }
 
@@ -1976,6 +2030,8 @@ interface ValidatedClientProductPayload {
   title: string;
   description: string;
   fabricNote: string;
+  includedPieces: string;
+  careNote: string;
   category: string;
   sku: string;
   pricePaise: number;
@@ -2025,6 +2081,18 @@ function validateClientProductPayload(params: {
   )
     .trim()
     .slice(0, 400);
+  const includedPieces = (
+    typeof body.includedPieces === 'string'
+      ? body.includedPieces
+      : existing?.included_pieces ?? ''
+  )
+    .trim()
+    .slice(0, 240);
+  const careNote = (
+    typeof body.careNote === 'string' ? body.careNote : existing?.care_note ?? ''
+  )
+    .trim()
+    .slice(0, 240);
 
   const category = (
     typeof body.category === 'string' ? body.category : existing?.category ?? ''
@@ -2316,6 +2384,8 @@ function validateClientProductPayload(params: {
       title,
       description,
       fabricNote,
+      includedPieces,
+      careNote,
       category,
       sku,
       pricePaise: minPricePaise,
@@ -2380,6 +2450,8 @@ function formatProductDto(doc: StoredProductDoc, includeAdmin = false, orderCoun
         : null,
     description: doc.description || '',
     fabricNote: doc.fabric_note || '',
+    ...(doc.included_pieces ? { includedPieces: doc.included_pieces } : {}),
+    ...(doc.care_note ? { careNote: doc.care_note } : {}),
     stockQty: totalStock,
     lowStockThreshold: Number(doc.low_stock_threshold ?? 2),
     inStock: totalStock > 0,
@@ -2407,10 +2479,23 @@ function formatProductDto(doc: StoredProductDoc, includeAdmin = false, orderCoun
   };
 
   if (!includeAdmin) return pub;
+  let pendingFields: string[] = [];
+  if (doc.pending_fields_json) {
+    try {
+      const parsed = JSON.parse(doc.pending_fields_json);
+      if (Array.isArray(parsed)) pendingFields = parsed.filter((x): x is string => typeof x === 'string');
+    } catch {
+      pendingFields = [];
+    }
+  }
   return {
     ...pub,
     sku: doc.sku,
     status: doc.status === 'active' ? 'published' : doc.status || 'published',
+    importKey: doc.import_key ?? null,
+    sourceImageFilename: doc.source_image_filename ?? null,
+    pendingFields,
+    catalogBatch: doc.catalog_batch ?? null,
     version: Number(doc.version || 1),
     publishedAt: doc.published_at,
     archivedAt: doc.archived_at,
@@ -6521,6 +6606,8 @@ export async function handleClientlessApiRequest<T>(
           title: d.title,
           description: d.description,
           fabric_note: d.fabricNote,
+          included_pieces: d.includedPieces,
+          care_note: d.careNote,
           category: d.category,
           status: d.status,
           featured: d.featured,
@@ -6981,6 +7068,8 @@ export async function handleClientlessApiRequest<T>(
             slug: nextSlug,
             description: d.description,
             fabric_note: d.fabricNote,
+            included_pieces: d.includedPieces,
+            care_note: d.careNote,
             category: d.category,
             status: nextStatus,
             featured: d.featured,

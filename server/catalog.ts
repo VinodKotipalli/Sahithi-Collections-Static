@@ -62,6 +62,7 @@ export const ALLOWED_CATEGORIES = [
   'Dresses',
   'Festive Collection',
   'Accessories',
+  'Lehengas',
 ] as const;
 
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5 MB
@@ -115,6 +116,8 @@ export interface PublicProductDTO {
   compareAtPrice: number | null;
   description: string;
   fabricNote: string;
+  includedPieces?: string;
+  careNote?: string;
   stockQty: number;
   lowStockThreshold: number;
   inStock: boolean;
@@ -130,6 +133,10 @@ export interface PublicProductDTO {
 export interface AdminProductDTO extends PublicProductDTO {
   sku: string;
   status: ProductStatus;
+  importKey?: string | null;
+  sourceImageFilename?: string | null;
+  pendingFields?: string[];
+  catalogBatch?: string | null;
   version: number;
   publishedAt: number | null;
   archivedAt: number | null;
@@ -260,6 +267,8 @@ function serializePublicProduct(record: ProductWithParts): PublicProductDTO {
       effectiveComparePaise !== null ? Number((effectiveComparePaise / 100).toFixed(2)) : null,
     description: row.description,
     fabricNote: row.fabric_note,
+    ...(row.included_pieces ? { includedPieces: row.included_pieces } : {}),
+    ...(row.care_note ? { careNote: row.care_note } : {}),
     stockQty: totalStock,
     lowStockThreshold: row.low_stock_threshold,
     inStock: totalStock > 0,
@@ -290,10 +299,17 @@ function serializePublicProduct(record: ProductWithParts): PublicProductDTO {
 function serializeAdminProduct(record: AdminProductRecord): AdminProductDTO {
   const pub = serializePublicProduct(record);
   const { product: row, images, orderCount } = record;
+  const pendingFields = row.pending_fields_json
+    ? parseJsonSafe<string[]>(row.pending_fields_json, [])
+    : [];
   return {
     ...pub,
     sku: row.sku,
     status: row.status,
+    importKey: row.import_key ?? null,
+    sourceImageFilename: row.source_image_filename ?? null,
+    pendingFields,
+    catalogBatch: row.catalog_batch ?? null,
     version: row.version,
     publishedAt: row.published_at,
     archivedAt: row.archived_at,
@@ -544,6 +560,8 @@ interface ParsedProductPayload {
   title: string;
   description: string;
   fabricNote: string;
+  includedPieces: string;
+  careNote: string;
   category: string;
   sku: string;
   pricePaise: number;
@@ -578,6 +596,9 @@ async function validateAndNormalizeProductInput(
   }
 
   const fabricNote = typeof body.fabricNote === 'string' ? body.fabricNote.trim().slice(0, 240) : '';
+  const includedPieces =
+    typeof body.includedPieces === 'string' ? body.includedPieces.trim().slice(0, 240) : '';
+  const careNote = typeof body.careNote === 'string' ? body.careNote.trim().slice(0, 240) : '';
 
   const categoryRaw = typeof body.category === 'string' ? body.category.trim() : '';
   const availableCategories = await store.listCategories();
@@ -940,6 +961,8 @@ async function validateAndNormalizeProductInput(
       title,
       description,
       fabricNote,
+      includedPieces,
+      careNote,
       category,
       sku,
       pricePaise: lowestPricePaise,
@@ -2535,6 +2558,8 @@ export function registerCatalogAndAdminRoutes(params: {
             title: d.title,
             description: d.description,
             fabric_note: d.fabricNote,
+            included_pieces: d.includedPieces,
+            care_note: d.careNote,
             category: d.category,
             sku: d.sku,
             price_paise: d.pricePaise,
@@ -2734,6 +2759,8 @@ export function registerCatalogAndAdminRoutes(params: {
           title: d.title,
           description: d.description,
           fabricNote: d.fabricNote,
+          includedPieces: d.includedPieces,
+          careNote: d.careNote,
           category: d.category,
           sku: d.sku,
           pricePaise: d.pricePaise,

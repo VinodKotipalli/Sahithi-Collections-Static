@@ -986,6 +986,8 @@ interface FirestoreProductDoc {
   title: string;
   description: string;
   fabric_note: string;
+  included_pieces?: string;
+  care_note?: string;
   category: string;
   sku: string;
   price_paise: number;
@@ -996,6 +998,10 @@ interface FirestoreProductDoc {
   status: ProductStatus;
   colors_json: string;
   sizes_json: string;
+  import_key?: string | null;
+  source_image_filename?: string | null;
+  pending_fields_json?: string | null;
+  catalog_batch?: string | null;
   version: number;
   published_at: number | null;
   archived_at: number | null;
@@ -1103,6 +1109,8 @@ function fromFirestoreProduct(doc: FirestoreProductDoc): ProductWithParts {
     title: doc.title,
     description: doc.description || '',
     fabric_note: doc.fabric_note || '',
+    included_pieces: typeof doc.included_pieces === 'string' ? doc.included_pieces : '',
+    care_note: typeof doc.care_note === 'string' ? doc.care_note : '',
     category: doc.category,
     sku: doc.sku,
     price_paise: Number(doc.price_paise),
@@ -1114,6 +1122,12 @@ function fromFirestoreProduct(doc: FirestoreProductDoc): ProductWithParts {
     status: doc.status,
     colors_json: doc.colors_json || '[]',
     sizes_json: doc.sizes_json || '[]',
+    import_key: typeof doc.import_key === 'string' ? doc.import_key : null,
+    source_image_filename:
+      typeof doc.source_image_filename === 'string' ? doc.source_image_filename : null,
+    pending_fields_json:
+      typeof doc.pending_fields_json === 'string' ? doc.pending_fields_json : null,
+    catalog_batch: typeof doc.catalog_batch === 'string' ? doc.catalog_batch : null,
     version: Number(doc.version || 1),
     published_at: doc.published_at ?? null,
     archived_at: doc.archived_at ?? null,
@@ -1868,18 +1882,43 @@ export class FirestoreRestStore implements BoutiqueStore {
   private hiddenProductSlugs = new Set<string>();
   private deletedProductIds = new Set<string>();
 
+  private suppressLegacySeed = false;
+
   private async getCatalogVisibilityMeta(): Promise<{
     hiddenIds: Set<string>;
     hiddenSlugs: Set<string>;
     deletedIds: Set<string>;
+    suppressLegacySeed: boolean;
   }> {
     const hiddenIds = new Set<string>(this.hiddenProductIds);
     const hiddenSlugs = new Set<string>(this.hiddenProductSlugs);
     const deletedIds = new Set<string>(this.deletedProductIds);
+    let suppressLegacySeed = this.suppressLegacySeed;
 
     try {
       const settingsDoc = await this.getDoc('site_documents/settings');
       if (settingsDoc && settingsDoc.data) {
+        const valueObj =
+          settingsDoc.data.value && typeof settingsDoc.data.value === 'object'
+            ? (settingsDoc.data.value as Record<string, unknown>)
+            : null;
+        const catalogCtrl =
+          valueObj?.catalogControl && typeof valueObj.catalogControl === 'object'
+            ? (valueObj.catalogControl as Record<string, unknown>)
+            : null;
+        if (
+          settingsDoc.data.suppress_legacy_seed === true ||
+          catalogCtrl?.suppressLegacySeed === true
+        ) {
+          suppressLegacySeed = true;
+          this.suppressLegacySeed = true;
+        } else if (
+          settingsDoc.data.suppress_legacy_seed === false ||
+          catalogCtrl?.suppressLegacySeed === false
+        ) {
+          suppressLegacySeed = false;
+          this.suppressLegacySeed = false;
+        }
         const rawHiddenIds = settingsDoc.data.hidden_product_ids;
         if (Array.isArray(rawHiddenIds)) {
           for (const id of rawHiddenIds) {
@@ -1959,7 +1998,7 @@ export class FirestoreRestStore implements BoutiqueStore {
       }
     }
 
-    return { hiddenIds, hiddenSlugs, deletedIds };
+    return { hiddenIds, hiddenSlugs, deletedIds, suppressLegacySeed };
   }
 
   private async persistCatalogVisibilityMeta(): Promise<void> {
@@ -1973,6 +2012,7 @@ export class FirestoreRestStore implements BoutiqueStore {
       await this.setDoc('site_documents/settings', {
         key: 'settings',
         value: currentValue,
+        suppress_legacy_seed: this.suppressLegacySeed,
         hidden_product_ids: Array.from(this.hiddenProductIds),
         hidden_product_slugs: Array.from(this.hiddenProductSlugs),
         deleted_product_ids: Array.from(this.deletedProductIds),
@@ -2040,6 +2080,10 @@ export class FirestoreRestStore implements BoutiqueStore {
       });
     }
 
+    if (meta.suppressLegacySeed) {
+      return;
+    }
+
     const existingProductIds = new Set(existingProducts.map((p) => p.id));
     const missingProducts = INITIAL_SEED_PRODUCTS.filter(
       (p) => !existingProductIds.has(p.id) && !meta.deletedIds.has(p.id)
@@ -2066,6 +2110,9 @@ export class FirestoreRestStore implements BoutiqueStore {
     const list = docs
       .map((d) => d.data as unknown as FirestoreProductDoc)
       .filter((d) => !meta.deletedIds.has(d.id));
+    if (meta.suppressLegacySeed) {
+      return list;
+    }
     const existingIds = new Set(list.map((d) => d.id));
     const existingSlugs = new Set(list.map((d) => d.slug));
     const now = Date.now();
@@ -2100,7 +2147,7 @@ export class FirestoreRestStore implements BoutiqueStore {
       };
     }
     const meta = await this.getCatalogVisibilityMeta();
-    if (meta.deletedIds.has(id)) return null;
+    if (meta.suppressLegacySeed || meta.deletedIds.has(id)) return null;
     const seedIdx = INITIAL_SEED_PRODUCTS.findIndex(
       (p) => p.id === id || p.id.toLowerCase() === id.toLowerCase() || p.slug === id
     );
@@ -2211,18 +2258,20 @@ export class FirestoreRestStore implements BoutiqueStore {
       .filter((d) => !meta.hiddenIds.has(d.id) && !meta.deletedIds.has(d.id))
       .map((d) => fromFirestoreProduct(d));
 
-    // Ensure starter/catalog products are available unless hidden, unpublished, archived, or deleted
-    const existingIds = new Set(list.map((item) => item.product.id));
-    const existingSlugs = new Set(list.map((item) => item.product.slug));
-    for (const starter of buildStarterReadProducts(Date.now())) {
-      if (
-        !existingIds.has(starter.product.id) &&
-        !existingSlugs.has(starter.product.slug) &&
-        !meta.hiddenIds.has(starter.product.id) &&
-        !meta.deletedIds.has(starter.product.id) &&
-        !meta.hiddenSlugs.has(starter.product.slug)
-      ) {
-        list.push(starter);
+    // Ensure starter/catalog products are available unless suppressed, hidden, unpublished, archived, or deleted
+    if (!meta.suppressLegacySeed) {
+      const existingIds = new Set(list.map((item) => item.product.id));
+      const existingSlugs = new Set(list.map((item) => item.product.slug));
+      for (const starter of buildStarterReadProducts(Date.now())) {
+        if (
+          !existingIds.has(starter.product.id) &&
+          !existingSlugs.has(starter.product.slug) &&
+          !meta.hiddenIds.has(starter.product.id) &&
+          !meta.deletedIds.has(starter.product.id) &&
+          !meta.hiddenSlugs.has(starter.product.slug)
+        ) {
+          list.push(starter);
+        }
       }
     }
 
@@ -2239,7 +2288,9 @@ export class FirestoreRestStore implements BoutiqueStore {
           item.product.title.toLowerCase().includes(term) ||
           item.product.category.toLowerCase().includes(term) ||
           item.product.description.toLowerCase().includes(term) ||
-          item.product.fabric_note.toLowerCase().includes(term)
+          item.product.fabric_note.toLowerCase().includes(term) ||
+          (item.product.included_pieces || '').toLowerCase().includes(term) ||
+          (item.product.care_note || '').toLowerCase().includes(term)
       );
     }
 
@@ -2263,6 +2314,7 @@ export class FirestoreRestStore implements BoutiqueStore {
         (d.id === idOrSlug || d.slug === idOrSlug)
     );
     if (match) return fromFirestoreProduct(match);
+    if (meta.suppressLegacySeed) return null;
 
     const starter = buildStarterReadProducts(Date.now()).find(
       (item) => item.product.id === idOrSlug || item.product.slug === idOrSlug
@@ -2523,6 +2575,8 @@ export class FirestoreRestStore implements BoutiqueStore {
       title: input.product.title,
       description: input.product.description,
       fabric_note: input.product.fabric_note,
+      included_pieces: input.product.included_pieces ?? '',
+      care_note: input.product.care_note ?? '',
       category: input.product.category,
       sku: input.product.sku,
       price_paise: input.product.price_paise,
@@ -2533,6 +2587,10 @@ export class FirestoreRestStore implements BoutiqueStore {
       status: input.product.status,
       colors_json: input.product.colors_json,
       sizes_json: input.product.sizes_json,
+      import_key: input.product.import_key ?? null,
+      source_image_filename: input.product.source_image_filename ?? null,
+      pending_fields_json: input.product.pending_fields_json ?? null,
+      catalog_batch: input.product.catalog_batch ?? null,
       version: input.product.version,
       published_at: input.product.published_at,
       archived_at: input.product.archived_at,
@@ -2601,6 +2659,8 @@ export class FirestoreRestStore implements BoutiqueStore {
     title: string;
     description: string;
     fabricNote: string;
+    includedPieces?: string;
+    careNote?: string;
     category: string;
     sku: string;
     pricePaise: number;
@@ -2611,6 +2671,10 @@ export class FirestoreRestStore implements BoutiqueStore {
     nextStatus: ProductStatus;
     colorsJson: string;
     sizesJson: string;
+    importKey?: string | null;
+    sourceImageFilename?: string | null;
+    pendingFieldsJson?: string | null;
+    catalogBatch?: string | null;
     publishedAtIfNull: number | null;
     now: number;
     variants: ProductVariantRow[];
@@ -2634,6 +2698,12 @@ export class FirestoreRestStore implements BoutiqueStore {
       title: input.title,
       description: input.description,
       fabric_note: input.fabricNote,
+      included_pieces:
+        input.includedPieces !== undefined
+          ? input.includedPieces
+          : (current.included_pieces ?? ''),
+      care_note:
+        input.careNote !== undefined ? input.careNote : (current.care_note ?? ''),
       category: input.category,
       sku: input.sku,
       price_paise: input.pricePaise,
@@ -2644,6 +2714,18 @@ export class FirestoreRestStore implements BoutiqueStore {
       status: input.nextStatus,
       colors_json: input.colorsJson,
       sizes_json: input.sizesJson,
+      import_key:
+        input.importKey !== undefined ? input.importKey : (current.import_key ?? null),
+      source_image_filename:
+        input.sourceImageFilename !== undefined
+          ? input.sourceImageFilename
+          : (current.source_image_filename ?? null),
+      pending_fields_json:
+        input.pendingFieldsJson !== undefined
+          ? input.pendingFieldsJson
+          : (current.pending_fields_json ?? null),
+      catalog_batch:
+        input.catalogBatch !== undefined ? input.catalogBatch : (current.catalog_batch ?? null),
       version: current.version + 1,
       published_at: current.published_at ?? input.publishedAtIfNull,
       archived_at: input.nextStatus === 'archived' ? (current.archived_at ?? input.now) : null,
@@ -4620,9 +4702,13 @@ export class FirestoreRestStore implements BoutiqueStore {
   async saveSiteSettings(settings: SiteSettingsData): Promise<SiteSettingsData> {
     const merged = mergeSiteSettings(settings);
     await this.getCatalogVisibilityMeta();
+    if (merged.catalogControl && typeof merged.catalogControl.suppressLegacySeed === 'boolean') {
+      this.suppressLegacySeed = merged.catalogControl.suppressLegacySeed;
+    }
     await this.setDoc('site_documents/settings', {
       key: 'settings',
       value: merged,
+      suppress_legacy_seed: this.suppressLegacySeed,
       hidden_product_ids: Array.from(this.hiddenProductIds),
       hidden_product_slugs: Array.from(this.hiddenProductSlugs),
       deleted_product_ids: Array.from(this.deletedProductIds),

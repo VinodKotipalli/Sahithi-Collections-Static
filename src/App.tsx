@@ -105,7 +105,7 @@ function BoutiqueShell() {
     navigateToSection,
   } = useBoutiqueRouter();
 
-  const [products, setProducts] = useState<Product[]>(() => DEFAULT_NORMALIZED_PRODUCTS);
+  const [products, setProducts] = useState<Product[]>([]);
   const [loadingCatalog, setLoadingCatalog] = useState(true);
 
   const [selectedCategory, setSelectedCategory] = useState<'All' | CollectionCategory>('All');
@@ -151,9 +151,11 @@ function BoutiqueShell() {
         setQuickViewProduct((current) =>
           current ? fallback.data.items!.find((p) => p.id === current.id) || null : null
         );
+        return;
       }
+      setProducts((current) => (current.length > 0 ? current : DEFAULT_NORMALIZED_PRODUCTS));
     } catch {
-      // Preserve current catalog list if transient error occurs
+      setProducts((current) => (current.length > 0 ? current : DEFAULT_NORMALIZED_PRODUCTS));
     } finally {
       setLoadingCatalog(false);
     }
@@ -253,6 +255,8 @@ function BoutiqueShell() {
         product.category.toLowerCase().includes(query) ||
         product.description.toLowerCase().includes(query) ||
         product.fabricNote.toLowerCase().includes(query) ||
+        (product.includedPieces || '').toLowerCase().includes(query) ||
+        (product.careNote || '').toLowerCase().includes(query) ||
         product.colors.some((c) => c.name.toLowerCase().includes(query))
       );
     });
@@ -390,7 +394,7 @@ function BoutiqueShell() {
           <AccountDashboard
             activeSection={accountSection}
             onSelectSection={(section) => navigate(buildAccountSectionPath(section))}
-            wishlistCount={wishlistCount}
+            wishlistCount={loadingCatalog ? wishlistCount : wishlistProducts.length}
             wishlistProducts={wishlistProducts}
             onRemoveWishlistItem={removeFromWishlist}
             onAddToBag={addToBag}
@@ -417,7 +421,7 @@ function BoutiqueShell() {
           </a>
 
           <Navbar
-            wishlistCount={wishlistCount}
+            wishlistCount={loadingCatalog ? wishlistCount : wishlistProducts.length}
             bagCount={bagCount}
             onOpenWishlist={() => setWishlistOpen(true)}
             onOpenBag={() => setBagOpen(true)}

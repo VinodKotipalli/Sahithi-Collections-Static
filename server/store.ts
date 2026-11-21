@@ -313,6 +313,8 @@ export interface BoutiqueStore {
     title: string;
     description: string;
     fabricNote: string;
+    includedPieces?: string;
+    careNote?: string;
     category: string;
     sku: string;
     pricePaise: number;
@@ -323,6 +325,10 @@ export interface BoutiqueStore {
     nextStatus: ProductStatus;
     colorsJson: string;
     sizesJson: string;
+    importKey?: string | null;
+    sourceImageFilename?: string | null;
+    pendingFieldsJson?: string | null;
+    catalogBatch?: string | null;
     publishedAtIfNull: number | null;
     now: number;
     variants: ProductVariantRow[];

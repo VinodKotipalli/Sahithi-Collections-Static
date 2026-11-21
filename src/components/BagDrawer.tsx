@@ -437,6 +437,13 @@ export function BagDrawer({
       return;
     }
 
+    if (validation?.hasUnavailable) {
+      setPaymentErrorText(
+        'One or more pieces in your bag are archived or out of stock. Remove unavailable items before checking out.'
+      );
+      return;
+    }
+
     if (paymentMethod === 'razorpay' && netPayablePaise < 100) {
       setPaymentErrorText(
         'Net payable amount after promo discounts must be at least ₹1.00 (100 paise) for Razorpay Checkout.'
@@ -1207,6 +1214,18 @@ export function BagDrawer({
                       );
                     })}
                   </ul>
+
+                  {validation?.hasUnavailable && (
+                    <div
+                      role="alert"
+                      className="rounded-2xl border border-[#B76E79]/50 bg-[#F3D5DF]/35 p-3.5 text-xs text-[#49243E]"
+                    >
+                      <p className="font-semibold">Some pieces in your bag are no longer available.</p>
+                      <p className="mt-1 text-[#49243E]/80">
+                        Please remove archived or out-of-stock items above to proceed to checkout.
+                      </p>
+                    </div>
+                  )}
 
                   {checkoutOpen && !validation?.hasUnavailable && (
                     <form

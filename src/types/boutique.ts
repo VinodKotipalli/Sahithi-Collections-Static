@@ -35,6 +35,8 @@ export interface Product {
   compareAtPaise?: number | null;
   description: string;
   fabricNote: string;
+  includedPieces?: string;
+  careNote?: string;
   stockQty?: number;
   lowStockThreshold?: number;
   inStock?: boolean;
@@ -291,6 +293,10 @@ export interface AdminProductImage {
 export interface AdminProduct extends Product {
   sku: string;
   status: AdminProductStatus;
+  importKey?: string | null;
+  sourceImageFilename?: string | null;
+  pendingFields?: string[];
+  catalogBatch?: string | null;
   version: number;
   publishedAt: number | null;
   archivedAt: number | null;

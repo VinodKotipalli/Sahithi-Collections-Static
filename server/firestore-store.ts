@@ -79,6 +79,8 @@ interface FirestoreProductDoc {
   title: string;
   description: string;
   fabric_note: string;
+  included_pieces?: string;
+  care_note?: string;
   category: string;
   sku: string;
   price_paise: number;
@@ -89,6 +91,10 @@ interface FirestoreProductDoc {
   status: ProductStatus;
   colors_json: string;
   sizes_json: string;
+  import_key?: string | null;
+  source_image_filename?: string | null;
+  pending_fields_json?: string | null;
+  catalog_batch?: string | null;
   version: number;
   published_at: number | null;
   archived_at: number | null;
@@ -295,6 +301,8 @@ function fromFirestoreProduct(doc: FirestoreProductDoc): ProductWithParts {
     title: doc.title,
     description: doc.description,
     fabric_note: doc.fabric_note || '',
+    included_pieces: typeof doc.included_pieces === 'string' ? doc.included_pieces : '',
+    care_note: typeof doc.care_note === 'string' ? doc.care_note : '',
     category: doc.category,
     sku: doc.sku,
     price_paise: Number(doc.price_paise),
@@ -306,6 +314,12 @@ function fromFirestoreProduct(doc: FirestoreProductDoc): ProductWithParts {
     status: doc.status,
     colors_json: doc.colors_json || '[]',
     sizes_json: doc.sizes_json || '[]',
+    import_key: typeof doc.import_key === 'string' ? doc.import_key : null,
+    source_image_filename:
+      typeof doc.source_image_filename === 'string' ? doc.source_image_filename : null,
+    pending_fields_json:
+      typeof doc.pending_fields_json === 'string' ? doc.pending_fields_json : null,
+    catalog_batch: typeof doc.catalog_batch === 'string' ? doc.catalog_batch : null,
     version: Number(doc.version || 1),
     published_at: typeof doc.published_at === 'number' ? doc.published_at : null,
     archived_at: typeof doc.archived_at === 'number' ? doc.archived_at : null,
@@ -879,10 +893,19 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
   }
 
   async seedInitialCatalogIfEmpty(): Promise<void> {
-    const [existingSnap, deleteAuditsSnap] = await Promise.all([
+    const [existingSnap, deleteAuditsSnap, settingsSnap] = await Promise.all([
       this.productsCol().get(),
       this.auditCol().where('action', '==', 'delete').get(),
+      this.siteDocsCol().doc('settings').get(),
     ]);
+    if (settingsSnap.exists) {
+      const sData = settingsSnap.data() as Record<string, unknown> | undefined;
+      const val = sData?.value as Record<string, unknown> | undefined;
+      const ctrl = val?.catalogControl as Record<string, unknown> | undefined;
+      if (sData?.suppress_legacy_seed === true || ctrl?.suppressLegacySeed === true) {
+        return;
+      }
+    }
     const existingIds = new Set(existingSnap.docs.map((d) => d.id));
     for (const doc of deleteAuditsSnap.docs) {
       const pid = String(doc.data().product_id || '');
@@ -1019,6 +1042,8 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
           r.product.category.toLowerCase().includes(q) ||
           r.product.description.toLowerCase().includes(q) ||
           r.product.fabric_note.toLowerCase().includes(q) ||
+          (r.product.included_pieces || '').toLowerCase().includes(q) ||
+          (r.product.care_note || '').toLowerCase().includes(q) ||
           r.product.colors_json.toLowerCase().includes(q)
       );
     }
@@ -1323,6 +1348,8 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
       title: p.title,
       description: p.description,
       fabric_note: p.fabric_note,
+      included_pieces: p.included_pieces ?? '',
+      care_note: p.care_note ?? '',
       category: p.category,
       sku: p.sku,
       price_paise: p.price_paise,
@@ -1333,6 +1360,10 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
       status: p.status,
       colors_json: p.colors_json,
       sizes_json: p.sizes_json,
+      import_key: p.import_key ?? null,
+      source_image_filename: p.source_image_filename ?? null,
+      pending_fields_json: p.pending_fields_json ?? null,
+      catalog_batch: p.catalog_batch ?? null,
       version: p.version,
       published_at: p.published_at,
       archived_at: p.archived_at,
@@ -1374,6 +1405,8 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     title: string;
     description: string;
     fabricNote: string;
+    includedPieces?: string;
+    careNote?: string;
     category: string;
     sku: string;
     pricePaise: number;
@@ -1384,6 +1417,10 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     nextStatus: ProductStatus;
     colorsJson: string;
     sizesJson: string;
+    importKey?: string | null;
+    sourceImageFilename?: string | null;
+    pendingFieldsJson?: string | null;
+    catalogBatch?: string | null;
     publishedAtIfNull: number | null;
     now: number;
     variants: ProductVariantRow[];
@@ -1423,6 +1460,12 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
         title: input.title,
         description: input.description,
         fabric_note: input.fabricNote,
+        included_pieces:
+          input.includedPieces !== undefined
+            ? input.includedPieces
+            : (existing.included_pieces ?? ''),
+        care_note:
+          input.careNote !== undefined ? input.careNote : (existing.care_note ?? ''),
         category: input.category,
         sku: input.sku,
         price_paise: input.pricePaise,
@@ -1433,6 +1476,18 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
         status: input.nextStatus,
         colors_json: input.colorsJson,
         sizes_json: input.sizesJson,
+        import_key:
+          input.importKey !== undefined ? input.importKey : (existing.import_key ?? null),
+        source_image_filename:
+          input.sourceImageFilename !== undefined
+            ? input.sourceImageFilename
+            : (existing.source_image_filename ?? null),
+        pending_fields_json:
+          input.pendingFieldsJson !== undefined
+            ? input.pendingFieldsJson
+            : (existing.pending_fields_json ?? null),
+        catalog_batch:
+          input.catalogBatch !== undefined ? input.catalogBatch : (existing.catalog_batch ?? null),
         version: existing.version + 1,
         published_at:
           typeof existing.published_at === 'number'

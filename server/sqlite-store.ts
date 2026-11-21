@@ -488,6 +488,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           r.category.toLowerCase().includes(q) ||
           r.description.toLowerCase().includes(q) ||
           r.fabric_note.toLowerCase().includes(q) ||
+          (r.included_pieces || '').toLowerCase().includes(q) ||
+          (r.care_note || '').toLowerCase().includes(q) ||
           r.colors_json.toLowerCase().includes(q)
       );
     }
@@ -750,11 +752,12 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       this.db
         .prepare(
           `INSERT INTO products (
-            id, slug, title, description, fabric_note, category, sku,
+            id, slug, title, description, fabric_note, included_pieces, care_note, category, sku,
             price_paise, compare_at_paise, stock_qty, low_stock_threshold,
-            featured, status, colors_json, sizes_json, version,
-            published_at, archived_at, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            featured, status, colors_json, sizes_json,
+            import_key, source_image_filename, pending_fields_json, catalog_batch,
+            version, published_at, archived_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           p.id,
@@ -762,6 +765,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           p.title,
           p.description,
           p.fabric_note,
+          p.included_pieces ?? '',
+          p.care_note ?? '',
           p.category,
           p.sku,
           p.price_paise,
@@ -772,6 +777,10 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           p.status,
           p.colors_json,
           p.sizes_json,
+          p.import_key ?? null,
+          p.source_image_filename ?? null,
+          p.pending_fields_json ?? null,
+          p.catalog_batch ?? null,
           p.version,
           p.published_at,
           p.archived_at,
@@ -846,6 +855,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     title: string;
     description: string;
     fabricNote: string;
+    includedPieces?: string;
+    careNote?: string;
     category: string;
     sku: string;
     pricePaise: number;
@@ -856,6 +867,10 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     nextStatus: ProductStatus;
     colorsJson: string;
     sizesJson: string;
+    importKey?: string | null;
+    sourceImageFilename?: string | null;
+    pendingFieldsJson?: string | null;
+    catalogBatch?: string | null;
     publishedAtIfNull: number | null;
     now: number;
     variants: ProductVariantRow[];
@@ -880,12 +895,31 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     try {
       const nextArchivedAt =
         input.nextStatus === 'archived' ? (existing.archived_at ?? input.now) : null;
+      const nextIncludedPieces =
+        input.includedPieces !== undefined ? input.includedPieces : (existing.included_pieces ?? '');
+      const nextCareNote =
+        input.careNote !== undefined ? input.careNote : (existing.care_note ?? '');
+      const nextImportKey =
+        input.importKey !== undefined ? input.importKey : (existing.import_key ?? null);
+      const nextSourceFilename =
+        input.sourceImageFilename !== undefined
+          ? input.sourceImageFilename
+          : (existing.source_image_filename ?? null);
+      const nextPendingFieldsJson =
+        input.pendingFieldsJson !== undefined
+          ? input.pendingFieldsJson
+          : (existing.pending_fields_json ?? null);
+      const nextCatalogBatch =
+        input.catalogBatch !== undefined ? input.catalogBatch : (existing.catalog_batch ?? null);
       const updateRes = this.db
         .prepare(
           `UPDATE products SET
-            slug = ?, title = ?, description = ?, fabric_note = ?, category = ?, sku = ?,
+            slug = ?, title = ?, description = ?, fabric_note = ?,
+            included_pieces = ?, care_note = ?,
+            category = ?, sku = ?,
             price_paise = ?, compare_at_paise = ?, stock_qty = ?, low_stock_threshold = ?,
             featured = ?, status = ?, colors_json = ?, sizes_json = ?,
+            import_key = ?, source_image_filename = ?, pending_fields_json = ?, catalog_batch = ?,
             version = version + 1,
             published_at = COALESCE(published_at, ?),
             archived_at = ?,
@@ -897,6 +931,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           input.title,
           input.description,
           input.fabricNote,
+          nextIncludedPieces,
+          nextCareNote,
           input.category,
           input.sku,
           input.pricePaise,
@@ -907,6 +943,10 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           input.nextStatus,
           input.colorsJson,
           input.sizesJson,
+          nextImportKey,
+          nextSourceFilename,
+          nextPendingFieldsJson,
+          nextCatalogBatch,
           input.publishedAtIfNull,
           nextArchivedAt,
           input.now,
@@ -1020,11 +1060,11 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       this.db
         .prepare(
           `INSERT INTO products (
-            id, slug, title, description, fabric_note, category, sku,
+            id, slug, title, description, fabric_note, included_pieces, care_note, category, sku,
             price_paise, compare_at_paise, stock_qty, low_stock_threshold,
             featured, status, colors_json, sizes_json, version,
             published_at, archived_at, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'draft', ?, ?, 1, NULL, NULL, ?, ?)`
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'draft', ?, ?, 1, NULL, NULL, ?, ?)`
         )
         .run(
           newId,
@@ -1032,6 +1072,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           copyTitle,
           source.description,
           source.fabric_note,
+          source.included_pieces ?? '',
+          source.care_note ?? '',
           source.category,
           copySku,
           source.price_paise,

@@ -27,6 +27,11 @@ export interface SiteSettingsData {
     pinterestUrl: string;
     youtubeUrl: string;
   };
+  catalogControl?: {
+    suppressLegacySeed?: boolean;
+    activeCatalogBatch?: string | null;
+    activeBackupId?: string | null;
+  };
 }
 
 export interface LookbookContentItem {
@@ -216,6 +221,15 @@ export const INITIAL_SEED_CATEGORIES: SeedCategoryDef[] = [
     imageUrl: '/boutique-media/col_accessories_1794557657836.jpg',
     altText: 'Pearl-embroidered blush potli clutch, rose-gold earrings, and silk scarf on travertine',
     position: 9,
+  },
+  {
+    id: 'lehengas',
+    name: 'Lehengas',
+    slug: 'lehengas',
+    subtitle: 'Celebration skirts, illustrated borders & festive statement sets',
+    imageUrl: '/boutique-media/col_festive_wear_1794557658541.jpg',
+    altText: 'Festive lehenga set with ornate border detailing',
+    position: 10,
   },
 ];
 
@@ -443,6 +457,21 @@ export function mergeSiteSettings(partial?: Partial<SiteSettingsData> | null): S
           ? partial.socialLinks.youtubeUrl.trim()
           : '',
     },
+    ...(partial.catalogControl && typeof partial.catalogControl === 'object'
+      ? {
+          catalogControl: {
+            suppressLegacySeed: Boolean(partial.catalogControl.suppressLegacySeed),
+            activeCatalogBatch:
+              typeof partial.catalogControl.activeCatalogBatch === 'string'
+                ? partial.catalogControl.activeCatalogBatch.trim().slice(0, 80)
+                : null,
+            activeBackupId:
+              typeof partial.catalogControl.activeBackupId === 'string'
+                ? partial.catalogControl.activeBackupId.trim().slice(0, 80)
+                : null,
+          },
+        }
+      : {}),
   };
 }
 

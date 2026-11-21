@@ -61,9 +61,12 @@ service cloud.firestore {
           'variants', 'images', 'variant_skus', 'image_urls'
         ])
         && data.keys().hasOnly([
-          'id', 'slug', 'title', 'description', 'fabric_note', 'category', 'sku',
+          'id', 'slug', 'title', 'description', 'fabric_note',
+          'included_pieces', 'care_note', 'category', 'sku',
           'price_paise', 'compare_at_paise', 'stock_qty', 'low_stock_threshold', 'featured', 'status',
-          'colors_json', 'sizes_json', 'version', 'published_at', 'archived_at',
+          'colors_json', 'sizes_json',
+          'import_key', 'source_image_filename', 'pending_fields_json', 'catalog_batch',
+          'version', 'published_at', 'archived_at',
           'created_at', 'updated_at', 'variants', 'images', 'variant_skus', 'image_urls'
         ])
         && data.id == productId
@@ -71,6 +74,8 @@ service cloud.firestore {
         && data.title is string && data.title.size() >= 2 && data.title.size() <= 160
         && data.description is string && data.description.size() <= 5000
         && data.fabric_note is string && data.fabric_note.size() <= 500
+        && (!('included_pieces' in data) || (data.included_pieces is string && data.included_pieces.size() <= 300))
+        && (!('care_note' in data) || (data.care_note is string && data.care_note.size() <= 300))
         && data.category is string && data.category.size() >= 1 && data.category.size() <= 80
         && data.sku is string && data.sku.size() >= 1 && data.sku.size() <= 64
         && data.price_paise is number && data.price_paise >= 100 && data.price_paise <= 100000000
@@ -81,6 +86,10 @@ service cloud.firestore {
         && data.status in ['draft', 'published', 'archived']
         && data.colors_json is string && data.colors_json.size() <= 10000
         && data.sizes_json is string && data.sizes_json.size() <= 5000
+        && (!('import_key' in data) || data.import_key == null || (data.import_key is string && data.import_key.size() <= 80))
+        && (!('source_image_filename' in data) || data.source_image_filename == null || (data.source_image_filename is string && data.source_image_filename.size() <= 140))
+        && (!('pending_fields_json' in data) || data.pending_fields_json == null || (data.pending_fields_json is string && data.pending_fields_json.size() <= 1500))
+        && (!('catalog_batch' in data) || data.catalog_batch == null || (data.catalog_batch is string && data.catalog_batch.size() <= 80))
         && data.version is number && data.version >= 1
         && data.created_at is number && data.updated_at is number
         && data.variants is list && data.variants.size() >= 1 && data.variants.size() <= 100
@@ -219,7 +228,7 @@ service cloud.firestore {
         allow list: if isValidEnv(envKey) && isOwner();
         allow create, update: if isValidEnv(envKey)
           && isOwner()
-          && docKey in ['settings', 'content', 'loyalty_config', 'owner_meta']
+          && docKey in ['settings', 'content', 'loyalty_config', 'owner_meta', 'catalog_backup']
           && request.resource.data.key == docKey
           && request.resource.data.updated_at is number;
         allow delete: if false;

@@ -997,6 +997,7 @@ export async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, 
   const hiddenIds = new Set<string>();
   const hiddenSlugs = new Set<string>();
   const deletedIds = new Set<string>();
+  let suppressLegacySeed = false;
 
   try {
     const settingsRes = await fetch(
@@ -1008,6 +1009,21 @@ export async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, 
         fields?: Record<string, FsFieldValue>;
       };
       const settingsData = fromFsFields(settingsJson.fields);
+      const valueObj =
+        settingsData.value && typeof settingsData.value === 'object'
+          ? (settingsData.value as Record<string, unknown>)
+          : null;
+      const catalogCtrl =
+        valueObj?.catalogControl && typeof valueObj.catalogControl === 'object'
+          ? (valueObj.catalogControl as Record<string, unknown>)
+          : null;
+      if (
+        settingsData.suppress_legacy_seed === true ||
+        catalogCtrl?.suppressLegacySeed === true
+      ) {
+        suppressLegacySeed = true;
+        byId.clear();
+      }
       const hIds = Array.isArray(settingsData.hidden_product_ids)
         ? settingsData.hidden_product_ids
         : [];
@@ -1029,6 +1045,7 @@ export async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, 
   } catch {
     // Non-fatal: continue with seed + runQuery
   }
+  void suppressLegacySeed;
 
   try {
     const queryUrl = `${ctx.docBaseUrl}/environments/${ctx.namespace}:runQuery${keyParam}`;

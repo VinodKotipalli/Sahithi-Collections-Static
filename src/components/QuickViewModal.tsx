@@ -292,6 +292,17 @@ export function QuickViewModal({
                         <span className="font-medium">Fabric &amp; Craft:</span> {product.fabricNote}
                       </p>
                     )}
+                    {product.includedPieces && (
+                      <p className="mt-1.5 text-xs text-[#49243E]/75">
+                        <span className="font-medium">Included Pieces:</span>{' '}
+                        {product.includedPieces}
+                      </p>
+                    )}
+                    {product.careNote && (
+                      <p className="mt-1.5 text-xs text-[#49243E]/75">
+                        <span className="font-medium">Care:</span> {product.careNote}
+                      </p>
+                    )}
 
                     {/* Color Selector */}
                     <div className="mt-6">

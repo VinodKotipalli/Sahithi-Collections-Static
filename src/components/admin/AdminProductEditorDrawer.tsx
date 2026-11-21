@@ -56,6 +56,8 @@ interface ProductFormState {
   sku: string;
   description: string;
   fabricNote: string;
+  includedPieces: string;
+  careNote: string;
   basePriceInr: string;
   baseCompareAtInr: string;
   lowStockThreshold: string;
@@ -102,6 +104,8 @@ function createInitialFormState(
       sku: defaultSku,
       description: '',
       fabricNote: '',
+      includedPieces: '',
+      careNote: '',
       basePriceInr: '2499',
       baseCompareAtInr: '',
       lowStockThreshold: '5',
@@ -176,6 +180,8 @@ function createInitialFormState(
     sku: product.sku,
     description: product.description,
     fabricNote: product.fabricNote,
+    includedPieces: product.includedPieces || '',
+    careNote: product.careNote || '',
     basePriceInr: paiseToInput(product.pricePaise ?? Math.round(product.price * 100)),
     baseCompareAtInr: paiseToInput(product.compareAtPaise),
     lowStockThreshold: String(product.lowStockThreshold ?? 5),
@@ -765,6 +771,8 @@ export function AdminProductEditorDrawer({
       sku: cleanSku,
       description: cleanDescription,
       fabricNote: form.fabricNote.trim(),
+      includedPieces: form.includedPieces.trim(),
+      careNote: form.careNote.trim(),
       pricePaise: basePricePaise,
       compareAtPaise: baseComparePaise,
       lowStockThreshold: Math.max(0, Number.parseInt(form.lowStockThreshold, 10) || 0),
@@ -1096,6 +1104,50 @@ export function AdminProductEditorDrawer({
                           className="mt-1 h-11 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3.5 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
                         />
                       </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-[#49243E]">
+                          Included Pieces
+                        </label>
+                        <input
+                          type="text"
+                          value={form.includedPieces}
+                          onChange={(e) =>
+                            setForm((p) => ({ ...p, includedPieces: e.target.value }))
+                          }
+                          placeholder="e.g., Kurta, wide-leg pants, and dupatta"
+                          className="mt-1 h-11 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3.5 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
+                        />
+                      </div>
+
+                      <div className="sm:col-span-2">
+                        <label className="block text-xs font-medium text-[#49243E]">
+                          Garment Care Instructions
+                        </label>
+                        <input
+                          type="text"
+                          value={form.careNote}
+                          onChange={(e) =>
+                            setForm((p) => ({ ...p, careNote: e.target.value }))
+                          }
+                          placeholder="e.g., Gentle hand wash separately or dry clean"
+                          className="mt-1 h-11 w-full rounded-xl border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3.5 text-sm focus:border-[#49243E] focus:bg-white focus:outline-none"
+                        />
+                      </div>
+
+                      {product?.pendingFields && product.pendingFields.length > 0 && (
+                        <div className="sm:col-span-2 rounded-xl border border-[#B76E79]/40 bg-[#FFF9F5] p-3.5 text-xs text-[#49243E]">
+                          <p className="font-semibold">
+                            Pending items before publishing
+                            {product.sourceImageFilename
+                              ? ` (Reference: ${product.sourceImageFilename})`
+                              : ''}
+                          </p>
+                          <p className="mt-1 text-[#49243E]/80">
+                            {product.pendingFields.join(', ')}
+                          </p>
+                        </div>
+                      )}
 
                       <div className="grid grid-cols-1 gap-3 sm:col-span-2 sm:grid-cols-3">
                         <div>

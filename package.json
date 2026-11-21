@@ -15,6 +15,12 @@
     "admin:bind-owner": "tsx server/bind-owner.ts",
     "db:check": "tsx server/db-check.ts",
     "db:migrate-firestore": "tsx server/migrate.ts",
+    "catalog:import-drafts": "tsx server/catalog-cli.ts import-drafts",
+    "catalog:readiness": "tsx server/catalog-cli.ts readiness",
+    "catalog:backup": "tsx server/catalog-cli.ts backup",
+    "catalog:cutover": "tsx server/catalog-cli.ts cutover",
+    "catalog:verify": "tsx server/catalog-cli.ts verify",
+    "catalog:rollback": "tsx server/catalog-cli.ts rollback",
     "build:static": "vite build --mode static"
   },
   "dependencies": {

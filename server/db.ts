@@ -81,6 +81,8 @@ export interface ProductRow {
   title: string;
   description: string;
   fabric_note: string;
+  included_pieces?: string;
+  care_note?: string;
   category: string;
   sku: string;
   price_paise: number;
@@ -91,6 +93,10 @@ export interface ProductRow {
   status: ProductStatus;
   colors_json: string;
   sizes_json: string;
+  import_key?: string | null;
+  source_image_filename?: string | null;
+  pending_fields_json?: string | null;
+  catalog_batch?: string | null;
   version: number;
   published_at: number | null;
   archived_at: number | null;
@@ -369,6 +375,8 @@ export function initAuthDatabase(
       title TEXT NOT NULL,
       description TEXT NOT NULL,
       fabric_note TEXT NOT NULL DEFAULT '',
+      included_pieces TEXT NOT NULL DEFAULT '',
+      care_note TEXT NOT NULL DEFAULT '',
       category TEXT NOT NULL,
       sku TEXT NOT NULL UNIQUE,
       price_paise INTEGER NOT NULL CHECK (price_paise >= 100),
@@ -379,6 +387,10 @@ export function initAuthDatabase(
       status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'archived')),
       colors_json TEXT NOT NULL DEFAULT '[]',
       sizes_json TEXT NOT NULL DEFAULT '[]',
+      import_key TEXT,
+      source_image_filename TEXT,
+      pending_fields_json TEXT,
+      catalog_batch TEXT,
       version INTEGER NOT NULL DEFAULT 1,
       published_at INTEGER,
       archived_at INTEGER,
@@ -654,10 +666,26 @@ export function initAuthDatabase(
   ensureOrderCol('payment_collected_by', `payment_collected_by TEXT`);
   ensureOrderCol('updated_at', `updated_at INTEGER`);
 
+  const productCols = (
+    db.prepare(`PRAGMA table_info(products)`).all() as Array<{ name: string }>
+  ).map((c) => c.name);
+  const ensureProductCol = (name: string, ddl: string) => {
+    if (!productCols.includes(name)) {
+      db.exec(`ALTER TABLE products ADD COLUMN ${ddl};`);
+    }
+  };
+  ensureProductCol('included_pieces', `included_pieces TEXT NOT NULL DEFAULT ''`);
+  ensureProductCol('care_note', `care_note TEXT NOT NULL DEFAULT ''`);
+  ensureProductCol('import_key', `import_key TEXT`);
+  ensureProductCol('source_image_filename', `source_image_filename TEXT`);
+  ensureProductCol('pending_fields_json', `pending_fields_json TEXT`);
+  ensureProductCol('catalog_batch', `catalog_batch TEXT`);
+
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_orders_customer_user_id ON orders(customer_user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_orders_razorpay_order_id ON orders(razorpay_order_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_products_import_key ON products(import_key) WHERE import_key IS NOT NULL;
   `);
 
   seedStorefrontCategoriesIfEmpty(db);
