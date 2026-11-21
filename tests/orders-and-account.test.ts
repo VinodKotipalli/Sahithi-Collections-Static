@@ -73,7 +73,7 @@ function createStatefulMockRazorpayFactory(state: MockRazorpayState): RazorpayCl
         const found = state.orders.find((o) => o.id === orderId);
         return {
           id: orderId,
-          amount: found?.amount ?? 74900,
+          amount: found?.amount ?? 169000,
           currency: found?.currency ?? 'INR',
           receipt: found?.receipt ?? 'rcpt_e2e',
           notes: found?.notes,
@@ -93,7 +93,7 @@ function createStatefulMockRazorpayFactory(state: MockRazorpayState): RazorpayCl
         return {
           id: paymentId,
           order_id: latest?.id ?? 'order_e2e_1',
-          amount: latest?.amount ?? 74900,
+          amount: latest?.amount ?? 169000,
           currency: 'INR',
           status: 'captured',
           captured: true,
@@ -333,8 +333,8 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
     );
     assert.equal(gcRes.status, 200);
 
-    // Track initial stock of sc-103 variant 0 (₹749 = 74900 paise)
-    const initialKurti = await appInstance.store.getPublicProductByIdOrSlug('sc-103');
+    // Track initial stock of sc-101 variant 0 (₹1,690 = 169000 paise)
+    const initialKurti = await appInstance.store.getPublicProductByIdOrSlug('sc-101');
     assert.ok(initialKurti);
     const variant0 = initialKurti.variants[0];
     assert.ok(variant0);
@@ -366,14 +366,14 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
       customerA.jar,
       'PUT',
       '/api/account/wishlist',
-      { productIds: ['sc-103', 'sc-108'] },
+      { productIds: ['sc-101', 'sc-004'] },
       customerA.csrfToken
     );
     assert.equal(wishRes.status, 200);
-    assert.deepEqual(wishRes.data.productIds, ['sc-103', 'sc-108']);
+    assert.deepEqual(wishRes.data.productIds, ['sc-101', 'sc-004']);
 
-    // 2. Customer A initiates checkout with coupon SAHITHI10 (10% off 74900 = 7490) + GIFT-MEERA-100 (10000)
-    // Expected payable = 74900 - 7490 - 10000 = 57410 paise
+    // 2. Customer A initiates checkout with coupon SAHITHI10 (10% off 169000 = 16900) + GIFT-MEERA-100 (10000)
+    // Expected payable = 169000 - 16900 - 10000 = 142100 paise
     const createOrderA = await jsonReq<{
       order_id: string;
       amount: number;
@@ -389,7 +389,7 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
         currency: 'INR',
         couponCode: 'SAHITHI10',
         giftCardCode: 'GIFT-MEERA-100',
-        items: [{ productId: 'sc-103', variantId: variant0.id, quantity: 1 }],
+        items: [{ productId: 'sc-101', variantId: variant0.id, quantity: 1 }],
         customer: {
           customerName: 'Meera Rao',
           customerEmail: 'meera.customer@example.com',
@@ -400,15 +400,15 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
       customerA.csrfToken
     );
     assert.equal(createOrderA.status, 200);
-    assert.equal(createOrderA.data.amount, 57410);
-    assert.equal(createOrderA.data.discount_paise, 7490);
+    assert.equal(createOrderA.data.amount, 142100);
+    assert.equal(createOrderA.data.discount_paise, 16900);
     assert.equal(createOrderA.data.gift_card_paise, 10000);
 
     const paymentIdA = 'pay_e2e_customer_a_1';
     mockRzpState.payments.set(paymentIdA, {
       id: paymentIdA,
       order_id: createOrderA.data.order_id,
-      amount: 57410,
+      amount: 142100,
       currency: 'INR',
       status: 'captured',
       captured: true,
@@ -426,7 +426,7 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
           entity: {
             id: paymentIdA,
             order_id: createOrderA.data.order_id,
-            amount: 57410,
+            amount: 142100,
             currency: 'INR',
             status: 'captured',
             captured: true,
@@ -469,7 +469,7 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
     assert.ok(verifyResA.data.order.orderNumber.startsWith('SC-'));
 
     // Stock deducted ONCE even under verify + webhook race
-    const afterRaceKurti = await appInstance.store.getPublicProductByIdOrSlug('sc-103');
+    const afterRaceKurti = await appInstance.store.getPublicProductByIdOrSlug('sc-101');
     assert.equal(afterRaceKurti?.variants[0]?.stock_qty, initialStock - 1);
 
     // Gift card balance deducted
@@ -499,7 +499,7 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
     );
     assert.equal(rewardsA.status, 200);
     assert.ok(rewardsA.data.pointsBalance > 0);
-    assert.equal(rewardsA.data.lifetimeSpendPaise, 57410);
+    assert.equal(rewardsA.data.lifetimeSpendPaise, 142100);
 
     const paymentMethodsA = await jsonReq<{ enabled: boolean; methods: unknown[] }>(
       baseUrl,
@@ -644,7 +644,7 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
       '/api/create-order',
       {
         currency: 'INR',
-        items: [{ productId: 'sc-103', variantId: variant0.id, quantity: 1 }],
+        items: [{ productId: 'sc-101', variantId: variant0.id, quantity: 1 }],
         customer: {
           customerName: 'Guest Priya',
           customerEmail: 'guest.priya@example.com',
@@ -730,7 +730,7 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
     );
 
     // Stock deducted once for webhook-only order too
-    const afterGuestKurti = await appInstance.store.getPublicProductByIdOrSlug('sc-103');
+    const afterGuestKurti = await appInstance.store.getPublicProductByIdOrSlug('sc-101');
     assert.equal(afterGuestKurti?.variants[0]?.stock_qty, initialStock - 2);
 
     // 6. Failed payment / abandoned modal deducts 0 stock and creates no order
@@ -741,7 +741,7 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
       '/api/create-order',
       {
         currency: 'INR',
-        items: [{ productId: 'sc-103', variantId: variant0.id, quantity: 1 }],
+        items: [{ productId: 'sc-101', variantId: variant0.id, quantity: 1 }],
         customer: {
           customerName: 'Divya Nair',
           customerEmail: 'divya.customer@example.com',
@@ -755,7 +755,7 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
     mockRzpState.payments.set('pay_failed_attempt', {
       id: 'pay_failed_attempt',
       order_id: abandonedCreate.data.order_id,
-      amount: 74900,
+      amount: 169000,
       currency: 'INR',
       status: 'failed',
       captured: false,
@@ -776,7 +776,7 @@ test('End-to-end order integrity, customer account isolation, owner sync, notifi
       customerB.csrfToken
     );
     assert.equal(failedVerify.status, 400);
-    const afterFailKurti = await appInstance.store.getPublicProductByIdOrSlug('sc-103');
+    const afterFailKurti = await appInstance.store.getPublicProductByIdOrSlug('sc-101');
     assert.equal(afterFailKurti?.variants[0]?.stock_qty, initialStock - 2);
 
     // 7. Admin Overview & Activity reflect live metrics
@@ -823,7 +823,7 @@ test('Durable checkout persistence failures return 503 pre-payment and 202 pendi
     const mockState: MockRazorpayState = { orders: [], payments: new Map() };
     const noPersistRes = await handleCreateOrderRequest({
       body: {
-        items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }],
+        items: [{ productId: 'sc-101', variantId: 'sc-101-var-1', quantity: 1 }],
         customer: {
           customerName: 'Asha',
           customerEmail: 'asha@example.com',
@@ -855,7 +855,7 @@ test('Durable checkout persistence failures return 503 pre-payment and 202 pendi
       passwordHash: 'hash_placeholder',
       now: Date.now(),
     });
-    const baseProduct = await realStore.getPublicProductByIdOrSlug('sc-103');
+    const baseProduct = await realStore.getPublicProductByIdOrSlug('sc-101');
     const variant0 = baseProduct!.variants[0]!;
     const stockBefore = variant0.stock_qty;
 
@@ -878,7 +878,7 @@ test('Durable checkout persistence failures return 503 pre-payment and 202 pendi
 
     const createOk = await handleCreateOrderRequest({
       body: {
-        items: [{ productId: 'sc-103', variantId: variant0.id, quantity: 1 }],
+        items: [{ productId: 'sc-101', variantId: variant0.id, quantity: 1 }],
         customer: {
           customerName: 'Kavya Sharma',
           customerEmail: 'kavya@example.com',
@@ -938,7 +938,7 @@ test('Durable checkout persistence failures return 503 pre-payment and 202 pendi
       assert.ok(statusBody.order?.orderNumber?.startsWith('SC-'));
       assert.equal(statusBody.order?.customerUserId, kavyaUser.id);
 
-      const stockAfter = (await realStore.getPublicProductByIdOrSlug('sc-103'))?.variants[0]?.stock_qty;
+      const stockAfter = (await realStore.getPublicProductByIdOrSlug('sc-101'))?.variants[0]?.stock_qty;
       assert.equal(stockAfter, stockBefore - 1);
       const allOrders = await realStore.listAdminOrders(1, 10);
       assert.equal(allOrders.total, 1);

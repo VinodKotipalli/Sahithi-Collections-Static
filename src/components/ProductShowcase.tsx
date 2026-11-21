@@ -102,7 +102,7 @@ export function ProductShowcase({
                 type="search"
                 value={searchQuery}
                 onChange={(e) => onSearchChange(e.target.value)}
-                placeholder="Search dresses, anarkalis, potlis..."
+                placeholder="Search dresses, anarkalis, lehengas, kurta sets..."
                 aria-label="Search boutique products"
                 className="h-11 w-full rounded-xl border border-[#49243E]/18 bg-white pl-10 pr-10 text-sm text-[#242124] placeholder:text-[#242124]/45 focus:border-[#B76E79] focus:outline-none"
               />

@@ -5,67 +5,67 @@ export const SITE_CONFIG = {
   brandName: 'Sahithi Collections',
   tagline: 'Style That Celebrates You.',
   hero: {
-    eyebrow: 'Curated Boutique Wardrobe',
+    eyebrow: 'New Boutique Collection',
     headline: 'Discover Your Everyday Elegance.',
     supportingText:
-      'Explore beautiful styles, fresh arrivals, and statement pieces at Sahithi Collections.',
+      'Explore sunlit floral organzas, handloom kurta sets, and festive zari-bordered silhouettes curated exclusively at Sahithi Collections.',
     primaryCta: 'Explore Collections',
-    secondaryCta: 'View New Arrivals',
-    floatingLabels: ['Fresh Styles', 'Made for Your Moments'] as const,
+    secondaryCta: 'Shop All 32 Styles',
+    floatingLabels: ['32 Fresh Arrivals', 'Made for Your Moments'] as const,
     mainImage: {
-      src: BOUTIQUE_MEDIA.heroEditorialCouture,
-      alt: 'Young woman in a blush pink and warm ivory pearl-embroidered silk organza maxi dress standing beside sunlit studio windows',
+      src: BOUTIQUE_MEDIA.wa0026RoyalBlue,
+      alt: 'Young woman wearing a royal blue checkered flared gown with wide antique gold zari border in a sunlit courtyard',
     },
     accentCutouts: [
       {
-        src: BOUTIQUE_MEDIA.prodSilkPotliBag,
-        alt: 'Artisanal rose-blush silk potli clutch with pearl tassels and baroque pearl hairpins',
-        caption: 'Handcrafted Details',
+        src: BOUTIQUE_MEDIA.wa0004PinkFloral,
+        alt: 'Young woman wearing a rose-pink floral organza puff-sleeve flared dress',
+        caption: 'Floral Organzas',
       },
       {
-        src: BOUTIQUE_MEDIA.spotlightEdit,
-        alt: 'Editorial look featuring a sculpted muted rose draped cape silhouette',
-        caption: 'Evening Silhouettes',
+        src: BOUTIQUE_MEDIA.wa0020PinkSharara,
+        alt: 'Young woman wearing a festive lotus-pink sharara set with orange-gold zari borders',
+        caption: 'Festive Shararas',
       },
     ],
   },
   spotlightEdit: {
     kicker: 'Featured Capsule',
-    title: 'The Spotlight Edit',
-    subtitle: 'Soft drape, rich plum undertones, and effortless poise.',
+    title: 'The Festive Spotlight',
+    subtitle: 'Illustrated heritage borders, luminous organza, and effortless poise.',
     description:
-      'Thoughtfully composed silhouettes designed to move gracefully from intimate daytime gatherings to evening celebrations. Discover sculpted capes, sheer organza borders, and tactile silk finishes.',
-    ctaLabel: 'Explore the Edit',
+      'From our coral-pink Kalamkari lehenga and lotus-pink zari-bordered sharara to shimmering tissue kurta sets, discover statement pieces designed to celebrate every joyous occasion in comfort and grace.',
+    ctaLabel: 'Explore Festive Styles',
     targetCategory: 'Festive Collection' as const,
     image: {
-      src: BOUTIQUE_MEDIA.spotlightEdit,
-      alt: 'Editorial fashion portrait showcasing a muted rose draped silk cape gown with metallic threadwork',
+      src: BOUTIQUE_MEDIA.wa0033CoralLehenga,
+      alt: 'Young woman wearing a coral-pink festive silk lehenga with illustrated Kalamkari border and matching dupatta',
     },
   },
   about: {
     kicker: 'Our Philosophy',
     heading: 'A Little Style. A Lot of Confidence.',
     paragraphs: [
-      'Sahithi Collections brings together thoughtful silhouettes for girls and young women who love dressing with quiet grace and personal flair. From airy cotton-silk kurtis for sunny afternoons to celebratory ensembles and modern separates, every piece is chosen to feel effortless the moment you slip it on.',
-      'We believe great style does not have to shout. Soft palettes, flattering cuts, and considered accessories help you celebrate both everyday moments and cherished occasions in your own natural rhythm.',
+      'Sahithi Collections brings together thoughtful silhouettes for girls and young women who love dressing with quiet grace and personal flair. From airy cotton gingham dresses and schiffli kurta sets for sunny afternoons to celebratory anarkalis and lehengas, every piece is chosen to feel effortless the moment you slip it on.',
+      'We believe great style does not have to shout. Soft palettes, flattering cuts, and considered textile details help you celebrate both everyday moments and cherished occasions in your own natural rhythm.',
     ],
     pillars: [
       {
         title: 'Everyday Ease',
-        detail: 'Breathable weaves and fluid tailoring built for comfortable movement.',
+        detail: 'Breathable cottons, handloom weaves, and fluid tailoring built for all-day movement.',
       },
       {
         title: 'Occasion Ready',
-        detail: 'Delicate pearl, zari, and organza textures curated for memorable gatherings.',
+        detail: 'Zari borders, Kalamkari artistry, and sheer organza textures curated for memorable gatherings.',
       },
       {
-        title: 'Coordinated Finishing',
-        detail: 'Potli clutches, earrings, and hair accents chosen to pair seamlessly.',
+        title: 'Signature Silhouettes',
+        detail: 'Puff-sleeve midis, flared anarkalis, and wide-leg sets crafted to flatter naturally.',
       },
     ],
     image: {
-      src: BOUTIQUE_MEDIA.aboutAtelier,
-      alt: 'Sunlit boutique space with warm plaster walls and a rose-gold rack displaying blush, ivory, and plum silk dresses',
+      src: BOUTIQUE_MEDIA.wa0003IvoryMauve,
+      alt: 'Young woman wearing a warm ivory flared ethnic dress paired with a flowing mauve organza dupatta',
     },
   },
   /**

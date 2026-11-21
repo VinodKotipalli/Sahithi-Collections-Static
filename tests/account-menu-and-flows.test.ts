@@ -218,7 +218,7 @@ test('Customer account sections integrate profile, COD & Razorpay orders, coupon
         const found = rzpOrders.find((o) => o.id === orderId);
         return {
           id: orderId,
-          amount: found?.amount ?? 74900,
+          amount: found?.amount ?? 169000,
           currency: found?.currency ?? 'INR',
           receipt: found?.receipt ?? 'rcpt_menu',
           status: 'paid',
@@ -238,7 +238,7 @@ test('Customer account sections integrate profile, COD & Razorpay orders, coupon
         return {
           id: paymentId,
           order_id: latest?.id ?? 'order_menu_1',
-          amount: latest?.amount ?? 74900,
+          amount: latest?.amount ?? 169000,
           currency: 'INR',
           status: 'captured',
           captured: true,
@@ -419,7 +419,7 @@ test('Customer account sections integrate profile, COD & Razorpay orders, coupon
     );
     assert.equal(gcCreate.status, 200);
 
-    const product = await appInstance.store.getPublicProductByIdOrSlug('sc-103');
+    const product = await appInstance.store.getPublicProductByIdOrSlug('sc-101');
     assert.ok(product && product.variants[0]);
     const variant0 = product.variants[0];
     const startStock = variant0.stock_qty;
@@ -427,7 +427,7 @@ test('Customer account sections integrate profile, COD & Razorpay orders, coupon
     // 3. COD checkout with ONCE50 + GC-ANANYA-200 and idempotency retry protection
     const codKey = 'cod-retry-key-ananya-1';
     const codPayload = {
-      items: [{ productId: 'sc-103', variantId: variant0.id, quantity: 1 }],
+      items: [{ productId: 'sc-101', variantId: variant0.id, quantity: 1 }],
       couponCode: 'ONCE50',
       giftCardCode: 'GC-ANANYA-200',
       idempotencyKey: codKey,
@@ -463,7 +463,7 @@ test('Customer account sections integrate profile, COD & Razorpay orders, coupon
     assert.equal(codRetry.data.order.id, cod1.data.order.id);
 
     // Stock only deducted once
-    const stockAfterCod = (await appInstance.store.getPublicProductByIdOrSlug('sc-103'))?.variants[0]?.stock_qty;
+    const stockAfterCod = (await appInstance.store.getPublicProductByIdOrSlug('sc-101'))?.variants[0]?.stock_qty;
     assert.equal(stockAfterCod, startStock - 1);
 
     // Second separate order reusing ONCE50 must fail eligibility (limit reached); expired & high-spend fail too
@@ -523,7 +523,7 @@ test('Customer account sections integrate profile, COD & Razorpay orders, coupon
       '/api/create-order',
       {
         currency: 'INR',
-        items: [{ productId: 'sc-103', variantId: variant0.id, quantity: 1 }],
+        items: [{ productId: 'sc-101', variantId: variant0.id, quantity: 1 }],
         customer: codPayload.customer,
       },
       custA.csrfToken
@@ -700,7 +700,7 @@ test('Customer account sections integrate profile, COD & Razorpay orders, coupon
       custA.jar,
       'PUT',
       '/api/account/wishlist',
-      { productIds: ['sc-103', 'sc-108'] },
+      { productIds: ['sc-101', 'sc-004'] },
       custA.csrfToken
     );
     await jsonReq(
@@ -708,7 +708,7 @@ test('Customer account sections integrate profile, COD & Razorpay orders, coupon
       custA.jar,
       'PUT',
       '/api/account/wishlist',
-      { productIds: ['sc-103'] },
+      { productIds: ['sc-101'] },
       custA.csrfToken
     );
     const wishA = await jsonReq<{ productIds: string[] }>(
@@ -719,7 +719,7 @@ test('Customer account sections integrate profile, COD & Razorpay orders, coupon
       undefined,
       custA.csrfToken
     );
-    assert.deepEqual(wishA.data.productIds, ['sc-103']);
+    assert.deepEqual(wishA.data.productIds, ['sc-101']);
     const wishB = await jsonReq<{ productIds: string[] }>(
       baseUrl,
       custB.jar,

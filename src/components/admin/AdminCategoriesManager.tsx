@@ -21,7 +21,7 @@ interface AdminCategoriesManagerProps {
   onDirtyChange?: (dirty: boolean) => void;
 }
 
-const DEFAULT_CATEGORY_IMAGE = '/boutique-media/col_dresses_1794557657118.jpg';
+const DEFAULT_CATEGORY_IMAGE = '/boutique-media/sc_wa0004_pink_floral.jpg';
 
 export function AdminCategoriesManager({
   categories,

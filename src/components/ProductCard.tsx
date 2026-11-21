@@ -77,8 +77,10 @@ export function ProductCard({
             alt={product.images[0]?.alt || product.name}
             loading="lazy"
             fallbackTitle={product.name}
-            className={`h-full w-full object-cover object-top transition-all duration-500 ${
-              hasSecondaryImage && isHovered ? 'opacity-0 scale-105' : 'opacity-100 group-hover:scale-[1.03]'
+            className={`h-full w-full object-cover object-top transition-all duration-700 ease-out ${
+              hasSecondaryImage && isHovered
+                ? 'opacity-0 scale-105'
+                : 'opacity-100 group-hover:scale-[1.04]'
             }`}
           />
 
@@ -88,11 +90,17 @@ export function ProductCard({
               alt={product.images[1].alt}
               loading="lazy"
               fallbackTitle={product.name}
-              className={`absolute inset-0 h-full w-full object-cover object-top transition-all duration-500 ${
-                isHovered ? 'opacity-100 scale-[1.03]' : 'opacity-0 scale-100'
+              className={`absolute inset-0 h-full w-full object-cover object-top transition-all duration-700 ease-out ${
+                isHovered ? 'opacity-100 scale-[1.04]' : 'opacity-0 scale-100'
               }`}
             />
           )}
+
+          {/* Subtle bottom editorial veil on hover */}
+          <span
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-t from-[#242124]/30 via-[#242124]/8 to-transparent opacity-0 transition-opacity duration-300 group-hover:opacity-100"
+          />
         </button>
 
         {/* Wishlist Toggle Button */}
@@ -102,7 +110,7 @@ export function ProductCard({
           aria-label={isWishlisted ? `Remove ${product.name} from wishlist` : `Save ${product.name} to wishlist`}
           aria-pressed={isWishlisted}
           whileTap={prefersReducedMotion ? undefined : { scale: 0.86 }}
-          className="absolute top-2.5 right-2.5 z-10 flex h-11 w-11 items-center justify-center rounded-full border border-[#49243E]/10 bg-[#FFF9F5]/92 text-[#49243E] shadow-sm transition-colors duration-200 hover:bg-[#FFF9F5]"
+          className="absolute top-2.5 right-2.5 z-10 flex h-10 w-10 items-center justify-center rounded-full border border-[#49243E]/10 bg-[#FFF9F5]/92 text-[#49243E] shadow-sm backdrop-blur-xs transition-colors duration-200 hover:bg-[#FFF9F5]"
         >
           <Heart
             className={`h-[18px] w-[18px] transition-transform duration-200 ${
@@ -116,7 +124,7 @@ export function ProductCard({
       {/* Product Body */}
       <div className="flex flex-1 flex-col justify-between p-3.5 sm:p-4">
         <div>
-          <div className="flex items-center gap-1.5 text-[11px] font-medium tracking-wider uppercase text-[#B76E79]">
+          <div className="flex items-center gap-1.5 text-[11px] font-medium tracking-[0.12em] uppercase text-[#B76E79]">
             <span className="truncate">{product.category}</span>
             {product.featured && (
               <>
@@ -126,7 +134,7 @@ export function ProductCard({
             )}
           </div>
 
-          <h3 className="mt-1.5 line-clamp-2 min-h-[2.75rem] font-serif text-lg font-semibold leading-snug text-[#49243E]">
+          <h3 className="mt-1.5 line-clamp-2 min-h-[2.75rem] font-serif text-[1.0625rem] font-semibold leading-snug text-[#49243E]">
             <button
               type="button"
               onClick={() => onQuickView(product)}
@@ -136,17 +144,17 @@ export function ProductCard({
             </button>
           </h3>
 
-          {/* Color Swatches */}
+          {/* Color Swatches & Sizes */}
           <div className="mt-2.5 flex items-center gap-1.5" aria-label="Available colors">
             {product.colors.map((color) => (
               <span
                 key={color.name}
                 title={color.name}
-                className="h-3.5 w-3.5 rounded-full border border-[#242124]/20"
+                className="h-3.5 w-3.5 rounded-full border border-[#242124]/20 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.35)]"
                 style={{ backgroundColor: color.hex }}
               />
             ))}
-            <span className="ml-1 text-[11px] text-[#242124]/60 truncate">
+            <span className="ml-1 text-[11px] text-[#242124]/58 truncate">
               {product.sizes.join(' · ')}
             </span>
           </div>
@@ -179,7 +187,7 @@ export function ProductCard({
           <button
             type="button"
             onClick={() => onQuickView(product)}
-            className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-[#49243E]/18 px-3 py-1.5 text-xs font-medium text-[#49243E] transition-colors duration-200 hover:border-[#49243E] hover:bg-[#49243E] hover:text-[#FFF9F5] whitespace-nowrap shrink-0"
+            className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-[#49243E]/18 bg-[#FFF9F5]/60 px-3 py-1.5 text-xs font-medium text-[#49243E] transition-colors duration-200 hover:border-[#49243E] hover:bg-[#49243E] hover:text-[#FFF9F5] whitespace-nowrap shrink-0"
           >
             <Eye className="h-3.5 w-3.5" aria-hidden="true" />
             <span>Quick View</span>

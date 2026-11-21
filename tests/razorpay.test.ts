@@ -46,7 +46,7 @@ function createMockRazorpayFactory(state: MockRazorpayState): RazorpayClientFact
           : state.createdOrders[state.createdOrders.length - 1];
         return {
           id: orderId,
-          amount: created?.amount ?? 74900,
+          amount: created?.amount ?? 169000,
           currency: created?.currency ?? 'INR',
           receipt: created?.receipt ?? 'rcpt_mock',
           status: 'paid',
@@ -65,7 +65,7 @@ function createMockRazorpayFactory(state: MockRazorpayState): RazorpayClientFact
           amount:
             state.nextPaymentOverrides.amount !== undefined
               ? state.nextPaymentOverrides.amount
-              : (latestOrder?.amount ?? 74900),
+              : (latestOrder?.amount ?? 169000),
           currency:
             state.nextPaymentOverrides.currency !== undefined
               ? state.nextPaymentOverrides.currency
@@ -146,10 +146,10 @@ test('Razorpay Standard Checkout endpoints: server cart calculation, key_id retu
     const lowAmountBody = (await lowAmountRes.json()) as { code?: string };
     assert.equal(lowAmountBody.code, 'INVALID_AMOUNT');
 
-    // 3. Create order with cart item sc-103 (₹749 = 74900 paise) — ignores tampered client amount
-    const kurti = await store.getPublicProductByIdOrSlug('sc-103');
-    assert.ok(kurti, 'Expected seeded sc-103 product');
-    const firstVariantId = kurti.variants[0]?.id || 'sc-103';
+    // 3. Create order with cart item sc-101 (₹1,690 = 169000 paise) — ignores tampered client amount
+    const kurti = await store.getPublicProductByIdOrSlug('sc-101');
+    assert.ok(kurti, 'Expected seeded sc-101 product');
+    const firstVariantId = kurti.variants[0]?.id || 'sc-101';
 
     const createRes = await fetch(`${baseUrl}/api/create-order`, {
       method: 'POST',
@@ -158,7 +158,7 @@ test('Razorpay Standard Checkout endpoints: server cart calculation, key_id retu
         amount: 100, // tampered client amount must be ignored when items are provided
         currency: 'INR',
         receipt: 'sc_rcpt_test_1',
-        items: [{ productId: 'sc-103', variantId: firstVariantId, quantity: 1 }],
+        items: [{ productId: 'sc-101', variantId: firstVariantId, quantity: 1 }],
         customer: {
           customerName: 'Ananya Reddy',
           customerEmail: 'ananya@example.com',
@@ -177,7 +177,7 @@ test('Razorpay Standard Checkout endpoints: server cart calculation, key_id retu
       key_secret?: string;
     };
     assert.equal(createBody.order_id, 'order_mock_1');
-    assert.equal(createBody.amount, 74900);
+    assert.equal(createBody.amount, 169000);
     assert.equal(createBody.currency, 'INR');
     assert.equal(createBody.key_id, 'rzp_test_U17MiWPrvpas0b');
     assert.equal(createBody.key_secret, undefined);
@@ -262,7 +262,7 @@ test('Razorpay Standard Checkout endpoints: server cart calculation, key_id retu
     // 8. Uncaptured / failed payment on Razorpay server -> 400 PAYMENT_NOT_CAPTURED
     mockState.nextPaymentOverrides = {
       order_id: 'order_mock_1',
-      amount: 74900,
+      amount: 169000,
       status: 'failed',
       captured: false,
     };
@@ -283,7 +283,7 @@ test('Razorpay Standard Checkout endpoints: server cart calculation, key_id retu
     // 9. Valid signature + captured payment -> 200 and records order ONCE
     mockState.nextPaymentOverrides = {
       order_id: 'order_mock_1',
-      amount: 74900,
+      amount: 169000,
       currency: 'INR',
       status: 'captured',
       captured: true,
@@ -301,10 +301,10 @@ test('Razorpay Standard Checkout endpoints: server cart calculation, key_id retu
         shippingAddress: '12 Jubilee Hills, Hyderabad 500033',
         items: [
           {
-            productId: 'sc-103',
+            productId: 'sc-101',
             variantId: firstVariantId,
             quantity: 1,
-            expectedPricePaise: 74900,
+            expectedPricePaise: 169000,
           },
         ],
       },
@@ -328,7 +328,7 @@ test('Razorpay Standard Checkout endpoints: server cart calculation, key_id retu
     assert.equal(validSigBody.order_id, 'order_mock_1');
     assert.equal(validSigBody.payment_id, paymentId1);
     assert.equal(validSigBody.order?.status, 'confirmed');
-    assert.equal(validSigBody.order?.totalPaise, 74900);
+    assert.equal(validSigBody.order?.totalPaise, 169000);
 
     // Duplicate verify call -> returns same order idempotently without creating a second order
     const duplicateRes = await fetch(`${baseUrl}/api/verify-payment`, {
@@ -402,12 +402,12 @@ test('Vercel Node.js Serverless Functions (/api/create-order.ts & /api/verify-pa
     const getRes = await fetch(`${baseUrl}/api/create-order`);
     assert.equal(getRes.status, 405);
 
-    // Server-side catalog calculation for Straight-Cut Printed Kurti (sc-103: ₹749 * 2 = 149800 paise)
+    // Server-side catalog calculation for Charcoal Grey Motif Cotton Kurta Set (sc-101: ₹1,690 * 2 = 338000 paise)
     const createRes = await fetch(`${baseUrl}/api/create-order`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 2 }],
+        items: [{ productId: 'sc-101', variantId: 'sc-101-var-1', quantity: 2 }],
         currency: 'INR',
       }),
     });
@@ -420,7 +420,7 @@ test('Vercel Node.js Serverless Functions (/api/create-order.ts & /api/verify-pa
       checkout_token: string;
     };
     assert.equal(createBody.order_id, 'order_mock_1');
-    assert.equal(createBody.amount, 149800);
+    assert.equal(createBody.amount, 338000);
     assert.equal(createBody.currency, 'INR');
     assert.equal(createBody.key_id, 'rzp_test_U17MiWPrvpas0b');
 
@@ -444,7 +444,7 @@ test('Vercel Node.js Serverless Functions (/api/create-order.ts & /api/verify-pa
     assert.equal(verifyBody.success, true);
     assert.equal(verifyBody.verified, true);
     assert.equal(mockState.capturedPayments.length, 1);
-    assert.equal(mockState.capturedPayments[0]?.amount, 149800);
+    assert.equal(mockState.capturedPayments[0]?.amount, 338000);
   } finally {
     if (prevKeyId === undefined) delete process.env.RAZORPAY_KEY_ID;
     else process.env.RAZORPAY_KEY_ID = prevKeyId;
@@ -475,15 +475,15 @@ test('Razorpay credential sanitization strips quotes/newlines, rejects malformed
               return { id: 'order_clean_1', amount: params.amount, currency: params.currency };
             },
             async fetch() {
-              return { id: 'order_clean_1', amount: 74900, currency: 'INR' };
+              return { id: 'order_clean_1', amount: 169000, currency: 'INR' };
             },
           },
           payments: {
             async fetch() {
-              return { id: 'pay_1', amount: 74900, currency: 'INR', status: 'captured', captured: true };
+              return { id: 'pay_1', amount: 169000, currency: 'INR', status: 'captured', captured: true };
             },
             async capture() {
-              return { id: 'pay_1', amount: 74900, currency: 'INR', status: 'captured', captured: true };
+              return { id: 'pay_1', amount: 169000, currency: 'INR', status: 'captured', captured: true };
             },
           },
         };
@@ -504,7 +504,7 @@ test('Razorpay credential sanitization strips quotes/newlines, rejects malformed
       const cleanRes = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+        body: JSON.stringify({ items: [{ productId: 'sc-101', variantId: 'sc-101-var-1', quantity: 1 }] }),
       });
       assert.equal(cleanRes.status, 200);
       assert.equal(capturedKeyId, 'rzp_test_CleanKey1234');
@@ -516,7 +516,7 @@ test('Razorpay credential sanitization strips quotes/newlines, rejects malformed
       const prefixedRes = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+        body: JSON.stringify({ items: [{ productId: 'sc-101', variantId: 'sc-101-var-1', quantity: 1 }] }),
       });
       assert.equal(prefixedRes.status, 200);
       assert.equal(capturedKeyId, 'rzp_live_PrefixedKey88');
@@ -528,7 +528,7 @@ test('Razorpay credential sanitization strips quotes/newlines, rejects malformed
       const badFormatRes = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+        body: JSON.stringify({ items: [{ productId: 'sc-101', variantId: 'sc-101-var-1', quantity: 1 }] }),
       });
       assert.equal(badFormatRes.status, 401);
       const badFormatBody = (await badFormatRes.json()) as { code?: string; error?: string };
@@ -541,7 +541,7 @@ test('Razorpay credential sanitization strips quotes/newlines, rejects malformed
       const swappedRes = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+        body: JSON.stringify({ items: [{ productId: 'sc-101', variantId: 'sc-101-var-1', quantity: 1 }] }),
       });
       assert.equal(swappedRes.status, 401);
       const swappedBody = (await swappedRes.json()) as { code?: string; error?: string };
@@ -554,7 +554,7 @@ test('Razorpay credential sanitization strips quotes/newlines, rejects malformed
       const maskedRes = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+        body: JSON.stringify({ items: [{ productId: 'sc-101', variantId: 'sc-101-var-1', quantity: 1 }] }),
       });
       assert.equal(maskedRes.status, 401);
       const maskedBody = (await maskedRes.json()) as { code?: string; error?: string };
@@ -596,7 +596,7 @@ test('Razorpay credential sanitization strips quotes/newlines, rejects malformed
       const failRes = await fetch(`http://127.0.0.1:${port2}/api/create-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }] }),
+        body: JSON.stringify({ items: [{ productId: 'sc-101', variantId: 'sc-101-var-1', quantity: 1 }] }),
       });
       assert.equal(failRes.status, 401);
       const failBody = (await failRes.json()) as {

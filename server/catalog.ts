@@ -3678,7 +3678,7 @@ export function registerCatalogAndAdminRoutes(params: {
 
         const imgCheck = await verifySafeImageReference(
           store,
-          rawImage || '/boutique-media/col_dresses_1794557657118.jpg'
+          rawImage || '/boutique-media/sc_wa0004_pink_floral.jpg'
         );
         if (!imgCheck.ok) {
           fieldErrors.imageUrl = imgCheck.error;
@@ -3758,7 +3758,7 @@ export function registerCatalogAndAdminRoutes(params: {
 
         const imgCheck = await verifySafeImageReference(
           store,
-          rawImage || '/boutique-media/col_dresses_1794557657118.jpg'
+          rawImage || '/boutique-media/sc_wa0004_pink_floral.jpg'
         );
         if (!imgCheck.ok) {
           fieldErrors.imageUrl = imgCheck.error;

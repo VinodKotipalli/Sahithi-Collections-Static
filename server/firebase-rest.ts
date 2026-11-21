@@ -1217,6 +1217,8 @@ function buildSeedStarterProductDoc(
     title: p.title,
     description: p.description,
     fabric_note: p.fabricNote,
+    included_pieces: p.includedPieces || '',
+    care_note: p.careNote || '',
     category: p.category,
     sku,
     price_paise: pricePaise,

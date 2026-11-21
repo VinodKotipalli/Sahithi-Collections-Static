@@ -11,13 +11,13 @@ interface BoutiqueImageProps {
 }
 
 const FALLBACK_MEDIA_URLS = [
-  '/boutique-media/col_ethnic_wear_1794557657086.jpg',
-  '/boutique-media/col_western_wear_1794557656476.jpg',
-  '/boutique-media/col_dresses_1794557657118.jpg',
-  '/boutique-media/col_festive_wear_1794557658541.jpg',
-  '/boutique-media/col_accessories_1794557657836.jpg',
-  '/boutique-media/hero_editorial_couture_1794557656265.jpg',
-  '/boutique-media/spotlight_edit_1794557658400.jpg',
+  '/boutique-media/sc_wa0026_royal_blue.jpg',
+  '/boutique-media/sc_wa0004_pink_floral.jpg',
+  '/boutique-media/sc_wa0033_coral_lehenga.jpg',
+  '/boutique-media/sc_wa0019_teal_bandhani.jpg',
+  '/boutique-media/sc_wa0027_purple_kurta.jpg',
+  '/boutique-media/sc_wa0028_mustard_flared.jpg',
+  '/boutique-media/sc_wa0032_blue_floral.jpg',
 ];
 
 export function BoutiqueImage({

@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import Razorpay from 'razorpay';
-import { PRODUCTS } from '../src/config/products.ts';
+import { PRODUCTS, SEED_SKU_BY_ID } from '../src/config/products.ts';
 import { verifyFirebaseIdToken } from './firebase-rest.ts';
 import {
   StoreHttpError,
@@ -19,36 +19,6 @@ const CHECKOUT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 const PENDING_CACHE_MAX = 1000;
 const COMPLETED_CACHE_MAX = 1000;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-const SEED_SKU_BY_ID: Record<string, string> = {
-  'sc-001': 'SC-DRS-001',
-  'sc-002': 'SC-ETH-002',
-  'sc-003': 'SC-WST-003',
-  'sc-004': 'SC-DRS-004',
-  'sc-005': 'SC-FST-005',
-  'sc-006': 'SC-FST-006',
-  'sc-007': 'SC-ETH-007',
-  'sc-008': 'SC-DRS-008',
-  'sc-009': 'SC-WST-009',
-  'sc-010': 'SC-FST-010',
-  'sc-011': 'SC-ACC-011',
-  'sc-012': 'SC-ACC-012',
-  'sc-101': 'SC-KRT-101',
-  'sc-102': 'SC-KRT-102',
-  'sc-103': 'SC-KRT-103',
-  'sc-104': 'SC-KRT-104',
-  'sc-105': 'SC-KST-105',
-  'sc-106': 'SC-KST-106',
-  'sc-107': 'SC-KST-107',
-  'sc-108': 'SC-SAR-108',
-  'sc-109': 'SC-SAR-109',
-  'sc-110': 'SC-SAR-110',
-  'sc-111': 'SC-SAR-111',
-  'sc-112': 'SC-CRD-112',
-  'sc-113': 'SC-CRD-113',
-  'sc-114': 'SC-DUP-114',
-  'sc-115': 'SC-DUP-115',
-};
 
 export interface RazorpayOrderEntity {
   id: string;

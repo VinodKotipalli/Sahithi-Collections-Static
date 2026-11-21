@@ -195,8 +195,8 @@ test('Cash on Delivery checkout: validation, idempotency, inventory deduction, a
     });
 
     // Pick a published product variant from catalog
-    const product = await appInstance.store.getPublicProductByIdOrSlug('sc-103');
-    assert.ok(product, 'Expected seeded sc-103 product');
+    const product = await appInstance.store.getPublicProductByIdOrSlug('sc-101');
+    assert.ok(product, 'Expected seeded sc-101 product');
     const targetVariant = product.variants[0];
     assert.ok(targetVariant);
     const initialStock = targetVariant.stock_qty;
@@ -524,7 +524,7 @@ test('Vercel /api/orders handler enforces verified auth, persists COD via store,
   const prevViteFbProj = process.env.VITE_FIREBASE_PROJECT_ID;
 
   try {
-    const product = await store.getPublicProductByIdOrSlug('sc-103');
+    const product = await store.getPublicProductByIdOrSlug('sc-101');
     assert.ok(product);
     const variant = product.variants[0];
 

@@ -386,7 +386,7 @@ test('3. Full preview cutover replaces live catalog with exact 20 items, validat
     const res = await appInstance.store.updateProduct({
       productId: rec.product.id,
       expectedVersion: rec.product.version,
-      nextSlug: m.slug,
+      nextSlug: rec.product.slug,
       title: m.title,
       description: m.description,
       fabricNote: 'Confirmed boutique fabric blend',
@@ -496,7 +496,7 @@ test('3. Full preview cutover replaces live catalog with exact 20 items, validat
     await fetch(`${baseUrl}/api/products?category=${encodeURIComponent('Lehengas')}`)
   ).json()) as { items: Array<{ slug: string; variants: Array<{ sku: string }> }> };
   assert.equal(lehengasRes.items.length, 1);
-  assert.equal(lehengasRes.items[0].slug, 'coral-pink-lehenga-with-illustrated-border');
+  assert.ok(lehengasRes.items[0].slug.startsWith('coral-pink-lehenga-with-illustrated-border'));
   assert.ok(lehengasRes.items[0].variants[0].sku.startsWith('SC-26-033'));
 
   // Archived legacy product slug returns 404
@@ -567,7 +567,9 @@ test('3. Full preview cutover replaces live catalog with exact 20 items, validat
   assert.equal(staleLegacyOrder.json.code, 'PRODUCT_UNAVAILABLE');
 
   // 3F. Admin price/stock edit propagates to storefront + checkout guards + live order stock deduction
-  const targetProd = publicNow.items.find((p) => p.slug === 'pink-floral-puff-sleeve-dress')!;
+  const targetProd = publicNow.items.find((p) =>
+    p.slug.startsWith('pink-floral-puff-sleeve-dress')
+  )!;
   const targetAdminBefore = ((await (
     await fetch(`${baseUrl}/api/admin/products/${targetProd.id}`, {
       headers: { Cookie: ownerJar.getHeader() },

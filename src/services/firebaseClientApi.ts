@@ -19,7 +19,7 @@ import {
   validateNonSensitivePaymentMethodInput,
   type NotificationPreferencesData,
 } from '../../server/order-utils.ts';
-import { PRODUCTS } from '../config/products';
+import { PRODUCTS, SEED_SKU_BY_ID } from '../config/products';
 import type { AuthCapabilities, AuthUser, ApiResult } from '../context/AuthContext';
 import type {
   LoyaltyConfig,
@@ -1370,36 +1370,6 @@ interface StoredProductDoc {
   image_urls?: string[];
 }
 
-const SEED_SKU_BY_ID: Record<string, string> = {
-  'sc-001': 'SC-DRS-001',
-  'sc-002': 'SC-ETH-002',
-  'sc-003': 'SC-WST-003',
-  'sc-004': 'SC-DRS-004',
-  'sc-005': 'SC-FST-005',
-  'sc-006': 'SC-FST-006',
-  'sc-007': 'SC-ETH-007',
-  'sc-008': 'SC-DRS-008',
-  'sc-009': 'SC-WST-009',
-  'sc-010': 'SC-FST-010',
-  'sc-011': 'SC-ACC-011',
-  'sc-012': 'SC-ACC-012',
-  'sc-101': 'SC-KRT-101',
-  'sc-102': 'SC-KRT-102',
-  'sc-103': 'SC-KRT-103',
-  'sc-104': 'SC-KRT-104',
-  'sc-105': 'SC-KST-105',
-  'sc-106': 'SC-KST-106',
-  'sc-107': 'SC-KST-107',
-  'sc-108': 'SC-SAR-108',
-  'sc-109': 'SC-SAR-109',
-  'sc-110': 'SC-SAR-110',
-  'sc-111': 'SC-SAR-111',
-  'sc-112': 'SC-CRD-112',
-  'sc-113': 'SC-CRD-113',
-  'sc-114': 'SC-DUP-114',
-  'sc-115': 'SC-DUP-115',
-};
-
 function buildSeedProductsDocs(): StoredProductDoc[] {
   return PRODUCTS.map((item) => {
     const ts = new Date(`${item.dateAdded}T10:00:00Z`).getTime() || Date.now();
@@ -1465,6 +1435,8 @@ function buildSeedProductsDocs(): StoredProductDoc[] {
       title: item.name,
       description: item.description,
       fabric_note: item.fabricNote,
+      included_pieces: item.includedPieces || '',
+      care_note: item.careNote || '',
       category: item.category,
       status: 'published',
       featured: Boolean(item.featured),

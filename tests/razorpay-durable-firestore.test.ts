@@ -88,7 +88,7 @@ test('Checkout persistence guards: missing/malformed credentials, OAuth failure,
       async fetch(orderId) {
         return {
           id: orderId,
-          amount: 74900,
+          amount: 169000,
           currency: 'INR',
           status: 'paid',
           notes: { customer_user_id: 'uid_priya_1' },
@@ -101,7 +101,7 @@ test('Checkout persistence guards: missing/malformed credentials, OAuth failure,
         return {
           id: paymentId,
           order_id: `order_durable_${razorpayCreateCount}`,
-          amount: 74900,
+          amount: 169000,
           currency: 'INR',
           status: 'captured',
           captured: true,
@@ -290,7 +290,7 @@ test('Checkout persistence guards: missing/malformed credentials, OAuth failure,
 
   try {
     const samplePayload = {
-      items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }],
+      items: [{ productId: 'sc-101', variantId: 'sc-101-var-1', quantity: 1 }],
       customer: {
         customerName: 'Priya Menon',
         customerEmail: 'priya@example.com',
@@ -589,7 +589,7 @@ test('Vercel Starter-Tier mode (default): checkout, verify-payment, order-status
       async fetch(orderId) {
         return {
           id: orderId,
-          amount: 74900,
+          amount: 169000,
           currency: 'INR',
           status: 'paid',
           notes: { customer_user_id: 'uid_priya_1' },
@@ -601,7 +601,7 @@ test('Vercel Starter-Tier mode (default): checkout, verify-payment, order-status
         return {
           id: paymentId,
           order_id: `order_starter_${rzpSeq}`,
-          amount: 74900,
+          amount: 169000,
           currency: 'INR',
           status: 'captured',
           captured: true,
@@ -712,7 +712,7 @@ test('Vercel Starter-Tier mode (default): checkout, verify-payment, order-status
 
   try {
     const samplePayload = {
-      items: [{ productId: 'sc-103', variantId: 'sc-103-var-1', quantity: 1 }],
+      items: [{ productId: 'sc-101', variantId: 'sc-101-var-1', quantity: 1 }],
       customer: {
         customerName: 'Priya Menon',
         customerEmail: 'priya@example.com',

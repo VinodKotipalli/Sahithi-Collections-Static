@@ -61,14 +61,14 @@ export function AboutSection() {
                   className="pointer-events-none absolute -inset-3 rounded-[28px] border border-[#B76E79]/25"
                 />
 
-                <div className="relative overflow-hidden rounded-3xl border border-[#49243E]/10 bg-white shadow-[0_24px_54px_-24px_rgba(73,36,62,0.22)]">
-                  <div className="aspect-[4/3] w-full overflow-hidden">
+                <div className="relative mx-auto max-w-[480px] overflow-hidden rounded-3xl border border-[#49243E]/10 bg-white shadow-[0_24px_54px_-24px_rgba(73,36,62,0.22)]">
+                  <div className="aspect-[4/5] w-full overflow-hidden">
                     <BoutiqueImage
                       src={about.image.src}
                       alt={about.image.alt}
                       loading="lazy"
                       fallbackTitle={settings.brandName}
-                      className="h-full w-full object-cover"
+                      className="h-full w-full object-cover object-top"
                     />
                   </div>
                 </div>

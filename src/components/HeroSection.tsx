@@ -198,14 +198,14 @@ export function HeroSection() {
                       ? undefined
                       : { duration: 6, repeat: Infinity, ease: 'easeInOut' }
                   }
-                  className="relative z-20 -mt-14 ml-4 w-44 overflow-hidden rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5] p-2 shadow-[0_18px_40px_-14px_rgba(73,36,62,0.24)] sm:absolute sm:-bottom-6 sm:-left-8 sm:mt-0 sm:w-48"
+                  className="relative z-20 -mt-16 ml-4 w-36 overflow-hidden rounded-2xl border border-[#49243E]/12 bg-[#FFF9F5] p-2 shadow-[0_18px_40px_-14px_rgba(73,36,62,0.24)] sm:absolute sm:-bottom-6 sm:-left-8 sm:mt-0 sm:w-44"
                 >
-                  <div className="aspect-[4/3] overflow-hidden rounded-xl bg-[#F3D5DF]/25">
+                  <div className="aspect-[4/5] overflow-hidden rounded-xl bg-[#F3D5DF]/25">
                     <BoutiqueImage
                       src={hero.accentCutouts[0].src}
                       alt={hero.accentCutouts[0].alt}
                       loading="eager"
-                      className="h-full w-full object-cover"
+                      className="h-full w-full object-cover object-top"
                     />
                   </div>
                   <p className="mt-2 px-1 pb-0.5 text-[11px] font-medium tracking-wide text-[#49243E]">
