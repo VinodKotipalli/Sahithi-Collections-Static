@@ -31,6 +31,7 @@ import {
   firebaseConfirmPasswordResetOobCode,
   firebaseConfirmVerifyEmailOobCode,
   firebaseDeleteAccount,
+  firebaseLookupUser,
   firebaseRefreshIdToken,
   firebaseSendPasswordReset,
   firebaseSendVerifyEmail,
@@ -180,14 +181,19 @@ export function resolveAppBaseUrl(req: Request, configuredUrl?: string): string 
 
 function serializePublicUser(user: UserRow, session: SessionRow, isOwner = false) {
   const reauthExpiresAt = session.last_reauth_at + REAUTH_WINDOW_MS;
+  const verifiedPhone =
+    user.phone_verified && user.phone_e164 ? user.phone_e164 : null;
   return {
     id: user.id,
     fullName: user.full_name,
     email: user.email,
-    phone: user.phone_e164 || null,
+    phone: user.contact_phone ?? user.phone_e164 ?? null,
+    verifiedPhone,
     notificationPrefs: parseNotificationPrefs(user.notification_prefs_json),
     emailVerified: Boolean(user.email_verified),
-    hasPassword: Boolean(user.password_hash),
+    phoneVerified: Boolean(verifiedPhone),
+    hasPassword:
+      user.has_password !== undefined ? Boolean(user.has_password) : Boolean(user.password_hash),
     isOwner: Boolean(isOwner),
     recentReauthValid: Date.now() < reauthExpiresAt,
     recentReauthExpiresAt: reauthExpiresAt,
@@ -499,6 +505,9 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
             "'unsafe-inline'",
             'https://checkout.razorpay.com',
             'https://apis.google.com',
+            'https://www.google.com',
+            'https://www.gstatic.com',
+            'https://www.recaptcha.net',
           ],
           styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
           fontSrc: ["'self'", 'data:', 'https://fonts.gstatic.com'],
@@ -512,12 +521,17 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
             'https://securetoken.googleapis.com',
             'https://firestore.googleapis.com',
             'https://www.googleapis.com',
+            'https://www.google.com',
+            'https://www.gstatic.com',
+            'https://www.recaptcha.net',
           ],
           frameSrc: [
             "'self'",
             'https://api.razorpay.com',
             'https://checkout.razorpay.com',
             'https://*.firebaseapp.com',
+            'https://www.google.com',
+            'https://www.recaptcha.net',
           ],
           objectSrc: ["'none'"],
           baseUri: ["'self'"],
@@ -682,25 +696,40 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
           }
         }
 
+        if (!claims.emailVerified && !claims.phoneVerified) {
+          setActiveFirestoreIdToken(undefined);
+          clearAuthSessionCookies(res);
+          return next();
+        }
+
         let user = await restStore.getUserById(claims.uid);
-        if (!user && claims.emailVerified) {
+        if (!user && (claims.emailVerified || claims.phoneVerified)) {
           user = await restStore.syncVerifiedUserProfile({
             id: claims.uid,
             fullName:
-              claims.name || (claims.email === restStore.ownerEmail ? 'Store Owner' : 'Member'),
-            email: claims.email,
-            emailVerified: true,
+              claims.name ||
+              (claims.email === restStore.ownerEmail && claims.emailVerified
+                ? 'Store Owner'
+                : 'Customer'),
+            email: claims.email || null,
+            emailVerified: claims.emailVerified,
+            phoneE164: claims.phoneVerified ? claims.phoneNumber : null,
+            phoneVerified: claims.phoneVerified,
+            hasPassword: claims.signInProvider !== 'phone',
           });
         }
         if (!user) {
+          const hasPassword = claims.signInProvider !== 'phone';
           user = {
             id: claims.uid,
-            full_name: claims.name || 'Member',
-            email: claims.email,
+            full_name: claims.name || 'Customer',
+            email: claims.email || null,
             email_verified: claims.emailVerified ? 1 : 0,
-            password_hash: 'firebase-managed',
-            phone_e164: null,
-            phone_verified: 0,
+            password_hash: hasPassword ? 'firebase-managed' : '',
+            phone_e164: claims.phoneVerified ? claims.phoneNumber : null,
+            phone_verified: claims.phoneVerified ? 1 : 0,
+            contact_phone: claims.phoneVerified ? claims.phoneNumber : null,
+            has_password: hasPassword,
             notification_prefs_json: null,
             deleted_at: null,
             created_at: claims.authTimeMs || Date.now(),
@@ -855,7 +884,7 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
         res,
         403,
         'REAUTH_REQUIRED',
-        'Please verify your current password before updating login details.'
+        'Please verify your identity before updating login details.'
       );
     }
     return next();
@@ -903,11 +932,21 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     setActiveFirestoreIdToken(signIn.idToken);
 
     const isOwnerEmail = claims.email === restStore.ownerEmail && claims.emailVerified;
+    const lookedUp = await firebaseLookupUser(restStore.config.apiKey, signIn.idToken).catch(() => null);
+    const verifiedPhone = claims.phoneVerified
+      ? claims.phoneNumber
+      : lookedUp?.phoneVerified
+        ? lookedUp.phoneNumber
+        : null;
     const user = await restStore.syncVerifiedUserProfile({
       id: claims.uid,
       fullName: claims.name || signIn.displayName || (isOwnerEmail ? 'Store Owner' : 'Member'),
-      email: claims.email,
-      emailVerified: true,
+      email: claims.email || null,
+      emailVerified: claims.emailVerified,
+      phoneE164: verifiedPhone,
+      phoneVerified: Boolean(verifiedPhone),
+      hasPassword: lookedUp ? lookedUp.hasPassword : true,
+      signInProviders: lookedUp?.providerIds,
     });
 
     let bound: AdminBindingRow | null = null;
@@ -949,7 +988,9 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
       idToken: signIn.idToken,
       refreshToken: signIn.refreshToken,
       uid: user.id,
-      email: claims.email,
+      email: claims.email || null,
+      ...(verifiedPhone ? { phoneNumber: verifiedPhone, phoneVerified: true } : {}),
+      hasPassword: lookedUp ? lookedUp.hasPassword : true,
       lastReauthAt: now,
       csrfSecret,
       sessionId,
@@ -1043,6 +1084,7 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
         authMode: restStore ? 'firebase_managed' : 'local',
         firebaseProjectId: restStore ? restStore.config.projectId : null,
         emailPasswordEnabled: fbProviderStatus ? fbProviderStatus.enabled : true,
+        phoneOtpEnabled: Boolean(restStore),
         providerStatusReason: fbProviderStatus ? fbProviderStatus.rawCode : null,
         emailDeliveryConfigured: fbProviderStatus
           ? fbProviderStatus.enabled
@@ -1665,6 +1707,126 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
   );
 
   app.post(
+    '/api/auth/phone-session',
+    authLimiter,
+    async (req: AuthedRequest, res: Response, next: NextFunction) => {
+      try {
+        if (!restStore) {
+          return sendError(
+            req,
+            res,
+            503,
+            'PHONE_AUTH_UNAVAILABLE',
+            'Mobile OTP authentication requires Firebase Authentication mode.'
+          );
+        }
+
+        const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '';
+        const refreshToken =
+          typeof req.body?.refreshToken === 'string' ? req.body.refreshToken.trim() : '';
+        const requestedName =
+          typeof req.body?.fullName === 'string' ? req.body.fullName.trim() : '';
+
+        if (!idToken || !refreshToken) {
+          return sendError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Missing Firebase mobile authentication credentials.'
+          );
+        }
+
+        const claims = await verifyFirebaseIdToken(idToken, restStore.config.projectId);
+        if (!claims || !claims.phoneVerified || !claims.phoneNumber) {
+          return sendError(
+            req,
+            res,
+            401,
+            'PHONE_NOT_VERIFIED',
+            'A verified mobile OTP token is required to sign in.'
+          );
+        }
+
+        setActiveFirestoreIdToken(idToken);
+        const lookedUp = await firebaseLookupUser(restStore.config.apiKey, idToken).catch(
+          () => null
+        );
+        const effectiveName =
+          requestedName.length >= 2
+            ? requestedName.slice(0, 100)
+            : claims.name || lookedUp?.displayName || 'Customer';
+
+        if (
+          requestedName.length >= 2 &&
+          requestedName.slice(0, 100) !== (lookedUp?.displayName || claims.name)
+        ) {
+          await firebaseUpdateDisplayName(
+            restStore.config.apiKey,
+            idToken,
+            requestedName.slice(0, 100)
+          ).catch(() => undefined);
+        }
+
+        const user = await restStore.syncVerifiedUserProfile({
+          id: claims.uid,
+          fullName: effectiveName,
+          email: claims.email || lookedUp?.email || null,
+          emailVerified: Boolean(claims.email && claims.emailVerified),
+          phoneE164: claims.phoneNumber,
+          phoneVerified: true,
+          hasPassword: lookedUp ? lookedUp.hasPassword : false,
+          signInProviders: lookedUp?.providerIds || ['phone'],
+        });
+
+        const now = Date.now();
+        let issuedAt = now;
+        const userRevokedBefore = revokedFirebaseUsersBefore.get(user.id);
+        if (userRevokedBefore && issuedAt <= userRevokedBefore) {
+          issuedAt = userRevokedBefore + 1;
+        }
+
+        const csrfSecret = generateOpaqueToken(24);
+        const sessionId = crypto.randomUUID();
+        const envelope: FirebaseSessionEnvelope = {
+          idToken,
+          refreshToken,
+          uid: user.id,
+          email: user.email,
+          phoneNumber: claims.phoneNumber,
+          phoneVerified: true,
+          hasPassword: Boolean(user.has_password),
+          lastReauthAt: now,
+          csrfSecret,
+          sessionId,
+          issuedAt,
+        };
+        setFirebaseSessionCookies(req, res, envelope, restStore);
+
+        const session: SessionRow = {
+          id: sessionId,
+          user_id: user.id,
+          token_hash: 'firebase-managed',
+          csrf_secret: csrfSecret,
+          last_reauth_at: now,
+          expires_at: claims.expiresAtMs,
+          created_at: issuedAt,
+          revoked_at: null,
+        };
+
+        // Strictly never elevate phone-authenticated sessions to owner unless email_verified matches bound owner
+        const isOwner = await resolveIsBoundOwner(user);
+        return res.json({
+          csrfToken: csrfSecret,
+          user: serializePublicUser(user, session, isOwner),
+        });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
     '/api/auth/forgot-password',
     authLimiter,
     async (req: AuthedRequest, res: Response, next: NextFunction) => {
@@ -2055,6 +2217,98 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
   );
 
   app.post(
+    '/api/account/phone',
+    requireRecentReauth,
+    authLimiter,
+    async (req: AuthedRequest, res: Response, next: NextFunction) => {
+      try {
+        if (!restStore || !req.fbEnvelope) {
+          return sendError(
+            req,
+            res,
+            503,
+            'PHONE_AUTH_UNAVAILABLE',
+            'Verified login mobile linking requires Firebase Authentication mode.'
+          );
+        }
+
+        const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '';
+        const refreshToken =
+          typeof req.body?.refreshToken === 'string' && req.body.refreshToken.trim()
+            ? req.body.refreshToken.trim()
+            : req.fbEnvelope.refreshToken;
+        if (!idToken) {
+          return sendError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Missing verified Firebase token for the updated mobile number.'
+          );
+        }
+
+        const claims = await verifyFirebaseIdToken(idToken, restStore.config.projectId);
+        if (!claims || !claims.phoneVerified || !claims.phoneNumber) {
+          return sendError(
+            req,
+            res,
+            400,
+            'PHONE_NOT_LINKED',
+            'No verified mobile number was found on the supplied Firebase token.'
+          );
+        }
+        if (claims.uid !== req.authUser!.id) {
+          return sendError(
+            req,
+            res,
+            403,
+            'ACCOUNT_MISMATCH',
+            'This mobile verification belongs to a different account.'
+          );
+        }
+
+        setActiveFirestoreIdToken(idToken);
+        const lookedUp = await firebaseLookupUser(restStore.config.apiKey, idToken).catch(
+          () => null
+        );
+        const updated = await restStore.syncVerifiedUserProfile({
+          id: req.authUser!.id,
+          fullName: req.authUser!.full_name || claims.name || 'Customer',
+          email: claims.email || req.authUser!.email || null,
+          emailVerified: Boolean(claims.email && claims.emailVerified),
+          phoneE164: claims.phoneNumber,
+          phoneVerified: true,
+          hasPassword: lookedUp ? lookedUp.hasPassword : Boolean(req.authUser!.has_password),
+          signInProviders: lookedUp?.providerIds,
+        });
+
+        const now = Date.now();
+        const updatedEnvelope: FirebaseSessionEnvelope = {
+          ...req.fbEnvelope,
+          idToken,
+          refreshToken,
+          email: updated.email,
+          phoneNumber: claims.phoneNumber,
+          phoneVerified: true,
+          hasPassword: Boolean(updated.has_password),
+          lastReauthAt: now,
+        };
+        req.fbEnvelope = updatedEnvelope;
+        req.authSession!.last_reauth_at = now;
+        setFirebaseSessionCookies(req, res, updatedEnvelope, restStore);
+
+        const isOwner = await resolveIsBoundOwner(updated);
+        return res.json({
+          message: `Verified login mobile number updated to ${claims.phoneNumber}.`,
+          user: serializePublicUser(updated, req.authSession!, isOwner),
+        });
+      } catch (err) {
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
     '/api/account/reauthenticate',
     requireAuth,
     authLimiter,
@@ -2063,6 +2317,58 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
         const user = req.authUser!;
         const session = req.authSession!;
         const password = typeof req.body?.password === 'string' ? req.body.password : '';
+        const otpIdToken = typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '';
+
+        if (restStore && req.fbEnvelope && otpIdToken) {
+          const claims = await verifyFirebaseIdToken(otpIdToken, restStore.config.projectId);
+          if (!claims) {
+            return sendError(
+              req,
+              res,
+              401,
+              'INVALID_CREDENTIALS',
+              'Unable to confirm mobile OTP reauthentication.'
+            );
+          }
+          if (claims.uid !== user.id) {
+            return sendError(
+              req,
+              res,
+              403,
+              'ACCOUNT_MISMATCH',
+              'Verification token does not match your signed-in account.'
+            );
+          }
+          if (Date.now() - claims.authTimeMs > 5 * 60_000) {
+            return sendError(
+              req,
+              res,
+              403,
+              'REAUTH_REQUIRED',
+              'Please complete a fresh SMS verification step to confirm your identity.'
+            );
+          }
+          const nextRefresh =
+            typeof req.body?.refreshToken === 'string' && req.body.refreshToken.trim()
+              ? req.body.refreshToken.trim()
+              : req.fbEnvelope.refreshToken;
+          const now = Date.now();
+          const updatedEnvelope: FirebaseSessionEnvelope = {
+            ...req.fbEnvelope,
+            idToken: otpIdToken,
+            refreshToken: nextRefresh,
+            lastReauthAt: now,
+          };
+          req.fbEnvelope = updatedEnvelope;
+          session.last_reauth_at = now;
+          setActiveFirestoreIdToken(otpIdToken);
+          setFirebaseSessionCookies(req, res, updatedEnvelope, restStore);
+          const isOwner = await resolveIsBoundOwner(user);
+          return res.json({
+            message: 'Identity reauthenticated via verified mobile OTP.',
+            user: serializePublicUser(user, session, isOwner),
+          });
+        }
 
         if (restStore && req.fbEnvelope) {
           if (!user.email || !password) {

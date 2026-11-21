@@ -253,14 +253,29 @@ export function initializeFirestoreHandle(config: FirebaseAppletConfig): {
 }
 
 function toUserRow(data: Record<string, unknown>): UserRow {
+  const phoneVerified = Boolean(data.phone_verified && data.phone_e164);
+  const contactPhone =
+    typeof data.contact_phone === 'string' && data.contact_phone.trim()
+      ? data.contact_phone.trim()
+      : typeof data.phone_e164 === 'string' && data.phone_e164.trim()
+        ? data.phone_e164.trim()
+        : null;
+  const hasPassword =
+    typeof data.has_password === 'boolean'
+      ? data.has_password
+      : Array.isArray(data.sign_in_providers)
+        ? (data.sign_in_providers as unknown[]).includes('password')
+        : Boolean(data.password_hash);
   return {
     id: String(data.id),
     full_name: String(data.full_name || ''),
-    email: typeof data.email === 'string' ? data.email : null,
+    email: typeof data.email === 'string' && data.email.trim() ? data.email : null,
     email_verified: data.email_verified ? 1 : 0,
     password_hash: typeof data.password_hash === 'string' ? data.password_hash : null,
     phone_e164: typeof data.phone_e164 === 'string' ? data.phone_e164 : null,
-    phone_verified: data.phone_verified ? 1 : 0,
+    phone_verified: phoneVerified ? 1 : 0,
+    contact_phone: contactPhone,
+    has_password: hasPassword,
     notification_prefs_json:
       typeof data.notification_prefs_json === 'string'
         ? data.notification_prefs_json
@@ -1114,7 +1129,10 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
       });
     }
     allOrders.sort((a, b) => b.order.created_at - a.order.created_at);
-    const totalCustomers = usersSnap.docs.filter((d) => Boolean(d.data()?.email_verified)).length;
+    const totalCustomers = usersSnap.docs.filter((d) => {
+      const data = d.data();
+      return !data?.deleted_at && (Boolean(data?.email_verified) || Boolean(data?.phone_verified));
+    }).length;
 
     const allMessages = msgSnap.docs
       .map((d) => d.data() as ContactMessageRow)
@@ -3074,7 +3092,7 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
     const snap = await this.usersCol().get();
     const verifiedUsers = snap.docs
       .map((d) => toUserRow(d.data() as Record<string, unknown>))
-      .filter((u) => Boolean(u.email_verified) && !u.deleted_at)
+      .filter((u) => (Boolean(u.email_verified) || Boolean(u.phone_verified)) && !u.deleted_at)
       .sort((a, b) => b.created_at - a.created_at)
       .slice(0, 100);
 
@@ -3084,7 +3102,9 @@ export class FirestoreBoutiqueStore implements BoutiqueStore {
         fullName: u.full_name,
         email: u.email || '',
         emailVerified: Boolean(u.email_verified),
-        phone: u.phone_e164 || null,
+        phone: u.contact_phone || u.phone_e164 || null,
+        verifiedPhone: u.phone_verified ? u.phone_e164 || null : null,
+        phoneVerified: Boolean(u.phone_verified && u.phone_e164),
         notificationPrefs: parseNotificationPrefs(u.notification_prefs_json),
         addresses: await this.listCustomerAddresses(u.id).catch(() => []),
         createdAt: u.created_at,

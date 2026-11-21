@@ -42,11 +42,15 @@ interface ClientFirebaseSession {
   idToken: string;
   refreshToken: string;
   uid: string;
-  email: string;
+  email: string | null;
   fullName: string;
   phone?: string | null;
+  verifiedPhone?: string | null;
   notificationPrefs?: NotificationPreferencesData;
   emailVerified: boolean;
+  phoneVerified?: boolean;
+  hasPassword?: boolean;
+  signInProviders?: string[];
   lastReauthAt: number;
   issuedAt: number;
   expiresAtMs: number;
@@ -132,6 +136,19 @@ function emitBoutiqueSyncEvent(topic: 'orders' | 'account' | 'catalog'): void {
   }
 }
 
+function sessionHasVerifiedIdentity(session: {
+  email?: string | null;
+  emailVerified?: boolean;
+  phone?: string | null;
+  verifiedPhone?: string | null;
+  phoneVerified?: boolean;
+}): boolean {
+  return Boolean(
+    (session.emailVerified && session.email) ||
+      (session.phoneVerified && (session.verifiedPhone || session.phone))
+  );
+}
+
 function loadStoredSession(): ClientFirebaseSession | null {
   if (memorySession) return memorySession;
   if (typeof window === 'undefined') return null;
@@ -141,24 +158,44 @@ function loadStoredSession(): ClientFirebaseSession | null {
       window.localStorage.getItem(CLIENT_SESSION_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<ClientFirebaseSession>;
+    const normalizedEmail =
+      typeof parsed.email === 'string' && parsed.email.trim()
+        ? parsed.email.trim().toLowerCase()
+        : null;
+    const hasEmailOrPhoneIdentity =
+      Boolean(normalizedEmail) ||
+      Boolean(parsed.phoneVerified) ||
+      typeof parsed.verifiedPhone === 'string' ||
+      typeof parsed.phone === 'string';
     if (
       parsed &&
       typeof parsed.idToken === 'string' &&
       typeof parsed.refreshToken === 'string' &&
       typeof parsed.uid === 'string' &&
-      typeof parsed.email === 'string'
+      hasEmailOrPhoneIdentity
     ) {
       memorySession = {
         idToken: parsed.idToken,
         refreshToken: parsed.refreshToken,
         uid: parsed.uid,
-        email: parsed.email.toLowerCase(),
+        email: normalizedEmail,
         fullName: parsed.fullName || 'Member',
         phone: typeof parsed.phone === 'string' ? parsed.phone : null,
+        verifiedPhone:
+          typeof parsed.verifiedPhone === 'string'
+            ? parsed.verifiedPhone
+            : parsed.phoneVerified && typeof parsed.phone === 'string'
+              ? parsed.phone
+              : null,
         notificationPrefs: parsed.notificationPrefs
           ? parseNotificationPrefs(parsed.notificationPrefs)
           : undefined,
-        emailVerified: Boolean(parsed.emailVerified),
+        emailVerified: Boolean(normalizedEmail && parsed.emailVerified),
+        phoneVerified: Boolean(parsed.phoneVerified),
+        hasPassword: parsed.hasPassword !== false,
+        signInProviders: Array.isArray(parsed.signInProviders)
+          ? parsed.signInProviders.filter((p): p is string => typeof p === 'string')
+          : undefined,
         lastReauthAt: Number(parsed.lastReauthAt || Date.now()),
         issuedAt: Number(parsed.issuedAt || Date.now()),
         expiresAtMs: Number(parsed.expiresAtMs || Date.now() + 3600_000),
@@ -412,11 +449,37 @@ function mapFirebaseAuthError(rawMessage: string): ClientFirebaseError {
   }
 }
 
+function getIdentityToolkitBaseUrl(): string {
+  const emulatorHost =
+    (typeof process !== 'undefined' &&
+      process.env &&
+      (process.env.FIREBASE_AUTH_EMULATOR_HOST || process.env.VITE_FIREBASE_AUTH_EMULATOR_HOST)) ||
+    '';
+  if (emulatorHost.trim()) {
+    const clean = emulatorHost.trim().replace(/^https?:\/\//, '');
+    return `http://${clean}/identitytoolkit.googleapis.com/v1`;
+  }
+  return 'https://identitytoolkit.googleapis.com/v1';
+}
+
+function getSecureTokenBaseUrl(): string {
+  const emulatorHost =
+    (typeof process !== 'undefined' &&
+      process.env &&
+      (process.env.FIREBASE_AUTH_EMULATOR_HOST || process.env.VITE_FIREBASE_AUTH_EMULATOR_HOST)) ||
+    '';
+  if (emulatorHost.trim()) {
+    const clean = emulatorHost.trim().replace(/^https?:\/\//, '');
+    return `http://${clean}/securetoken.googleapis.com/v1`;
+  }
+  return 'https://securetoken.googleapis.com/v1';
+}
+
 async function callIdentityToolkit<T>(
   endpoint: string,
   payload: Record<string, unknown>
 ): Promise<T> {
-  const url = `https://identitytoolkit.googleapis.com/v1/${endpoint}?key=${encodeURIComponent(
+  const url = `${getIdentityToolkitBaseUrl()}/${endpoint}?key=${encodeURIComponent(
     FIREBASE_CONFIG.apiKey
   )}`;
   const res = await fetch(url, {
@@ -469,9 +532,14 @@ type AccountLookupResult =
       status: 'ok';
       account: {
         uid: string;
-        email: string;
+        email: string | null;
         emailVerified: boolean;
+        phoneNumber: string | null;
+        phoneVerified: boolean;
+        providerIds: string[];
+        hasPassword: boolean;
         displayName: string;
+        authTimeMs: number;
         expiresAtMs: number;
       };
     }
@@ -492,7 +560,7 @@ type TokenRefreshResult =
 
 async function lookupFirebaseAccountDetailed(idToken: string): Promise<AccountLookupResult> {
   try {
-    const url = `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(
+    const url = `${getIdentityToolkitBaseUrl()}/accounts:lookup?key=${encodeURIComponent(
       FIREBASE_CONFIG.apiKey
     )}`;
     const res = await fetch(url, {
@@ -506,7 +574,9 @@ async function lookupFirebaseAccountDetailed(idToken: string): Promise<AccountLo
         localId?: string;
         email?: string;
         emailVerified?: boolean;
+        phoneNumber?: string;
         displayName?: string;
+        providerUserInfo?: Array<{ providerId?: string }>;
       }>;
     };
 
@@ -533,13 +603,32 @@ async function lookupFirebaseAccountDetailed(idToken: string): Promise<AccountLo
     if (!account || !account.localId) return { status: 'invalid' };
     const jwt = decodeJwtPayload(idToken);
     const expSec = Number(jwt?.exp || 0);
+    const authTimeSec = Number(jwt?.auth_time || 0);
+    const cleanEmail =
+      typeof account.email === 'string' && account.email.trim()
+        ? account.email.trim().toLowerCase()
+        : null;
+    const cleanPhone =
+      typeof account.phoneNumber === 'string' && account.phoneNumber.trim()
+        ? account.phoneNumber.trim()
+        : null;
+    const providerIds = Array.isArray(account.providerUserInfo)
+      ? account.providerUserInfo
+          .map((p) => (typeof p?.providerId === 'string' ? p.providerId : ''))
+          .filter(Boolean)
+      : [];
     return {
       status: 'ok',
       account: {
         uid: account.localId,
-        email: (account.email || '').toLowerCase(),
-        emailVerified: Boolean(account.emailVerified),
+        email: cleanEmail,
+        emailVerified: Boolean(cleanEmail && account.emailVerified),
+        phoneNumber: cleanPhone,
+        phoneVerified: Boolean(cleanPhone),
+        providerIds,
+        hasPassword: providerIds.includes('password'),
         displayName: account.displayName || '',
+        authTimeMs: authTimeSec > 0 ? authTimeSec * 1000 : Date.now(),
         expiresAtMs: expSec > 0 ? expSec * 1000 : Date.now() + 3600_000,
       },
     };
@@ -550,9 +639,14 @@ async function lookupFirebaseAccountDetailed(idToken: string): Promise<AccountLo
 
 async function lookupFirebaseAccount(idToken: string): Promise<{
   uid: string;
-  email: string;
+  email: string | null;
   emailVerified: boolean;
+  phoneNumber: string | null;
+  phoneVerified: boolean;
+  providerIds: string[];
+  hasPassword: boolean;
   displayName: string;
+  authTimeMs: number;
   expiresAtMs: number;
 } | null> {
   const result = await lookupFirebaseAccountDetailed(idToken);
@@ -561,7 +655,7 @@ async function lookupFirebaseAccount(idToken: string): Promise<{
 
 async function refreshClientIdTokenDetailed(refreshToken: string): Promise<TokenRefreshResult> {
   try {
-    const url = `https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(
+    const url = `${getSecureTokenBaseUrl()}/token?key=${encodeURIComponent(
       FIREBASE_CONFIG.apiKey
     )}`;
     const res = await fetch(url, {
@@ -625,7 +719,9 @@ async function resolveValidClientSession(): Promise<ClientFirebaseSession | null
       return null;
     }
     if (refreshed.status === 'transient_error') {
-      return active.emailVerified && now < active.expiresAtMs - 5_000 ? active : null;
+      return sessionHasVerifiedIdentity(active) && now < active.expiresAtMs - 5_000
+        ? active
+        : null;
     }
     active = {
       ...active,
@@ -640,7 +736,7 @@ async function resolveValidClientSession(): Promise<ClientFirebaseSession | null
 
   if (
     !forceLookup &&
-    active.emailVerified &&
+    sessionHasVerifiedIdentity(active) &&
     active.lastVerifiedAt &&
     now - active.lastVerifiedAt < SESSION_LOOKUP_TTL_MS &&
     now < active.expiresAtMs - 60_000
@@ -654,9 +750,11 @@ async function resolveValidClientSession(): Promise<ClientFirebaseSession | null
     return null;
   }
   if (lookup.status === 'transient_error') {
-    return active.emailVerified && now < active.expiresAtMs - 5_000 ? active : null;
+    return sessionHasVerifiedIdentity(active) && now < active.expiresAtMs - 5_000
+      ? active
+      : null;
   }
-  if (!lookup.account.emailVerified) {
+  if (!lookup.account.emailVerified && !lookup.account.phoneVerified) {
     clearClientFirebaseSession();
     return null;
   }
@@ -665,6 +763,11 @@ async function resolveValidClientSession(): Promise<ClientFirebaseSession | null
     ...active,
     email: lookup.account.email,
     emailVerified: lookup.account.emailVerified,
+    verifiedPhone: lookup.account.phoneNumber,
+    phoneVerified: lookup.account.phoneVerified,
+    phone: active.phone || lookup.account.phoneNumber || null,
+    hasPassword: lookup.account.hasPassword,
+    signInProviders: lookup.account.providerIds,
     fullName: lookup.account.displayName || active.fullName,
     expiresAtMs: lookup.account.expiresAtMs,
     lastVerifiedAt: Date.now(),
@@ -693,17 +796,26 @@ export async function getValidClientIdToken(): Promise<string | null> {
 
 function buildPublicAuthUser(session: ClientFirebaseSession): AuthUser {
   const reauthExpiresAt = session.lastReauthAt + REAUTH_WINDOW_MS;
-  const isOwner =
+  const cleanEmail = session.email ? session.email.toLowerCase() : null;
+  const isOwner = Boolean(
     session.emailVerified &&
-    session.email.toLowerCase() === AUTHORIZED_OWNER_EMAIL;
+      cleanEmail &&
+      cleanEmail === AUTHORIZED_OWNER_EMAIL
+  );
+  const verifiedPhone =
+    session.phoneVerified && (session.verifiedPhone || session.phone)
+      ? session.verifiedPhone || session.phone || null
+      : null;
   return {
     id: session.uid,
     fullName: session.fullName || (isOwner ? 'Store Owner' : 'Member'),
-    email: session.email,
-    phone: session.phone ?? null,
+    email: cleanEmail,
+    phone: session.phone ?? verifiedPhone ?? null,
+    verifiedPhone,
     notificationPrefs: parseNotificationPrefs(session.notificationPrefs),
-    emailVerified: session.emailVerified,
-    hasPassword: true,
+    emailVerified: Boolean(cleanEmail && session.emailVerified),
+    phoneVerified: Boolean(verifiedPhone),
+    hasPassword: session.hasPassword !== false,
     isOwner,
     recentReauthValid: Date.now() < reauthExpiresAt,
     recentReauthExpiresAt: reauthExpiresAt,
@@ -2409,7 +2521,11 @@ async function ensureCompletedClientSignIn(params: {
   }
 
   const now = Date.now();
-  const isOwner = account.email === AUTHORIZED_OWNER_EMAIL && account.emailVerified;
+  const isOwner = Boolean(
+    account.email &&
+      account.emailVerified &&
+      account.email.toLowerCase() === AUTHORIZED_OWNER_EMAIL
+  );
 
   // Sync user profile in Firestore using rules-compliant schema (boolean email_verified, no password_hash)
   const existingUserDoc = await firestoreGetDoc<{
@@ -2417,6 +2533,7 @@ async function ensureCompletedClientSignIn(params: {
     created_at?: number;
     phone_e164?: string | null;
     phone_verified?: boolean;
+    contact_phone?: string | null;
     notification_prefs_json?: string | null;
     notification_prefs?: unknown;
   }>('users', account.uid, signIn.idToken).catch(() => null);
@@ -2431,6 +2548,13 @@ async function ensureCompletedClientSignIn(params: {
     existingUserDoc?.notification_prefs ?? existingUserDoc?.notification_prefs_json
   );
 
+  const verifiedPhone = account.phoneNumber || null;
+  const contactPhone =
+    existingUserDoc?.contact_phone ??
+    existingUserDoc?.phone_e164 ??
+    verifiedPhone ??
+    null;
+
   await firestoreSetDoc(
     'users',
     account.uid,
@@ -2439,11 +2563,11 @@ async function ensureCompletedClientSignIn(params: {
       full_name: fullName.slice(0, 100),
       email: account.email,
       email_verified: true,
-      phone_e164: existingUserDoc?.phone_e164 ?? null,
-      phone_verified:
-        typeof existingUserDoc?.phone_verified === 'boolean'
-          ? existingUserDoc.phone_verified
-          : false,
+      phone_e164: verifiedPhone || existingUserDoc?.phone_e164 || null,
+      phone_verified: Boolean(verifiedPhone),
+      contact_phone: contactPhone,
+      has_password: account.hasPassword,
+      sign_in_providers: account.providerIds,
       notification_prefs_json: JSON.stringify(notificationPrefs),
       created_at: Number(existingUserDoc?.created_at || now),
       updated_at: now,
@@ -2498,9 +2622,13 @@ async function ensureCompletedClientSignIn(params: {
     uid: account.uid,
     email: account.email,
     fullName,
-    phone: existingUserDoc?.phone_e164 ?? null,
+    phone: contactPhone,
+    verifiedPhone,
     notificationPrefs,
     emailVerified: true,
+    phoneVerified: Boolean(verifiedPhone),
+    hasPassword: account.hasPassword,
+    signInProviders: account.providerIds,
     lastReauthAt: now,
     issuedAt: now,
     expiresAtMs: account.expiresAtMs,
@@ -2515,6 +2643,140 @@ async function ensureCompletedClientSignIn(params: {
       csrfToken: session.csrfToken,
       user: buildPublicAuthUser(session),
       ...(isOwner ? { ownerBinding: { boundAt, boundVia } } : {}),
+    },
+  };
+}
+
+async function establishPhoneClientSession(params: {
+  idToken: string;
+  refreshToken: string;
+  fullName?: string;
+}): Promise<
+  ApiResult<{
+    csrfToken: string;
+    user: AuthUser;
+  }>
+> {
+  const idToken = String(params.idToken || '').trim();
+  const refreshToken = String(params.refreshToken || '').trim();
+  if (!idToken || !refreshToken) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'VALIDATION_ERROR',
+      error: 'Missing Firebase authentication tokens.',
+    };
+  }
+
+  const lookup = await lookupFirebaseAccountDetailed(idToken);
+  if (lookup.status === 'transient_error') {
+    return {
+      ok: false,
+      status: 503,
+      code: 'AUTH_UNAVAILABLE',
+      error: 'Unable to reach Firebase Authentication right now. Please try again in a moment.',
+    };
+  }
+  if (lookup.status !== 'ok') {
+    return {
+      ok: false,
+      status: 401,
+      code: 'INVALID_CREDENTIALS',
+      error: 'Unable to verify your mobile OTP token. Please try again.',
+    };
+  }
+
+  const account = lookup.account;
+  if (!account.phoneNumber) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'PHONE_NOT_VERIFIED',
+      error: 'A verified mobile number is required to sign in.',
+    };
+  }
+
+  const cleanRequestedName =
+    typeof params.fullName === 'string' && params.fullName.trim().length >= 2
+      ? params.fullName.trim().slice(0, 100)
+      : '';
+
+  if (cleanRequestedName && cleanRequestedName !== account.displayName) {
+    await callIdentityToolkit('accounts:update', {
+      idToken,
+      displayName: cleanRequestedName,
+      returnSecureToken: false,
+    }).catch(() => undefined);
+  }
+
+  const now = Date.now();
+  const existingUserDoc = await firestoreGetDoc<{
+    full_name?: string;
+    created_at?: number;
+    contact_phone?: string | null;
+    phone_e164?: string | null;
+    notification_prefs_json?: string | null;
+    notification_prefs?: unknown;
+  }>('users', account.uid, idToken).catch(() => null);
+
+  const fullName =
+    cleanRequestedName ||
+    account.displayName ||
+    existingUserDoc?.full_name ||
+    'Customer';
+
+  const notificationPrefs = parseNotificationPrefs(
+    existingUserDoc?.notification_prefs ?? existingUserDoc?.notification_prefs_json
+  );
+  const contactPhone = existingUserDoc?.contact_phone || account.phoneNumber;
+
+  await firestoreSetDoc(
+    'users',
+    account.uid,
+    {
+      id: account.uid,
+      full_name: fullName.slice(0, 100),
+      email: account.email,
+      email_verified: Boolean(account.email && account.emailVerified),
+      phone_e164: account.phoneNumber,
+      phone_verified: true,
+      contact_phone: contactPhone,
+      has_password: account.hasPassword,
+      sign_in_providers: account.providerIds,
+      notification_prefs_json: JSON.stringify(notificationPrefs),
+      created_at: Number(existingUserDoc?.created_at || now),
+      updated_at: now,
+    },
+    idToken
+  ).catch(() => undefined);
+
+  const session: ClientFirebaseSession = {
+    idToken,
+    refreshToken,
+    uid: account.uid,
+    email: account.email,
+    fullName,
+    phone: contactPhone,
+    verifiedPhone: account.phoneNumber,
+    notificationPrefs,
+    emailVerified: Boolean(account.email && account.emailVerified),
+    phoneVerified: true,
+    hasPassword: account.hasPassword,
+    signInProviders: account.providerIds,
+    lastReauthAt: now,
+    issuedAt: now,
+    expiresAtMs: account.expiresAtMs,
+    lastVerifiedAt: now,
+    csrfToken: randomHex(16),
+  };
+  saveStoredSession(session);
+  emitBoutiqueSyncEvent('account');
+
+  return {
+    ok: true,
+    data: {
+      csrfToken: session.csrfToken,
+      user: buildPublicAuthUser(session),
     },
   };
 }
@@ -2593,6 +2855,16 @@ export async function handleClientlessApiRequest<T>(
         email: typeof body.email === 'string' ? body.email : '',
         password: typeof body.password === 'string' ? body.password : '',
         requireOwner: true,
+      });
+      return res as unknown as ApiResult<T>;
+    }
+
+    // 3b. Mobile OTP Sign-In / Sign-Up Session
+    if (cleanPath === '/api/auth/phone-session' && upperMethod === 'POST') {
+      const res = await establishPhoneClientSession({
+        idToken: typeof body.idToken === 'string' ? body.idToken : '',
+        refreshToken: typeof body.refreshToken === 'string' ? body.refreshToken : '',
+        fullName: typeof body.fullName === 'string' ? body.fullName : undefined,
       });
       return res as unknown as ApiResult<T>;
     }
@@ -3109,14 +3381,26 @@ export async function handleClientlessApiRequest<T>(
         const userDoc = await firestoreGetDoc<{
           full_name?: string;
           phone_e164?: string | null;
+          phone_verified?: boolean;
+          contact_phone?: string | null;
           notification_prefs_json?: string | null;
           notification_prefs?: unknown;
         }>('users', session.uid, session.idToken).catch(() => null);
         if (userDoc) {
+          const verifiedPhone =
+            session.phoneVerified && (session.verifiedPhone || userDoc.phone_e164)
+              ? session.verifiedPhone || userDoc.phone_e164 || null
+              : null;
           const synced: ClientFirebaseSession = {
             ...session,
             fullName: userDoc.full_name || session.fullName,
-            phone: userDoc.phone_e164 !== undefined ? userDoc.phone_e164 : (session.phone ?? null),
+            verifiedPhone,
+            phone:
+              userDoc.contact_phone !== undefined
+                ? userDoc.contact_phone
+                : userDoc.phone_e164 !== undefined
+                  ? userDoc.phone_e164
+                  : (session.phone ?? null),
             notificationPrefs: parseNotificationPrefs(
               userDoc.notification_prefs ?? userDoc.notification_prefs_json ?? session.notificationPrefs
             ),
@@ -3145,10 +3429,10 @@ export async function handleClientlessApiRequest<T>(
           };
         }
 
-        let nextPhone = session.phone ?? null;
+        let nextContactPhone = session.phone ?? null;
         if (body.phone !== undefined) {
           if (body.phone === null || String(body.phone).trim() === '') {
-            nextPhone = null;
+            nextContactPhone = null;
           } else {
             const rawPhone = String(body.phone).trim();
             const digits = rawPhone.replace(/[\s()-]/g, '');
@@ -3160,7 +3444,7 @@ export async function handleClientlessApiRequest<T>(
                 error: 'Please enter a valid phone number (7–15 digits) or leave it blank.',
               };
             }
-            nextPhone = rawPhone.slice(0, 24);
+            nextContactPhone = rawPhone.slice(0, 24);
           }
         }
 
@@ -3168,6 +3452,7 @@ export async function handleClientlessApiRequest<T>(
           created_at?: number;
           phone_e164?: string | null;
           phone_verified?: boolean;
+          contact_phone?: string | null;
           notification_prefs_json?: string | null;
           notification_prefs?: unknown;
         }>('users', session.uid, session.idToken).catch(() => null);
@@ -3206,6 +3491,19 @@ export async function handleClientlessApiRequest<T>(
           });
         }
 
+        const hasVerifiedLoginPhone = Boolean(
+          session.phoneVerified && (session.verifiedPhone || existingUserDoc?.phone_e164)
+        );
+        const preservedLoginPhone = hasVerifiedLoginPhone
+          ? session.verifiedPhone || existingUserDoc?.phone_e164 || null
+          : body.phone !== undefined
+            ? nextContactPhone
+            : (existingUserDoc?.phone_e164 ?? nextContactPhone);
+        const resolvedContactPhone =
+          body.phone !== undefined
+            ? nextContactPhone
+            : (existingUserDoc?.contact_phone ?? existingUserDoc?.phone_e164 ?? nextContactPhone);
+
         const now = Date.now();
         await firestoreSetDoc(
           'users',
@@ -3214,12 +3512,12 @@ export async function handleClientlessApiRequest<T>(
             id: session.uid,
             full_name: fullName,
             email: session.email,
-            email_verified: Boolean(session.emailVerified),
-            phone_e164: body.phone !== undefined ? nextPhone : (existingUserDoc?.phone_e164 ?? nextPhone),
-            phone_verified:
-              typeof existingUserDoc?.phone_verified === 'boolean'
-                ? existingUserDoc.phone_verified
-                : false,
+            email_verified: Boolean(session.email && session.emailVerified),
+            phone_e164: preservedLoginPhone,
+            phone_verified: hasVerifiedLoginPhone,
+            contact_phone: resolvedContactPhone,
+            has_password: session.hasPassword !== false,
+            ...(session.signInProviders ? { sign_in_providers: session.signInProviders } : {}),
             notification_prefs_json: JSON.stringify(nextPrefs),
             created_at: Number(existingUserDoc?.created_at || session.issuedAt || now),
             updated_at: now,
@@ -3230,7 +3528,9 @@ export async function handleClientlessApiRequest<T>(
         const updatedSession: ClientFirebaseSession = {
           ...session,
           fullName,
-          phone: body.phone !== undefined ? nextPhone : (existingUserDoc?.phone_e164 ?? nextPhone),
+          phone: resolvedContactPhone,
+          verifiedPhone: hasVerifiedLoginPhone ? preservedLoginPhone : null,
+          phoneVerified: hasVerifiedLoginPhone,
           notificationPrefs: nextPrefs,
         };
         saveStoredSession(updatedSession);
@@ -3241,7 +3541,7 @@ export async function handleClientlessApiRequest<T>(
         };
       }
       if (upperMethod === 'DELETE') {
-        if (session.email.toLowerCase() === AUTHORIZED_OWNER_EMAIL) {
+        if ((session.email || '').toLowerCase() === AUTHORIZED_OWNER_EMAIL) {
           return {
             ok: false,
             status: 403,
@@ -3254,7 +3554,7 @@ export async function handleClientlessApiRequest<T>(
             ok: false,
             status: 403,
             code: 'REAUTH_REQUIRED',
-            error: 'Please verify your current password before permanently deleting your account.',
+            error: 'Please verify your identity above before permanently deleting your account.',
           };
         }
         const confirmText = typeof body.confirmText === 'string' ? body.confirmText.trim() : '';
@@ -3327,6 +3627,125 @@ export async function handleClientlessApiRequest<T>(
       }
     }
 
+    if (cleanPath === '/api/account/phone' && upperMethod === 'POST') {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      if (Date.now() - session.lastReauthAt > REAUTH_WINDOW_MS) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'REAUTH_REQUIRED',
+          error: 'Please verify your identity before updating your verified mobile number.',
+        };
+      }
+
+      const idToken = typeof body.idToken === 'string' ? body.idToken.trim() : '';
+      const refreshToken =
+        typeof body.refreshToken === 'string' && body.refreshToken.trim()
+          ? body.refreshToken.trim()
+          : session.refreshToken;
+      if (!idToken) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          error: 'Missing verified Firebase token for the updated mobile number.',
+        };
+      }
+
+      const lookup = await lookupFirebaseAccountDetailed(idToken);
+      if (lookup.status !== 'ok') {
+        return {
+          ok: false,
+          status: 401,
+          code: 'INVALID_CREDENTIALS',
+          error: 'Unable to verify updated mobile number credentials. Please try again.',
+        };
+      }
+      if (lookup.account.uid !== session.uid) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'ACCOUNT_MISMATCH',
+          error: 'This mobile verification belongs to a different account.',
+        };
+      }
+      if (!lookup.account.phoneNumber) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'PHONE_NOT_LINKED',
+          error: 'No verified mobile number was found on your Firebase account.',
+        };
+      }
+
+      const existingUserDoc = await firestoreGetDoc<{
+        created_at?: number;
+        contact_phone?: string | null;
+        notification_prefs_json?: string | null;
+        notification_prefs?: unknown;
+      }>('users', session.uid, idToken).catch(() => null);
+
+      const now = Date.now();
+      const contactPhone = existingUserDoc?.contact_phone ?? lookup.account.phoneNumber;
+      const basePrefs = parseNotificationPrefs(
+        existingUserDoc?.notification_prefs ??
+          existingUserDoc?.notification_prefs_json ??
+          session.notificationPrefs
+      );
+
+      await firestoreSetDoc(
+        'users',
+        session.uid,
+        {
+          id: session.uid,
+          full_name: lookup.account.displayName || session.fullName,
+          email: lookup.account.email,
+          email_verified: Boolean(lookup.account.email && lookup.account.emailVerified),
+          phone_e164: lookup.account.phoneNumber,
+          phone_verified: true,
+          contact_phone: contactPhone,
+          has_password: lookup.account.hasPassword,
+          sign_in_providers: lookup.account.providerIds,
+          notification_prefs_json: JSON.stringify(basePrefs),
+          created_at: Number(existingUserDoc?.created_at || session.issuedAt || now),
+          updated_at: now,
+        },
+        idToken
+      );
+
+      const updatedSession: ClientFirebaseSession = {
+        ...session,
+        idToken,
+        refreshToken,
+        email: lookup.account.email,
+        emailVerified: Boolean(lookup.account.email && lookup.account.emailVerified),
+        verifiedPhone: lookup.account.phoneNumber,
+        phoneVerified: true,
+        phone: session.phone || lookup.account.phoneNumber,
+        hasPassword: lookup.account.hasPassword,
+        signInProviders: lookup.account.providerIds,
+        lastReauthAt: now,
+        lastVerifiedAt: now,
+      };
+      saveStoredSession(updatedSession);
+      emitBoutiqueSyncEvent('account');
+      return {
+        ok: true,
+        data: {
+          message: `Verified login mobile number updated to ${lookup.account.phoneNumber}.`,
+          user: buildPublicAuthUser(updatedSession),
+        } as unknown as T,
+      };
+    }
+
     if (cleanPath === '/api/account/reauthenticate' && upperMethod === 'POST') {
       const session = await getValidClientSession();
       if (!session) {
@@ -3337,7 +3756,64 @@ export async function handleClientlessApiRequest<T>(
           error: 'Authentication required.',
         };
       }
+
+      const idToken = typeof body.idToken === 'string' ? body.idToken.trim() : '';
+      if (idToken) {
+        const lookup = await lookupFirebaseAccountDetailed(idToken);
+        if (lookup.status !== 'ok') {
+          return {
+            ok: false,
+            status: 401,
+            code: 'INVALID_CREDENTIALS',
+            error: 'Unable to confirm mobile OTP reauthentication.',
+          };
+        }
+        if (lookup.account.uid !== session.uid) {
+          return {
+            ok: false,
+            status: 403,
+            code: 'ACCOUNT_MISMATCH',
+            error: 'Verification token does not match your signed-in account.',
+          };
+        }
+        if (Date.now() - lookup.account.authTimeMs > 5 * 60_000) {
+          return {
+            ok: false,
+            status: 403,
+            code: 'REAUTH_REQUIRED',
+            error: 'Please complete a fresh SMS verification step to confirm your identity.',
+          };
+        }
+        const refreshToken =
+          typeof body.refreshToken === 'string' && body.refreshToken.trim()
+            ? body.refreshToken.trim()
+            : session.refreshToken;
+        const updated: ClientFirebaseSession = {
+          ...session,
+          idToken,
+          refreshToken,
+          lastReauthAt: Date.now(),
+          lastVerifiedAt: Date.now(),
+        };
+        saveStoredSession(updated);
+        return {
+          ok: true,
+          data: {
+            message: 'Identity reauthenticated via verified mobile OTP.',
+            user: buildPublicAuthUser(updated),
+          } as unknown as T,
+        };
+      }
+
       const password = typeof body.password === 'string' ? body.password : '';
+      if (!session.email || !session.hasPassword) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'NO_PASSWORD_CONFIGURED',
+          error: 'Use mobile OTP verification above to reauthenticate this account.',
+        };
+      }
       if (!password) {
         return {
           ok: false,
@@ -7561,9 +8037,11 @@ export async function handleClientlessApiRequest<T>(
           firestoreListDocs<{
             id: string;
             full_name?: string;
-            email?: string;
+            email?: string | null;
             email_verified?: boolean;
             phone_e164?: string | null;
+            phone_verified?: boolean;
+            contact_phone?: string | null;
             notification_prefs_json?: string | null;
             notification_prefs?: unknown;
             deleted_at?: number | null;
@@ -7606,12 +8084,14 @@ export async function handleClientlessApiRequest<T>(
             id: u.id,
             fullName: u.full_name || 'Member',
             email: u.email || '',
-            phone: u.phone_e164 || null,
+            phone: u.contact_phone || u.phone_e164 || null,
+            verifiedPhone: u.phone_verified ? u.phone_e164 || null : null,
             notificationPrefs: parseNotificationPrefs(
               u.notification_prefs ?? u.notification_prefs_json
             ),
             addresses: addrByUser.get(u.id) || [],
             emailVerified: Boolean(u.email_verified),
+            phoneVerified: Boolean(u.phone_verified),
             createdAt: Number(u.created_at || 0),
             updatedAt: Number(u.updated_at || u.created_at || 0),
           }))
@@ -7633,14 +8113,15 @@ export async function handleClientlessApiRequest<T>(
         }> = [];
 
         for (const u of users) {
+          const identityLabel = u.email || u.verifiedPhone || u.phone || 'Customer';
           events.push({
             id: `reg_${u.id}`,
             type: 'registration',
             title: 'Customer Registered',
-            detail: `${u.fullName} (${u.email})`,
-            actorLabel: u.email,
+            detail: `${u.fullName} (${identityLabel})`,
+            actorLabel: identityLabel,
             refId: u.id,
-            status: u.emailVerified ? 'verified' : 'pending',
+            status: u.emailVerified || u.phoneVerified ? 'verified' : 'pending',
             createdAt: u.createdAt,
           });
         }

@@ -382,6 +382,8 @@ export interface AdminCustomerAccountSummary {
   email: string;
   emailVerified: boolean;
   phone?: string | null;
+  verifiedPhone?: string | null;
+  phoneVerified?: boolean;
   notificationPrefs?: NotificationPreferences;
   addresses?: CustomerAddress[];
   createdAt: number;

@@ -597,7 +597,9 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
 
     const totalCustomers = (
       this.db
-        .prepare(`SELECT COUNT(*) AS cnt FROM users WHERE email_verified = 1`)
+        .prepare(
+          `SELECT COUNT(*) AS cnt FROM users WHERE (email_verified = 1 OR phone_verified = 1) AND deleted_at IS NULL`
+        )
         .get() as { cnt: number }
     ).cnt;
 
@@ -2959,8 +2961,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
   async listUsersSummary(): Promise<StoreUserSummary[]> {
     const rows = this.db
       .prepare(
-        `SELECT id, full_name, email, email_verified, phone_e164, notification_prefs_json, created_at, updated_at
-         FROM users WHERE email_verified = 1 AND deleted_at IS NULL
+        `SELECT id, full_name, email, email_verified, phone_e164, phone_verified, notification_prefs_json, created_at, updated_at
+         FROM users WHERE (email_verified = 1 OR phone_verified = 1) AND deleted_at IS NULL
          ORDER BY created_at DESC LIMIT 100`
       )
       .all() as Array<{
@@ -2969,6 +2971,7 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       email: string | null;
       email_verified: number;
       phone_e164: string | null;
+      phone_verified: number;
       notification_prefs_json: string | null;
       created_at: number;
       updated_at: number;
@@ -2984,6 +2987,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       email: r.email || '',
       emailVerified: Boolean(r.email_verified),
       phone: r.phone_e164 || null,
+      verifiedPhone: r.phone_verified ? r.phone_e164 || null : null,
+      phoneVerified: Boolean(r.phone_verified && r.phone_e164),
       notificationPrefs: parseNotificationPrefs(r.notification_prefs_json),
       addresses: addrStmt.all(r.id) as unknown as CustomerAddressRow[],
       createdAt: r.created_at,

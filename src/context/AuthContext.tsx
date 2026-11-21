@@ -4,6 +4,10 @@ import {
   clearClientFirebaseSession,
   handleClientlessApiRequest,
 } from '../services/firebaseClientApi';
+import {
+  signOutFirebaseWebAuth,
+  syncEmailPasswordWithFirebaseWebSdk,
+} from '../services/firebaseWebAuth';
 import type { NotificationPreferences } from '../types/boutique';
 
 export interface AuthUser {
@@ -11,8 +15,10 @@ export interface AuthUser {
   fullName: string;
   email: string | null;
   phone?: string | null;
+  verifiedPhone?: string | null;
   notificationPrefs?: NotificationPreferences;
   emailVerified: boolean;
+  phoneVerified?: boolean;
   hasPassword: boolean;
   isOwner: boolean;
   recentReauthValid: boolean;
@@ -22,6 +28,7 @@ export interface AuthUser {
 export interface AuthCapabilities {
   emailDeliveryConfigured: boolean;
   emailPasswordEnabled?: boolean;
+  phoneOtpEnabled?: boolean;
   providerStatusReason?: string | null;
   firebaseProjectId?: string | null;
   passwordMinLength: number;
@@ -49,6 +56,11 @@ interface AuthContextValue {
   refreshSession: () => Promise<void>;
   refreshCapabilities: () => Promise<AuthCapabilities | null>;
   loginWithEmail: (email: string, password: string) => Promise<ApiResult<{ user: AuthUser }>>;
+  establishPhoneSession: (input: {
+    idToken: string;
+    refreshToken: string;
+    fullName?: string;
+  }) => Promise<ApiResult<{ user: AuthUser }>>;
   registerWithEmail: (
     fullName: string,
     email: string,
@@ -98,6 +110,14 @@ interface AuthContextValue {
   reauthenticateWithPassword: (
     password: string
   ) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
+  reauthenticateWithPhoneToken: (input: {
+    idToken: string;
+    refreshToken: string;
+  }) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
+  syncLinkedPhone: (input: {
+    idToken: string;
+    refreshToken: string;
+  }) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
   changePassword: (newPassword: string) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
   requestLinkEmail: (email: string) => Promise<ApiResult<{ message: string }>>;
   logout: () => Promise<ApiResult<{ message: string }>>;
@@ -573,6 +593,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (res.ok) {
         sessionEpochRef.current += 1;
         setUser(res.data.user);
+        if (capabilities.authMode === 'firebase_managed') {
+          void syncEmailPasswordWithFirebaseWebSdk(email, password);
+        }
+      }
+      return res;
+    },
+    [capabilities.authMode, requestApi]
+  );
+
+  const establishPhoneSession = useCallback(
+    async (input: { idToken: string; refreshToken: string; fullName?: string }) => {
+      const res = await requestApi<{ user: AuthUser }>('/api/auth/phone-session', {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+      if (res.ok) {
+        sessionEpochRef.current += 1;
+        setUser(res.data.user);
+        try {
+          if (typeof BroadcastChannel !== 'undefined') {
+            const ch = new BroadcastChannel('sahithi-boutique-sync');
+            ch.postMessage({ topic: 'account', at: Date.now() });
+            ch.close();
+          }
+        } catch {
+          // ignore
+        }
       }
       return res;
     },
@@ -701,6 +748,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         sessionTokenRef.current = '';
         writeStoredApiSessionToken('');
         clearClientFirebaseSession();
+        if (capabilities.authMode === 'firebase_managed') {
+          await signOutFirebaseWebAuth();
+        }
         if (typeof res.data.csrfToken === 'string' && res.data.csrfToken) {
           csrfTokenRef.current = res.data.csrfToken;
         }
@@ -717,7 +767,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       return res;
     },
-    [requestApi]
+    [capabilities.authMode, requestApi]
   );
 
   const reauthenticateWithPassword = useCallback(
@@ -732,6 +782,54 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (res.ok) {
         sessionEpochRef.current += 1;
         setUser(res.data.user);
+        if (capabilities.authMode === 'firebase_managed' && res.data.user.email) {
+          void syncEmailPasswordWithFirebaseWebSdk(res.data.user.email, password);
+        }
+      }
+      return res;
+    },
+    [capabilities.authMode, requestApi]
+  );
+
+  const reauthenticateWithPhoneToken = useCallback(
+    async (input: { idToken: string; refreshToken: string }) => {
+      const res = await requestApi<{ message: string; user: AuthUser }>(
+        '/api/account/reauthenticate',
+        {
+          method: 'POST',
+          body: JSON.stringify(input),
+        }
+      );
+      if (res.ok) {
+        sessionEpochRef.current += 1;
+        setUser(res.data.user);
+      }
+      return res;
+    },
+    [requestApi]
+  );
+
+  const syncLinkedPhone = useCallback(
+    async (input: { idToken: string; refreshToken: string }) => {
+      const res = await requestApi<{ message: string; user: AuthUser }>(
+        '/api/account/phone',
+        {
+          method: 'POST',
+          body: JSON.stringify(input),
+        }
+      );
+      if (res.ok) {
+        sessionEpochRef.current += 1;
+        setUser(res.data.user);
+        try {
+          if (typeof BroadcastChannel !== 'undefined') {
+            const ch = new BroadcastChannel('sahithi-boutique-sync');
+            ch.postMessage({ topic: 'account', at: Date.now() });
+            ch.close();
+          }
+        } catch {
+          // ignore
+        }
       }
       return res;
     },
@@ -857,6 +955,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       sessionTokenRef.current = '';
       writeStoredApiSessionToken('');
       clearClientFirebaseSession();
+      if (capabilities.authMode === 'firebase_managed') {
+        await signOutFirebaseWebAuth();
+      }
 
       const verifyRes = await requestApi<{
         authenticated?: boolean;
@@ -892,7 +993,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } finally {
       isLoggingOutRef.current = false;
     }
-  }, [requestApi]);
+  }, [capabilities.authMode, requestApi]);
 
   return (
     <AuthContext.Provider
@@ -903,6 +1004,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         refreshSession: syncSessionAndCapabilities,
         refreshCapabilities,
         loginWithEmail,
+        establishPhoneSession,
         registerWithEmail,
         resendVerificationEmail,
         verifyEmailToken,
@@ -912,6 +1014,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         updateProfile,
         deleteAccount,
         reauthenticateWithPassword,
+        reauthenticateWithPhoneToken,
+        syncLinkedPhone,
         changePassword,
         requestLinkEmail,
         logout,

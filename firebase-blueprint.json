@@ -2,15 +2,18 @@
   "entities": {
     "EnvironmentUser": {
       "title": "EnvironmentUser",
-      "description": "Server-managed user authentication record isolated per deployment environment.",
+      "description": "Server-managed user authentication record isolated per deployment environment (email and/or verified mobile OTP).",
       "type": "object",
       "properties": {
         "id": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
         "full_name": { "type": "string", "minLength": 2, "maxLength": 100 },
-        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "email": { "type": ["string", "null"], "maxLength": 254 },
         "email_verified": { "type": "boolean" },
-        "phone_e164": { "type": "string", "maxLength": 24 },
+        "phone_e164": { "type": ["string", "null"], "maxLength": 32 },
         "phone_verified": { "type": "boolean" },
+        "contact_phone": { "type": ["string", "null"], "maxLength": 32 },
+        "has_password": { "type": "boolean" },
+        "sign_in_providers": { "type": "array", "items": { "type": "string" } },
         "notification_prefs_json": { "type": "string", "maxLength": 2000 },
         "deleted_at": { "type": "number" },
         "created_at": { "type": "number" },

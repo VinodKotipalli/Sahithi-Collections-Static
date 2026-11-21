@@ -1075,10 +1075,11 @@ export function registerCatalogAndAdminRoutes(params: {
             id: verified.uid,
             full_name: 'Member',
             email: verified.email || null,
-            email_verified: 1,
-            password_hash: 'firebase-managed',
-            phone_e164: null,
-            phone_verified: 0,
+            email_verified: verified.email ? 1 : 0,
+            password_hash: verified.email ? 'firebase-managed' : '',
+            phone_e164: verified.phoneNumber || null,
+            phone_verified: verified.phoneNumber ? 1 : 0,
+            contact_phone: verified.phoneNumber || null,
             created_at: now,
             updated_at: now,
           };
@@ -3494,14 +3495,15 @@ export function registerCatalogAndAdminRoutes(params: {
         }> = [];
 
         for (const u of users) {
+          const identityLabel = u.email || u.verifiedPhone || u.phone || 'Customer';
           events.push({
             id: `reg_${u.id}`,
             type: 'registration',
             title: 'Customer Registered',
-            detail: `${u.fullName || 'Member'} (${u.email})`,
-            actorLabel: u.email,
+            detail: `${u.fullName || 'Member'} (${identityLabel})`,
+            actorLabel: identityLabel,
             refId: u.id,
-            status: u.emailVerified ? 'verified' : 'pending',
+            status: u.emailVerified || u.phoneVerified ? 'verified' : 'pending',
             createdAt: u.createdAt,
           });
         }

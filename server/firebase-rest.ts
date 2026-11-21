@@ -92,6 +92,9 @@ export interface VerifiedFirebaseTokenClaims {
   uid: string;
   email: string;
   emailVerified: boolean;
+  phoneNumber: string;
+  phoneVerified: boolean;
+  signInProvider: string;
   name: string;
   authTimeMs: number;
   expiresAtMs: number;
@@ -101,7 +104,10 @@ export interface FirebaseSessionEnvelope {
   idToken: string;
   refreshToken: string;
   uid: string;
-  email: string;
+  email: string | null;
+  phoneNumber?: string | null;
+  phoneVerified?: boolean;
+  hasPassword?: boolean;
   lastReauthAt: number;
   csrfSecret: string;
   sessionId?: string;
@@ -152,6 +158,13 @@ async function getFirebasePublicCerts(): Promise<Record<string, string>> {
   }
 }
 
+function resolveFirebaseAuthEmulatorOrigin(): string {
+  const raw = (process.env.FIREBASE_AUTH_EMULATOR_HOST || '').trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return raw.replace(/\/+$/, '');
+  return `http://${raw.replace(/\/+$/, '')}`;
+}
+
 export async function verifyFirebaseIdToken(
   idToken: string,
   projectId: string
@@ -159,7 +172,7 @@ export async function verifyFirebaseIdToken(
   const parts = idToken.split('.');
   if (parts.length !== 3) return null;
   const [headerB64, payloadB64, sigB64] = parts;
-  if (!headerB64 || !payloadB64 || !sigB64) return null;
+  if (!headerB64 || !payloadB64) return null;
 
   let header: { alg?: string; kid?: string };
   let payload: Record<string, unknown>;
@@ -170,27 +183,32 @@ export async function verifyFirebaseIdToken(
     return null;
   }
 
-  if (header.alg !== 'RS256' || typeof header.kid !== 'string' || !header.kid) {
-    return null;
-  }
+  const emulatorOrigin = resolveFirebaseAuthEmulatorOrigin();
+  const isEmulatorToken = Boolean(emulatorOrigin && header.alg === 'none');
 
-  let certs = await getFirebasePublicCerts();
-  let certPem = certs[header.kid];
-  if (!certPem) {
-    cachedCerts = null;
-    certs = await getFirebasePublicCerts();
-    certPem = certs[header.kid];
-  }
-  if (!certPem) return null;
+  if (!isEmulatorToken) {
+    if (!sigB64 || header.alg !== 'RS256' || typeof header.kid !== 'string' || !header.kid) {
+      return null;
+    }
 
-  try {
-    const verifier = crypto.createVerify('RSA-SHA256');
-    verifier.update(`${headerB64}.${payloadB64}`);
-    verifier.end();
-    const signatureValid = verifier.verify(certPem, Buffer.from(sigB64, 'base64url'));
-    if (!signatureValid) return null;
-  } catch {
-    return null;
+    let certs = await getFirebasePublicCerts();
+    let certPem = certs[header.kid];
+    if (!certPem) {
+      cachedCerts = null;
+      certs = await getFirebasePublicCerts();
+      certPem = certs[header.kid];
+    }
+    if (!certPem) return null;
+
+    try {
+      const verifier = crypto.createVerify('RSA-SHA256');
+      verifier.update(`${headerB64}.${payloadB64}`);
+      verifier.end();
+      const signatureValid = verifier.verify(certPem, Buffer.from(sigB64, 'base64url'));
+      if (!signatureValid) return null;
+    } catch {
+      return null;
+    }
   }
 
   const nowSec = Math.floor(Date.now() / 1000);
@@ -211,10 +229,29 @@ export async function verifyFirebaseIdToken(
     return null;
   }
 
+  const phoneNumber =
+    typeof payload.phone_number === 'string' ? payload.phone_number.trim() : '';
+  const email = typeof payload.email === 'string' ? payload.email.trim().toLowerCase() : '';
+  const emailVerified = Boolean(email && payload.email_verified);
+  const phoneVerified = Boolean(phoneNumber);
+  const firebaseMeta =
+    payload.firebase && typeof payload.firebase === 'object'
+      ? (payload.firebase as { sign_in_provider?: unknown })
+      : undefined;
+  const signInProvider =
+    typeof firebaseMeta?.sign_in_provider === 'string' && firebaseMeta.sign_in_provider
+      ? firebaseMeta.sign_in_provider
+      : phoneVerified && !email
+        ? 'phone'
+        : 'password';
+
   return {
     uid: payload.sub.trim(),
-    email: typeof payload.email === 'string' ? payload.email.trim().toLowerCase() : '',
-    emailVerified: Boolean(payload.email_verified),
+    email,
+    emailVerified,
+    phoneNumber,
+    phoneVerified,
+    signInProvider,
     name: typeof payload.name === 'string' ? payload.name.trim() : '',
     authTimeMs: authTime * 1000,
     expiresAtMs: exp * 1000,
@@ -256,30 +293,48 @@ export function unsealFirebaseSessionCookie(
     decipher.setAuthTag(tag);
     const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
     const parsed = JSON.parse(decrypted.toString('utf8')) as Partial<FirebaseSessionEnvelope>;
-    if (!parsed.idToken || !parsed.refreshToken || !parsed.uid || !parsed.email) {
+    const normalizedEmail =
+      typeof parsed.email === 'string' && parsed.email.trim()
+        ? parsed.email.trim().toLowerCase()
+        : null;
+    const normalizedPhone =
+      typeof parsed.phoneNumber === 'string' && parsed.phoneNumber.trim()
+        ? parsed.phoneNumber.trim()
+        : null;
+    if (
+      !parsed.idToken ||
+      !parsed.refreshToken ||
+      !parsed.uid ||
+      (!normalizedEmail && !normalizedPhone && !parsed.phoneVerified)
+    ) {
       return null;
     }
-      return {
-        idToken: String(parsed.idToken),
-        refreshToken: String(parsed.refreshToken),
-        uid: String(parsed.uid),
-        email: String(parsed.email).toLowerCase(),
-        lastReauthAt: Number(parsed.lastReauthAt || Date.now()),
-        csrfSecret:
-          typeof parsed.csrfSecret === 'string' && parsed.csrfSecret
-            ? parsed.csrfSecret
-            : crypto.randomBytes(24).toString('base64url'),
-        ...(typeof parsed.sessionId === 'string' && parsed.sessionId
-          ? { sessionId: parsed.sessionId }
-          : {}),
-        ...(typeof parsed.issuedAt === 'number' && Number.isFinite(parsed.issuedAt)
-          ? { issuedAt: parsed.issuedAt }
-          : {}),
-      };
-    } catch {
-      return null;
-    }
+    return {
+      idToken: String(parsed.idToken),
+      refreshToken: String(parsed.refreshToken),
+      uid: String(parsed.uid),
+      email: normalizedEmail,
+      ...(normalizedPhone ? { phoneNumber: normalizedPhone } : {}),
+      ...(typeof parsed.phoneVerified === 'boolean'
+        ? { phoneVerified: parsed.phoneVerified }
+        : {}),
+      ...(typeof parsed.hasPassword === 'boolean' ? { hasPassword: parsed.hasPassword } : {}),
+      lastReauthAt: Number(parsed.lastReauthAt || Date.now()),
+      csrfSecret:
+        typeof parsed.csrfSecret === 'string' && parsed.csrfSecret
+          ? parsed.csrfSecret
+          : crypto.randomBytes(24).toString('base64url'),
+      ...(typeof parsed.sessionId === 'string' && parsed.sessionId
+        ? { sessionId: parsed.sessionId }
+        : {}),
+      ...(typeof parsed.issuedAt === 'number' && Number.isFinite(parsed.issuedAt)
+        ? { issuedAt: parsed.issuedAt }
+        : {}),
+    };
+  } catch {
+    return null;
   }
+}
 
 export class FirebaseAuthApiError extends Error {
   readonly firebaseCode: string;
@@ -485,10 +540,14 @@ async function callIdentityToolkit<T>(
   endpoint: string,
   payload: Record<string, unknown>
 ): Promise<T> {
+  const emulatorOrigin = resolveFirebaseAuthEmulatorOrigin();
+  const baseUrl = emulatorOrigin
+    ? `${emulatorOrigin}/identitytoolkit.googleapis.com/v1`
+    : 'https://identitytoolkit.googleapis.com/v1';
   let res: Response;
   try {
     res = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/${endpoint}?key=${encodeURIComponent(apiKey)}`,
+      `${baseUrl}/${endpoint}?key=${encodeURIComponent(apiKey)}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -748,8 +807,12 @@ export async function firebaseRefreshIdToken(
   apiKey: string,
   refreshToken: string
 ): Promise<{ idToken: string; refreshToken: string; uid: string }> {
+  const emulatorOrigin = resolveFirebaseAuthEmulatorOrigin();
+  const tokenBase = emulatorOrigin
+    ? `${emulatorOrigin}/securetoken.googleapis.com/v1`
+    : 'https://securetoken.googleapis.com/v1';
   const res = await fetch(
-    `https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(apiKey)}`,
+    `${tokenBase}/token?key=${encodeURIComponent(apiKey)}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -781,7 +844,11 @@ export async function firebaseLookupUser(
   localId: string;
   email: string;
   emailVerified: boolean;
+  phoneNumber: string;
+  phoneVerified: boolean;
   displayName: string;
+  providerIds: string[];
+  hasPassword: boolean;
 } | null> {
   try {
     const data = await callIdentityToolkit<{
@@ -789,16 +856,29 @@ export async function firebaseLookupUser(
         localId: string;
         email?: string;
         emailVerified?: boolean;
+        phoneNumber?: string;
         displayName?: string;
+        providerUserInfo?: Array<{ providerId?: string }>;
       }>;
     }>(apiKey, 'accounts:lookup', { idToken });
     const u = data.users?.[0];
     if (!u) return null;
+    const providerIds = Array.isArray(u.providerUserInfo)
+      ? u.providerUserInfo
+          .map((p) => (typeof p.providerId === 'string' ? p.providerId : ''))
+          .filter(Boolean)
+      : [];
+    const cleanPhone = typeof u.phoneNumber === 'string' ? u.phoneNumber.trim() : '';
+    const cleanEmail = (u.email || '').trim().toLowerCase();
     return {
       localId: u.localId,
-      email: (u.email || '').toLowerCase(),
-      emailVerified: Boolean(u.emailVerified),
+      email: cleanEmail,
+      emailVerified: Boolean(cleanEmail && u.emailVerified),
+      phoneNumber: cleanPhone,
+      phoneVerified: Boolean(cleanPhone),
       displayName: u.displayName || '',
+      providerIds,
+      hasPassword: providerIds.includes('password'),
     };
   } catch {
     return null;
@@ -1429,14 +1509,29 @@ export class FirestoreRestStore implements BoutiqueStore {
   async getUserById(id: string): Promise<UserRow | null> {
     const doc = await this.getDoc(`users/${id}`).catch(() => null);
     if (!doc) return null;
+    const phoneVerified = Boolean(doc.data.phone_verified && doc.data.phone_e164);
+    const hasPassword =
+      typeof doc.data.has_password === 'boolean'
+        ? doc.data.has_password
+        : Array.isArray(doc.data.sign_in_providers)
+          ? (doc.data.sign_in_providers as unknown[]).includes('password')
+          : Boolean(doc.data.email);
+    const contactPhone =
+      typeof doc.data.contact_phone === 'string' && doc.data.contact_phone.trim()
+        ? doc.data.contact_phone.trim()
+        : typeof doc.data.phone_e164 === 'string' && doc.data.phone_e164.trim()
+          ? doc.data.phone_e164.trim()
+          : null;
     return {
       id: String(doc.data.id || doc.id),
       full_name: String(doc.data.full_name || ''),
-      email: typeof doc.data.email === 'string' ? doc.data.email : null,
+      email: typeof doc.data.email === 'string' && doc.data.email.trim() ? doc.data.email : null,
       email_verified: doc.data.email_verified ? 1 : 0,
-      password_hash: 'firebase-managed',
+      password_hash: hasPassword ? 'firebase-managed' : '',
       phone_e164: typeof doc.data.phone_e164 === 'string' ? doc.data.phone_e164 : null,
-      phone_verified: doc.data.phone_verified ? 1 : 0,
+      phone_verified: phoneVerified ? 1 : 0,
+      contact_phone: contactPhone,
+      has_password: hasPassword,
       notification_prefs_json:
         typeof doc.data.notification_prefs_json === 'string'
           ? doc.data.notification_prefs_json
@@ -1452,17 +1547,55 @@ export class FirestoreRestStore implements BoutiqueStore {
   async syncVerifiedUserProfile(input: {
     id: string;
     fullName: string;
-    email: string;
+    email?: string | null;
     emailVerified: boolean;
+    phoneE164?: string | null;
+    phoneVerified?: boolean;
+    hasPassword?: boolean;
+    signInProviders?: string[];
   }): Promise<UserRow> {
     const existing = await this.getUserById(input.id);
     const now = Date.now();
-    const safeInputName = input.fullName.trim().length >= 2 ? input.fullName.trim().slice(0, 100) : 'Member';
+    const safeInputName = input.fullName.trim().length >= 2 ? input.fullName.trim().slice(0, 100) : 'Customer';
+    const nextEmail =
+      typeof input.email === 'string' && input.email.trim()
+        ? input.email.trim().toLowerCase()
+        : existing?.email || null;
+    const nextEmailVerified = Boolean(nextEmail && (input.emailVerified || existing?.email_verified));
+    const verifiedPhone =
+      input.phoneVerified && typeof input.phoneE164 === 'string' && input.phoneE164.trim()
+        ? input.phoneE164.trim()
+        : existing?.phone_verified && existing.phone_e164
+          ? existing.phone_e164
+          : null;
+    const nextPhoneVerified = Boolean(verifiedPhone);
+    const nextPhoneE164 = verifiedPhone || existing?.phone_e164 || null;
+    const nextContactPhone = existing?.contact_phone ?? nextPhoneE164 ?? null;
+    const hasPassword =
+      typeof input.hasPassword === 'boolean'
+        ? input.hasPassword
+        : existing?.has_password !== undefined
+          ? existing.has_password
+          : Boolean(nextEmail);
+
     const row: Record<string, unknown> = {
       id: input.id,
-      full_name: existing?.full_name && existing.full_name.length >= 2 ? existing.full_name : safeInputName,
-      email: input.email.toLowerCase(),
-      email_verified: Boolean(input.emailVerified),
+      full_name:
+        existing?.full_name && existing.full_name.length >= 2 && existing.full_name !== 'Customer'
+          ? existing.full_name
+          : safeInputName,
+      email: nextEmail,
+      email_verified: nextEmailVerified,
+      phone_e164: nextPhoneE164,
+      phone_verified: nextPhoneVerified,
+      contact_phone: nextContactPhone,
+      has_password: hasPassword,
+      ...(Array.isArray(input.signInProviders) && input.signInProviders.length > 0
+        ? { sign_in_providers: input.signInProviders }
+        : {}),
+      ...(existing?.notification_prefs_json
+        ? { notification_prefs_json: existing.notification_prefs_json }
+        : {}),
       created_at: existing?.created_at || now,
       updated_at: now,
     };
@@ -1470,11 +1603,14 @@ export class FirestoreRestStore implements BoutiqueStore {
     return {
       id: input.id,
       full_name: String(row.full_name),
-      email: String(row.email),
-      email_verified: row.email_verified ? 1 : 0,
-      password_hash: 'firebase-managed',
-      phone_e164: null,
-      phone_verified: 0,
+      email: nextEmail,
+      email_verified: nextEmailVerified ? 1 : 0,
+      password_hash: hasPassword ? 'firebase-managed' : '',
+      phone_e164: nextPhoneE164,
+      phone_verified: nextPhoneVerified ? 1 : 0,
+      contact_phone: nextContactPhone,
+      has_password: hasPassword,
+      notification_prefs_json: existing?.notification_prefs_json ?? null,
       created_at: Number(row.created_at),
       updated_at: now,
     };
@@ -1497,11 +1633,18 @@ export class FirestoreRestStore implements BoutiqueStore {
     return {
       id: String(d.id || docs[0].id),
       full_name: String(d.full_name || ''),
-      email: typeof d.email === 'string' ? d.email : null,
+      email: typeof d.email === 'string' && d.email.trim() ? d.email : null,
       email_verified: d.email_verified ? 1 : 0,
-      password_hash: 'firebase-managed',
-      phone_e164: null,
-      phone_verified: 0,
+      password_hash: d.has_password === false ? '' : 'firebase-managed',
+      phone_e164: typeof d.phone_e164 === 'string' ? d.phone_e164 : null,
+      phone_verified: d.phone_verified ? 1 : 0,
+      contact_phone:
+        typeof d.contact_phone === 'string'
+          ? d.contact_phone
+          : typeof d.phone_e164 === 'string'
+            ? d.phone_e164
+            : null,
+      has_password: typeof d.has_password === 'boolean' ? d.has_password : Boolean(d.email),
       created_at: Number(d.created_at || 0),
       updated_at: Number(d.updated_at || 0),
     };
@@ -1564,19 +1707,23 @@ export class FirestoreRestStore implements BoutiqueStore {
       typeof input.fullName === 'string' && input.fullName.trim().length >= 2
         ? input.fullName.trim().slice(0, 100)
         : existing.full_name;
-    const nextPhone =
+    const nextContactPhone =
       input.phone === null
         ? null
         : typeof input.phone === 'string'
           ? input.phone.trim() || null
-          : existing.phone_e164;
+          : existing.contact_phone ?? existing.phone_e164;
     const nextPrefsJson = input.notificationPrefs
       ? JSON.stringify(parseNotificationPrefs(input.notificationPrefs))
       : existing.notification_prefs_json ?? null;
 
+    // Never overwrite a verified login mobile number (phone_e164) with editable contact_phone
+    const nextPhoneE164 = existing.phone_verified ? existing.phone_e164 : nextContactPhone;
+
     await this.patchDoc(`users/${userId}`, {
       full_name: nextName,
-      phone_e164: nextPhone,
+      phone_e164: nextPhoneE164,
+      contact_phone: nextContactPhone,
       notification_prefs_json: nextPrefsJson,
       updated_at: now,
     });
@@ -2227,7 +2374,9 @@ export class FirestoreRestStore implements BoutiqueStore {
       }
       return hasPending ? acc + 1 : acc;
     }, 0);
-    const totalCustomers = userDocs.filter((u) => Boolean(u.data?.email_verified)).length;
+    const totalCustomers = userDocs.filter(
+      (u) => !u.data?.deleted_at && (Boolean(u.data?.email_verified) || Boolean(u.data?.phone_verified))
+    ).length;
 
     const recentOrders: OrderWithItems[] = [...orders]
       .sort((a, b) => b.created_at - a.created_at)
@@ -4216,7 +4365,7 @@ export class FirestoreRestStore implements BoutiqueStore {
     const docs = await this.runQuery('users');
     const verifiedUsers = docs
       .map((d) => d.data)
-      .filter((d) => Boolean(d.email_verified) && !d.deleted_at)
+      .filter((d) => (Boolean(d.email_verified) || Boolean(d.phone_verified)) && !d.deleted_at)
       .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))
       .slice(0, 100);
 
@@ -4224,12 +4373,22 @@ export class FirestoreRestStore implements BoutiqueStore {
       verifiedUsers.map(async (d) => {
         const uid = String(d.id || '');
         const addrs = uid ? await this.listCustomerAddresses(uid).catch(() => []) : [];
+        const verifiedPhone =
+          d.phone_verified && typeof d.phone_e164 === 'string' ? d.phone_e164 : null;
+        const contactPhone =
+          typeof d.contact_phone === 'string'
+            ? d.contact_phone
+            : typeof d.phone_e164 === 'string'
+              ? d.phone_e164
+              : null;
         return {
           id: uid,
           fullName: String(d.full_name || ''),
           email: typeof d.email === 'string' ? d.email : '',
           emailVerified: Boolean(d.email_verified),
-          phone: typeof d.phone_e164 === 'string' ? d.phone_e164 : null,
+          phone: contactPhone,
+          verifiedPhone,
+          phoneVerified: Boolean(verifiedPhone),
           notificationPrefs: parseNotificationPrefs(
             d.notification_prefs_json ?? d.notification_prefs
           ),

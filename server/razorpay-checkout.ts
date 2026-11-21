@@ -726,7 +726,13 @@ export async function verifyBearerFirebaseTokenFromHeader(
   authHeader: string | string[] | undefined,
   verifierOverride?: IdTokenVerifierFn
 ): Promise<
-  | { ok: true; uid: string | null; rawToken: string | null; email?: string | null }
+  | {
+      ok: true;
+      uid: string | null;
+      rawToken: string | null;
+      email?: string | null;
+      phoneNumber?: string | null;
+    }
   | { ok: false; status: 401; code: string; error: string }
 > {
   const headerStr = Array.isArray(authHeader) ? authHeader[0] : authHeader;
@@ -786,7 +792,13 @@ export async function verifyBearerFirebaseTokenFromHeader(
     };
   }
 
-  return { ok: true, uid: claims.uid, rawToken: token, email: claims.email || null };
+  return {
+    ok: true,
+    uid: claims.uid,
+    rawToken: token,
+    email: claims.email || null,
+    phoneNumber: claims.phoneNumber || null,
+  };
 }
 
 type FsFieldValue =

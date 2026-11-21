@@ -18,8 +18,24 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function hasVerifiedPhoneToken() {
+      return isSignedIn()
+        && 'phone_number' in request.auth.token
+        && request.auth.token.phone_number is string
+        && request.auth.token.phone_number.size() >= 6;
+    }
+
+    function hasVerifiedAuthSession() {
+      return isSignedIn()
+        && (
+          request.auth.token.email_verified == true
+          || hasVerifiedPhoneToken()
+        );
+    }
+
     function isOwner() {
       return isSignedIn()
+        && 'email' in request.auth.token
         && request.auth.token.email == 'saivinodkotipalli2003@gmail.com'
         && request.auth.token.email_verified == true;
     }
@@ -139,12 +155,26 @@ service cloud.firestore {
 
     function isValidEnvironmentUser(data, userId) {
       return data.keys().hasAll(['id', 'full_name', 'email', 'email_verified', 'created_at', 'updated_at'])
-        && data.keys().hasOnly(['id', 'full_name', 'email', 'email_verified', 'phone_e164', 'phone_verified', 'notification_prefs', 'notification_prefs_json', 'deleted_at', 'created_at', 'updated_at'])
+        && data.keys().hasOnly([
+          'id', 'full_name', 'email', 'email_verified',
+          'phone_e164', 'phone_verified', 'contact_phone',
+          'has_password', 'sign_in_providers',
+          'notification_prefs', 'notification_prefs_json',
+          'deleted_at', 'created_at', 'updated_at'
+        ])
         && data.id == userId
         && data.full_name is string && data.full_name.size() >= 2 && data.full_name.size() <= 100
-        && data.email is string && data.email.size() >= 5 && data.email.size() <= 254
+        && (data.email == null || (data.email is string && data.email.size() >= 5 && data.email.size() <= 254))
         && data.email_verified is bool
         && (!('phone_e164' in data) || data.phone_e164 == null || (data.phone_e164 is string && data.phone_e164.size() <= 32))
+        && (!('phone_verified' in data) || data.phone_verified is bool)
+        && (!('contact_phone' in data) || data.contact_phone == null || (data.contact_phone is string && data.contact_phone.size() <= 32))
+        && (!('has_password' in data) || data.has_password is bool)
+        && (!('sign_in_providers' in data) || data.sign_in_providers is list)
+        && (
+          (data.email is string && data.email.size() >= 5)
+          || ('phone_verified' in data && data.phone_verified == true && 'phone_e164' in data && data.phone_e164 is string && data.phone_e164.size() >= 6)
+        )
         && (!('notification_prefs_json' in data) || data.notification_prefs_json == null || (data.notification_prefs_json is string && data.notification_prefs_json.size() <= 2000))
         && data.created_at is number && data.updated_at is number;
     }
@@ -350,20 +380,28 @@ service cloud.firestore {
         allow list: if isValidEnv(envKey) && isOwner();
         allow create: if isValidEnv(envKey)
           && isValidId(userId)
-          && isSignedIn()
-          && request.auth.token.email_verified == true
+          && hasVerifiedAuthSession()
           && (request.auth.uid == userId || isOwner())
+          && (
+            isOwner()
+            || (
+              (!request.resource.data.email_verified || (request.auth.token.email_verified == true && 'email' in request.auth.token && request.resource.data.email == request.auth.token.email))
+              && (!('phone_verified' in request.resource.data) || request.resource.data.phone_verified == false || (hasVerifiedPhoneToken() && request.resource.data.phone_e164 == request.auth.token.phone_number))
+            )
+          )
           && isValidEnvironmentUser(request.resource.data, userId);
         allow update: if isValidEnv(envKey)
           && isValidId(userId)
-          && isSignedIn()
-          && request.auth.token.email_verified == true
+          && hasVerifiedAuthSession()
           && (
             isOwner()
             || (
               request.auth.uid == userId
-              && request.resource.data.email == resource.data.email
-              && request.resource.data.email_verified == resource.data.email_verified
+              && (
+                (request.resource.data.email == resource.data.email && request.resource.data.email_verified == resource.data.email_verified)
+                || (request.auth.token.email_verified == true && 'email' in request.auth.token && request.resource.data.email == request.auth.token.email && request.resource.data.email_verified == true)
+              )
+              && (!('phone_verified' in request.resource.data) || request.resource.data.phone_verified == false || (hasVerifiedPhoneToken() && request.resource.data.phone_e164 == request.auth.token.phone_number))
             )
           )
           && isValidEnvironmentUser(request.resource.data, userId);
@@ -372,10 +410,9 @@ service cloud.firestore {
           && (
             isOwner()
             || (
-              isSignedIn()
-              && request.auth.token.email_verified == true
+              hasVerifiedAuthSession()
               && request.auth.uid == userId
-              && request.auth.token.email != 'saivinodkotipalli2003@gmail.com'
+              && (!('email' in request.auth.token) || request.auth.token.email != 'saivinodkotipalli2003@gmail.com')
             )
           );
 

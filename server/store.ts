@@ -164,6 +164,8 @@ export interface StoreUserSummary {
   email: string;
   emailVerified: boolean;
   phone?: string | null;
+  verifiedPhone?: string | null;
+  phoneVerified?: boolean;
   notificationPrefs?: NotificationPreferencesData;
   addresses?: CustomerAddressRow[];
   createdAt: number;

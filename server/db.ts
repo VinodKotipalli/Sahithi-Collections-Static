@@ -26,9 +26,11 @@ export interface UserRow {
   email: string | null;
   email_verified: number;
   password_hash: string | null;
-  // Preserved on existing records for legacy/contact continuity; never used for authentication
+  // Verified Firebase Auth mobile number (when phone_verified == 1) or legacy contact phone
   phone_e164: string | null;
   phone_verified: number;
+  contact_phone?: string | null;
+  has_password?: boolean;
   notification_prefs_json?: string | null;
   deleted_at?: number | null;
   created_at: number;
