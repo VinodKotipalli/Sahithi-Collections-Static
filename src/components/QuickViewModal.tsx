@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { type MouseEvent, type TouchEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   ChevronLeft,
@@ -7,6 +7,8 @@ import {
   MessageCircle,
   ShoppingBag,
   X,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import {
@@ -20,6 +22,9 @@ import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 import type { BagItem, Product } from '../types/boutique';
 import { formatPaiseINR } from '../utils/format';
 import { BoutiqueImage } from './BoutiqueImage';
+
+const DEFAULT_ZOOM_SCALE = 2.5;
+const HIGH_ZOOM_SCALE = 3.5;
 
 interface QuickViewModalProps {
   product: Product | null;
@@ -45,6 +50,7 @@ export function QuickViewModal({
   onClose,
 }: QuickViewModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
+  const imageFrameRef = useRef<HTMLDivElement>(null);
   const prefersReducedMotion = usePrefersReducedMotion();
   const { settings } = useStorefront();
   const isOpen = product !== null;
@@ -54,12 +60,22 @@ export function QuickViewModal({
   const [selectedSize, setSelectedSize] = useState('');
   const [addedFeedback, setAddedFeedback] = useState(false);
 
+  // Interactive magnified detail zoom state
+  const [isHoveringImage, setIsHoveringImage] = useState(false);
+  const [isZoomLocked, setIsZoomLocked] = useState(false);
+  const [zoomScale, setZoomScale] = useState(DEFAULT_ZOOM_SCALE);
+  const [zoomPointer, setZoomPointer] = useState({ fx: 0.5, fy: 0.35 });
+
   useFocusTrap(isOpen, modalRef, onClose);
 
   useEffect(() => {
     if (!product) return;
     setActiveImageIndex(0);
     setAddedFeedback(false);
+    setIsHoveringImage(false);
+    setIsZoomLocked(false);
+    setZoomScale(DEFAULT_ZOOM_SCALE);
+    setZoomPointer({ fx: 0.5, fy: 0.35 });
     const firstInStock = product.variants?.find((v) => v.stockQty > 0) || product.variants?.[0];
     setSelectedColor(firstInStock?.colorName || product.colors[0]?.name || 'Default');
     setSelectedSize(firstInStock?.size || product.sizes[0] || 'Free Size');
@@ -143,6 +159,61 @@ export function QuickViewModal({
     }
   };
 
+  const updateZoomFromClientPoint = (clientX: number, clientY: number) => {
+    const frame = imageFrameRef.current;
+    if (!frame) return;
+    const rect = frame.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const fx = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    const fy = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
+    setZoomPointer({ fx, fy });
+  };
+
+  const handleImageMouseEnter = (event: MouseEvent<HTMLDivElement>) => {
+    setIsHoveringImage(true);
+    updateZoomFromClientPoint(event.clientX, event.clientY);
+  };
+
+  const handleImageMouseMove = (event: MouseEvent<HTMLDivElement>) => {
+    if (!isHoveringImage) setIsHoveringImage(true);
+    updateZoomFromClientPoint(event.clientX, event.clientY);
+  };
+
+  const handleImageMouseLeave = () => {
+    setIsHoveringImage(false);
+  };
+
+  const handleImageClick = (event: MouseEvent<HTMLDivElement>) => {
+    updateZoomFromClientPoint(event.clientX, event.clientY);
+    if (isHoveringImage || isZoomLocked) {
+      setZoomScale((prev) =>
+        prev === DEFAULT_ZOOM_SCALE ? HIGH_ZOOM_SCALE : DEFAULT_ZOOM_SCALE
+      );
+    } else {
+      setIsZoomLocked(true);
+    }
+  };
+
+  const handleImageTouchMove = (event: TouchEvent<HTMLDivElement>) => {
+    if (!isZoomLocked || event.touches.length === 0) return;
+    const touch = event.touches[0];
+    updateZoomFromClientPoint(touch.clientX, touch.clientY);
+  };
+
+  const isZoomVisible = isHoveringImage || isZoomLocked;
+  const halfViewport = 0.5 / zoomScale;
+  const clampedCx = Math.min(1 - halfViewport, Math.max(halfViewport, zoomPointer.fx));
+  const clampedCy = Math.min(1 - halfViewport, Math.max(halfViewport, zoomPointer.fy));
+  const lensPercent = 100 / zoomScale;
+  const lensTranslateX = (clampedCx - halfViewport) * zoomScale * 100;
+  const lensTranslateY = (clampedCy - halfViewport) * zoomScale * 100;
+  const detailTranslateX = (0.5 - clampedCx * zoomScale) * 100;
+  const detailTranslateY = (0.5 - clampedCy * zoomScale) * 100;
+
+  const activeImage = product?.images[activeImageIndex];
+  const activeImageSrc = activeImage?.src || '';
+  const activeImageAlt = activeImage?.alt || product?.name || '';
+
   return (
     <AnimatePresence>
       {product && (
@@ -187,24 +258,133 @@ export function QuickViewModal({
               <div className="grid grid-cols-1 gap-6 md:grid-cols-12 md:gap-8">
                 {/* Gallery Column */}
                 <div className="md:col-span-6">
-                  <div className="relative aspect-[3/4] overflow-hidden rounded-2xl border border-[#49243E]/10 bg-[#F8F1ED]">
+                  <div
+                    ref={imageFrameRef}
+                    onMouseEnter={handleImageMouseEnter}
+                    onMouseMove={handleImageMouseMove}
+                    onMouseLeave={handleImageMouseLeave}
+                    onClick={handleImageClick}
+                    onTouchStart={(event) => {
+                      if (!isZoomLocked || event.touches.length === 0) return;
+                      const touch = event.touches[0];
+                      updateZoomFromClientPoint(touch.clientX, touch.clientY);
+                    }}
+                    onTouchMove={handleImageTouchMove}
+                    className={`relative aspect-[3/4] select-none overflow-hidden rounded-2xl border border-[#49243E]/10 bg-[#F8F1ED] ${
+                      isZoomLocked ? 'touch-none' : ''
+                    } ${
+                      zoomScale === HIGH_ZOOM_SCALE && isZoomVisible
+                        ? 'cursor-zoom-out'
+                        : 'cursor-zoom-in'
+                    }`}
+                  >
                     <BoutiqueImage
-                      src={product.images[activeImageIndex]?.src || ''}
-                      alt={product.images[activeImageIndex]?.alt || product.name}
+                      src={activeImageSrc}
+                      alt={activeImageAlt}
                       loading="eager"
                       fallbackTitle={product.name}
                       className="h-full w-full object-cover object-top"
                     />
 
+                    {/* Desktop Viewfinder Magnifying Lens Indicator */}
+                    <div
+                      aria-hidden="true"
+                      style={{
+                        width: `${lensPercent}%`,
+                        height: `${lensPercent}%`,
+                        transform: `translate3d(${lensTranslateX}%, ${lensTranslateY}%, 0)`,
+                      }}
+                      className={`pointer-events-none absolute left-0 top-0 hidden rounded-lg border border-[#FFF9F5]/90 bg-[#FFF9F5]/20 shadow-[0_0_0_1px_rgba(73,36,62,0.34),0_10px_28px_rgba(36,33,36,0.16)] backdrop-blur-[0.5px] will-change-transform md:block ${
+                        prefersReducedMotion
+                          ? ''
+                          : 'transition-opacity duration-200 ease-in-out'
+                      } ${isZoomVisible ? 'opacity-100' : 'opacity-0'}`}
+                    >
+                      <span className="absolute left-1/2 top-1/2 h-3 w-px -translate-x-1/2 -translate-y-1/2 bg-[#49243E]/45" />
+                      <span className="absolute left-1/2 top-1/2 h-px w-3 -translate-x-1/2 -translate-y-1/2 bg-[#49243E]/45" />
+                    </div>
+
+                    {/* Mobile / Compact In-Frame Magnified Detail View */}
+                    <div
+                      aria-hidden={!isZoomVisible}
+                      className={`pointer-events-none absolute inset-0 overflow-hidden bg-[#F8F1ED] md:hidden ${
+                        prefersReducedMotion
+                          ? ''
+                          : 'transition-opacity duration-200 ease-in-out'
+                      } ${isZoomVisible ? 'opacity-100' : 'opacity-0'}`}
+                    >
+                      <div
+                        style={{
+                          transformOrigin: '0 0',
+                          transform: `translate3d(${detailTranslateX}%, ${detailTranslateY}%, 0) scale(${zoomScale})`,
+                        }}
+                        className="h-full w-full will-change-transform"
+                      >
+                        <BoutiqueImage
+                          src={activeImageSrc}
+                          alt={`${product.name} magnified detail`}
+                          loading="eager"
+                          fallbackTitle={product.name}
+                          className="h-full w-full object-cover object-top"
+                        />
+                      </div>
+                      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-[#242124]/65 via-[#242124]/15 to-transparent px-3.5 pb-3 pt-8 text-xs text-[#FFF9F5]">
+                        <span>Drag to inspect detail</span>
+                        <span className="mx-1.5 opacity-60" aria-hidden="true">
+                          ·
+                        </span>
+                        <span className="tabular-nums">{zoomScale.toFixed(1)}×</span>
+                      </div>
+                    </div>
+
+                    {/* Interactive Zoom Toggle Button (Keyboard & Touch Accessible) */}
+                    <button
+                      type="button"
+                      onMouseEnter={(e) => {
+                        e.stopPropagation();
+                        setIsHoveringImage(false);
+                      }}
+                      onMouseMove={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setIsZoomLocked((prev) => {
+                          if (prev) {
+                            setZoomScale(DEFAULT_ZOOM_SCALE);
+                            return false;
+                          }
+                          return true;
+                        });
+                      }}
+                      aria-pressed={isZoomLocked}
+                      aria-label={
+                        isZoomLocked
+                          ? 'Exit magnified detail view'
+                          : 'Inspect magnified garment detail'
+                      }
+                      className="absolute bottom-3 right-3 z-10 flex h-10 w-10 items-center justify-center rounded-full border border-[#49243E]/15 bg-[#FFF9F5]/92 text-[#49243E] shadow-sm transition-colors hover:bg-[#FFF9F5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#49243E]"
+                    >
+                      {isZoomLocked ? (
+                        <ZoomOut className="h-4 w-4" aria-hidden="true" />
+                      ) : (
+                        <ZoomIn className="h-4 w-4" aria-hidden="true" />
+                      )}
+                    </button>
+
                     {product.images.length > 1 && (
-                      <div className="pointer-events-none absolute inset-x-3 top-1/2 flex -translate-y-1/2 justify-between">
+                      <div className="pointer-events-none absolute inset-x-3 top-1/2 z-10 flex -translate-y-1/2 justify-between">
                         <button
                           type="button"
-                          onClick={() =>
+                          onMouseEnter={(e) => {
+                            e.stopPropagation();
+                            setIsHoveringImage(false);
+                          }}
+                          onMouseMove={(e) => e.stopPropagation()}
+                          onClick={(e) => {
+                            e.stopPropagation();
                             setActiveImageIndex(
                               (prev) => (prev - 1 + product.images.length) % product.images.length
-                            )
-                          }
+                            );
+                          }}
                           aria-label="Previous product image"
                           className="pointer-events-auto flex h-10 w-10 items-center justify-center rounded-full bg-[#FFF9F5]/90 text-[#49243E] shadow-sm transition-colors hover:bg-[#FFF9F5]"
                         >
@@ -212,15 +392,48 @@ export function QuickViewModal({
                         </button>
                         <button
                           type="button"
-                          onClick={() =>
-                            setActiveImageIndex((prev) => (prev + 1) % product.images.length)
-                          }
+                          onMouseEnter={(e) => {
+                            e.stopPropagation();
+                            setIsHoveringImage(false);
+                          }}
+                          onMouseMove={(e) => e.stopPropagation()}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setActiveImageIndex((prev) => (prev + 1) % product.images.length);
+                          }}
                           aria-label="Next product image"
                           className="pointer-events-auto flex h-10 w-10 items-center justify-center rounded-full bg-[#FFF9F5]/90 text-[#49243E] shadow-sm transition-colors hover:bg-[#FFF9F5]"
                         >
                           <ChevronRight className="h-4 w-4" aria-hidden="true" />
                         </button>
                       </div>
+                    )}
+                  </div>
+
+                  {/* Subtle Editorial Zoom Caption */}
+                  <div className="mt-2.5 flex items-center justify-between gap-2 text-xs text-[#49243E]/65">
+                    <span className="hidden md:inline">
+                      Hover photo to magnify detail · Click for{' '}
+                      <span className="tabular-nums">
+                        {zoomScale === DEFAULT_ZOOM_SCALE ? '3.5×' : '2.5×'}
+                      </span>
+                    </span>
+                    <span className="md:hidden">
+                      {isZoomLocked
+                        ? 'Drag across photo to pan · Tap zoom icon to exit'
+                        : 'Tap photo or zoom icon to inspect fabric detail'}
+                    </span>
+                    {isZoomLocked && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsZoomLocked(false);
+                          setZoomScale(DEFAULT_ZOOM_SCALE);
+                        }}
+                        className="shrink-0 font-medium text-[#49243E] underline underline-offset-2 transition-colors hover:text-[#B76E79]"
+                      >
+                        Reset
+                      </button>
                     )}
                   </div>
 
@@ -251,8 +464,49 @@ export function QuickViewModal({
                   )}
                 </div>
 
-                {/* Details Column */}
-                <div className="flex flex-col justify-between md:col-span-6">
+                {/* Details Column (hosts desktop Magnified Detail View overlay on hover) */}
+                <div className="relative flex flex-col justify-between md:col-span-6">
+                  {/* Desktop Magnified Detail View Panel */}
+                  <div
+                    aria-hidden={!isZoomVisible}
+                    className={`pointer-events-none absolute inset-0 z-20 hidden flex-col bg-[#FFF9F5] md:flex ${
+                      prefersReducedMotion
+                        ? ''
+                        : 'transition-all duration-200 ease-in-out'
+                    } ${
+                      isZoomVisible
+                        ? 'scale-100 opacity-100'
+                        : 'scale-[0.985] opacity-0'
+                    }`}
+                  >
+                    <div className="relative aspect-[3/4] w-full overflow-hidden rounded-2xl border border-[#49243E]/18 bg-[#F8F1ED] shadow-2xl">
+                      <div
+                        style={{
+                          transformOrigin: '0 0',
+                          transform: `translate3d(${detailTranslateX}%, ${detailTranslateY}%, 0) scale(${zoomScale})`,
+                        }}
+                        className="h-full w-full will-change-transform"
+                      >
+                        <BoutiqueImage
+                          src={activeImageSrc}
+                          alt={`${product.name} magnified fabric detail`}
+                          loading="eager"
+                          fallbackTitle={product.name}
+                          className="h-full w-full object-cover object-top"
+                        />
+                      </div>
+
+                      <div className="absolute inset-x-0 bottom-0 flex items-end justify-between gap-3 bg-gradient-to-t from-[#242124]/75 via-[#242124]/25 to-transparent px-4 pb-3.5 pt-10 text-xs text-[#FFF9F5]">
+                        <span className="truncate font-medium">
+                          {product.fabricNote || 'Magnified Garment Detail'}
+                        </span>
+                        <span className="shrink-0 font-medium tabular-nums text-[#F3D5DF]">
+                          {zoomScale.toFixed(1)}× Detail
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
                   <div>
                     <h2
                       id="quick-view-title"
