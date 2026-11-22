@@ -408,80 +408,7 @@ test('Express + SQLite: profile/prefs/addresses/payment refs CRUD, cancel vs ret
       customerA.csrfToken
     );
 
-    // 5. Cancellation vs Return separation + Edit Reason + Pre-dispatch Delivery Edit
-    const cancelSubmit = await jsonReq<{
-      order: {
-        status: string;
-        fulfillmentStatus: string;
-        cancelRequest: { status: string; reason: string; type: string } | null;
-        returnRequest: unknown;
-      };
-    }>(
-      baseUrl,
-      customerA.jar,
-      'POST',
-      `/api/account/orders/${encodeURIComponent(orderId)}/request`,
-      { type: 'cancel', reason: 'Need to change delivery timings.' },
-      customerA.csrfToken
-    );
-    assert.equal(cancelSubmit.status, 200);
-    assert.equal(cancelSubmit.data.order.cancelRequest?.type, 'cancel');
-    assert.equal(cancelSubmit.data.order.cancelRequest?.status, 'pending');
-    assert.equal(cancelSubmit.data.order.returnRequest, null);
-    assert.equal(
-      cancelSubmit.data.order.fulfillmentStatus,
-      'placed',
-      'Submitting cancellation must NEVER set fulfillmentStatus to return_requested'
-    );
-    assert.notEqual(cancelSubmit.data.order.status, 'return_requested');
-
-    // Admin sees identical separated cancelRequest and 'placed' fulfillment
-    const adminOrdersBeforeWithdraw = await jsonReq<{
-      items: Array<{
-        id: string;
-        fulfillmentStatus: string;
-        shippingAddress: string;
-        cancelRequest: { status: string; reason: string } | null;
-        returnRequest: unknown;
-      }>;
-    }>(baseUrl, owner.jar, 'GET', '/api/admin/orders?page=1&pageSize=20', undefined, ownerCsrf);
-    const adminOrder1 = adminOrdersBeforeWithdraw.data.items.find((o) => o.id === orderId);
-    assert.ok(adminOrder1);
-    assert.equal(adminOrder1.fulfillmentStatus, 'placed');
-    assert.equal(adminOrder1.cancelRequest?.status, 'pending');
-    assert.equal(adminOrder1.returnRequest, null);
-    assert.equal(adminOrder1.shippingAddress, 'Flat 204, Jubilee Enclave, Hyderabad, Telangana - 500033');
-
-    // Customer edits cancellation reason
-    const cancelEdit = await jsonReq<{
-      order: { cancelRequest: { reason: string; status: string } | null };
-    }>(
-      baseUrl,
-      customerA.jar,
-      'PATCH',
-      `/api/account/orders/${encodeURIComponent(orderId)}/request`,
-      { type: 'cancel', reason: 'Ordered another shade instead.' },
-      customerA.csrfToken
-    );
-    assert.equal(cancelEdit.status, 200);
-    assert.equal(cancelEdit.data.order.cancelRequest?.reason, 'Ordered another shade instead.');
-
-    // Customer withdraws pending cancellation request
-    const withdrawRes = await jsonReq<{
-      order: { fulfillmentStatus: string; cancelRequest: { status: string } | null };
-    }>(
-      baseUrl,
-      customerA.jar,
-      'POST',
-      `/api/account/orders/${encodeURIComponent(orderId)}/request/withdraw`,
-      { type: 'cancel' },
-      customerA.csrfToken
-    );
-    assert.equal(withdrawRes.status, 200);
-    assert.equal(withdrawRes.data.order.cancelRequest?.status, 'withdrawn');
-    assert.equal(withdrawRes.data.order.fulfillmentStatus, 'placed');
-
-    // Pre-dispatch delivery edit succeeds while status is 'placed'
+    // 5. Pre-dispatch delivery edit succeeds while status is 'placed'
     const delivEditOk = await jsonReq<{
       order: { customerPhone: string; shippingAddress: string; deliveryDetailsEditedAt: number | null };
     }>(
@@ -532,7 +459,7 @@ test('Express + SQLite: profile/prefs/addresses/payment refs CRUD, cancel vs ret
     );
     assert.equal(delivEditLocked.status, 409);
 
-    // 6. Customer turns off cancelReturnUpdates pref, submits cancel again, admin approves -> idempotent stock restore once
+    // 6. Customer turns off cancelReturnUpdates pref and cancels order directly -> immediate 'cancelled' + idempotent stock restore once
     await jsonReq(
       baseUrl,
       customerA.jar,
@@ -550,21 +477,7 @@ test('Express + SQLite: profile/prefs/addresses/payment refs CRUD, cancel vs ret
       customerA.csrfToken
     );
 
-    const cancelResubmit = await jsonReq<{
-      order: { fulfillmentStatus: string; cancelRequest: { status: string } | null };
-    }>(
-      baseUrl,
-      customerA.jar,
-      'POST',
-      `/api/account/orders/${encodeURIComponent(orderId)}/request`,
-      { type: 'cancel', reason: 'Event postponed.' },
-      customerA.csrfToken
-    );
-    assert.equal(cancelResubmit.status, 200);
-    assert.equal(cancelResubmit.data.order.fulfillmentStatus, 'packed');
-    assert.equal(cancelResubmit.data.order.cancelRequest?.status, 'pending');
-
-    const notifsBeforeResolve = await jsonReq<{ items: Array<{ id: string; type: string }> }>(
+    const notifsBeforeCancel = await jsonReq<{ items: Array<{ id: string; type: string }> }>(
       baseUrl,
       customerA.jar,
       'GET',
@@ -572,39 +485,66 @@ test('Express + SQLite: profile/prefs/addresses/payment refs CRUD, cancel vs ret
       undefined,
       customerA.csrfToken
     );
-    const reqNotifCountBefore = notifsBeforeResolve.data.items.filter(
+    const reqNotifCountBefore = notifsBeforeCancel.data.items.filter(
       (n) => n.type === 'request_update'
     ).length;
 
-    const approveCancel = await jsonReq<{
+    const cancelDirect = await jsonReq<{
       order: {
+        status: string;
         fulfillmentStatus: string;
+        refundStatus: string;
+        cancelledBy: string | null;
+        cancelledAt: number | null;
         stockRestoredAt: number | null;
-        cancelRequest: { status: string; resolutionNote?: string } | null;
+        cancelRequest: { status: string; type: string } | null;
+        returnRequest: unknown;
       };
     }>(
       baseUrl,
-      owner.jar,
+      customerA.jar,
       'POST',
-      `/api/admin/orders/${encodeURIComponent(orderId)}/resolve-request`,
-      { decision: 'approved', requestType: 'cancel', note: 'Approved & stock restored' },
-      ownerCsrf
+      `/api/account/orders/${encodeURIComponent(orderId)}/cancel`,
+      { reason: 'Event postponed.' },
+      customerA.csrfToken
     );
-    assert.equal(approveCancel.status, 200);
-    assert.equal(approveCancel.data.order.fulfillmentStatus, 'cancelled');
-    assert.equal(approveCancel.data.order.cancelRequest?.status, 'approved');
-    assert.ok(approveCancel.data.order.stockRestoredAt);
+    assert.equal(cancelDirect.status, 200);
+    assert.equal(cancelDirect.data.order.status, 'cancelled');
+    assert.equal(cancelDirect.data.order.fulfillmentStatus, 'cancelled');
+    assert.equal(cancelDirect.data.order.refundStatus, 'not_required');
+    assert.equal(cancelDirect.data.order.cancelledBy, 'customer');
+    assert.ok(cancelDirect.data.order.cancelledAt);
+    assert.ok(cancelDirect.data.order.stockRestoredAt);
+    assert.equal(cancelDirect.data.order.returnRequest, null);
 
-    // Repeated approve fails with 409 and must NOT double-restore stock
-    const doubleApprove = await jsonReq<{ code?: string }>(
+    // Admin immediately sees 'cancelled' (never stale 'pending'/'placed') and preserved shipping snapshot
+    const adminOrdersAfterCancel = await jsonReq<{
+      items: Array<{
+        id: string;
+        status: string;
+        fulfillmentStatus: string;
+        shippingAddress: string;
+        returnRequest: unknown;
+      }>;
+    }>(baseUrl, owner.jar, 'GET', '/api/admin/orders?page=1&pageSize=20', undefined, ownerCsrf);
+    const adminCancelledOrder = adminOrdersAfterCancel.data.items.find((o) => o.id === orderId);
+    assert.ok(adminCancelledOrder);
+    assert.equal(adminCancelledOrder.status, 'cancelled');
+    assert.equal(adminCancelledOrder.fulfillmentStatus, 'cancelled');
+    assert.equal(adminCancelledOrder.returnRequest, null);
+    assert.equal(adminCancelledOrder.shippingAddress, 'Villa 12, Kondapur, Hyderabad, Telangana - 500084');
+
+    // Repeated cancel is idempotent and must NOT double-restore stock
+    const repeatCancel = await jsonReq<{ alreadyCancelled?: boolean }>(
       baseUrl,
-      owner.jar,
+      customerA.jar,
       'POST',
-      `/api/admin/orders/${encodeURIComponent(orderId)}/resolve-request`,
-      { decision: 'approved', requestType: 'cancel' },
-      ownerCsrf
+      `/api/account/orders/${encodeURIComponent(orderId)}/cancel`,
+      { reason: 'Event postponed.' },
+      customerA.csrfToken
     );
-    assert.equal(doubleApprove.status, 409);
+    assert.equal(repeatCancel.status, 200);
+    assert.equal(repeatCancel.data.alreadyCancelled, true);
 
     const catalogAfterRestore = (await (await fetch(`${baseUrl}/api/products`)).json()) as {
       items: Array<{ id: string; variants: Array<{ id: string; stockQty: number }> }>;
@@ -627,6 +567,78 @@ test('Express + SQLite: profile/prefs/addresses/payment refs CRUD, cancel vs ret
       (n) => n.type === 'request_update'
     ).length;
     assert.equal(reqNotifCountAfter, reqNotifCountBefore);
+
+    // 6b. Delivered order return request: submit -> edit reason -> withdraw -> resubmit -> admin approve
+    const retOrderRes = await jsonReq<{ order: { id: string } }>(
+      baseUrl,
+      customerA.jar,
+      'POST',
+      '/api/orders',
+      {
+        paymentMethod: 'cod',
+        idempotencyKey: 'idem_sync_cod_return_1',
+        customerName: 'Ananya Rao',
+        customerEmail: 'ananya.sync@example.com',
+        customerPhone: '9849011223',
+        shippingAddress: 'Flat 204, Jubilee Enclave, Hyderabad',
+        items: [{ productId: product.id, variantId: variant.id, quantity: 1 }],
+      },
+      customerA.csrfToken
+    );
+    assert.equal(retOrderRes.status, 201);
+    const retOrderId = retOrderRes.data.order.id;
+
+    await jsonReq(
+      baseUrl,
+      owner.jar,
+      'PATCH',
+      `/api/admin/orders/${encodeURIComponent(retOrderId)}/status`,
+      { status: 'delivered' },
+      ownerCsrf
+    );
+
+    const retSubmit = await jsonReq<{
+      order: { fulfillmentStatus: string; returnRequest: { status: string; reason: string; type: string } | null; cancelRequest: unknown };
+    }>(
+      baseUrl,
+      customerA.jar,
+      'POST',
+      `/api/account/orders/${encodeURIComponent(retOrderId)}/request`,
+      { type: 'return', reason: 'Sleeve fit is slightly tight.' },
+      customerA.csrfToken
+    );
+    assert.equal(retSubmit.status, 200);
+    assert.equal(retSubmit.data.order.fulfillmentStatus, 'delivered');
+    assert.equal(retSubmit.data.order.returnRequest?.type, 'return');
+    assert.equal(retSubmit.data.order.returnRequest?.status, 'pending');
+    assert.equal(retSubmit.data.order.cancelRequest, null);
+
+    const retEdit = await jsonReq<{
+      order: { returnRequest: { reason: string; status: string } | null };
+    }>(
+      baseUrl,
+      customerA.jar,
+      'PATCH',
+      `/api/account/orders/${encodeURIComponent(retOrderId)}/request`,
+      { type: 'return', reason: 'Need a larger size after trying on.' },
+      customerA.csrfToken
+    );
+    assert.equal(retEdit.status, 200);
+    assert.equal(retEdit.data.order.returnRequest?.reason, 'Need a larger size after trying on.');
+
+    const retWithdraw = await jsonReq<{
+      order: { fulfillmentStatus: string; returnRequest: { status: string } | null };
+    }>(
+      baseUrl,
+      customerA.jar,
+      'POST',
+      `/api/account/orders/${encodeURIComponent(retOrderId)}/request/withdraw`,
+      { type: 'return' },
+      customerA.csrfToken
+    );
+    assert.equal(retWithdraw.status, 200);
+    assert.equal(retWithdraw.data.order.returnRequest?.status, 'withdrawn');
+    assert.equal(retWithdraw.data.order.fulfillmentStatus, 'delivered');
 
     // Delete notification
     if (notifsAfterResolve.data.items.length > 0) {
@@ -1208,7 +1220,7 @@ test('Clientless Firestore mode: customer edit/delete, cancel vs return separati
     );
     assert.equal(addrRes.ok, true);
 
-    // 3. Place COD order, submit cancellation -> fulfillmentStatus stays 'placed'
+    // 3. Place COD order, customer cancels directly -> immediately 'cancelled' in Firestore
     const orderRes = await handleClientlessApiRequest<{
       order: { id: string; fulfillmentStatus: string };
     }>('/api/orders', 'POST', {
@@ -1222,22 +1234,23 @@ test('Clientless Firestore mode: customer edit/delete, cancel vs return separati
     });
     assert.equal(orderRes.ok, true);
     const fsOrderId = orderRes.ok ? orderRes.data.order.id : '';
-    const stockBeforeCancelApprove = docs.get('products/prod_silk_1')?.data.stock_qty as number;
-    assert.equal(stockBeforeCancelApprove, 5);
+    const stockBeforeCancel = docs.get('products/prod_silk_1')?.data.stock_qty as number;
+    assert.equal(stockBeforeCancel, 5);
 
-    const cancelReqRes = await handleClientlessApiRequest<{
-      order: { fulfillmentStatus: string; cancelRequest: { status: string } | null };
-    }>(`/api/account/orders/${fsOrderId}/request`, 'POST', {
-      type: 'cancel',
+    const cancelDirectRes = await handleClientlessApiRequest<{
+      order: { status: string; fulfillmentStatus: string; cancelledBy: string | null; refundStatus: string };
+    }>(`/api/account/orders/${fsOrderId}/cancel`, 'POST', {
       reason: 'Need a different size.',
     });
-    assert.equal(cancelReqRes.ok, true);
-    if (cancelReqRes.ok) {
-      assert.equal(cancelReqRes.data.order.fulfillmentStatus, 'placed');
-      assert.equal(cancelReqRes.data.order.cancelRequest?.status, 'pending');
+    assert.equal(cancelDirectRes.ok, true);
+    if (cancelDirectRes.ok) {
+      assert.equal(cancelDirectRes.data.order.status, 'cancelled');
+      assert.equal(cancelDirectRes.data.order.fulfillmentStatus, 'cancelled');
+      assert.equal(cancelDirectRes.data.order.cancelledBy, 'customer');
+      assert.equal(cancelDirectRes.data.order.refundStatus, 'not_required');
     }
 
-    // 4. Sign in as owner and check admin activity + request resolution + concurrency guard
+    // 4. Sign in as owner and check admin activity + admin sees 'cancelled' + terminal lock + legacy cancel resolve
     clearClientFirebaseSession();
     await handleClientlessApiRequest('/api/admin/login', 'POST', {
       email: AUTHORIZED_OWNER_EMAIL,
@@ -1262,29 +1275,50 @@ test('Clientless Firestore mode: customer edit/delete, cancel vs return separati
       assert.equal(kavya.addresses?.[0]?.city, 'Bengaluru');
     }
 
-    // Admin approves cancel request -> restores stock once (+1 -> 6) & records stock_restored_at
-    const approveFs = await handleClientlessApiRequest<{
+    // Admin orders immediately show fsOrderId as 'cancelled', excluded from ?status=pending and included in ?status=cancelled
+    const adminPendingRes = await handleClientlessApiRequest<{
+      items: Array<{ id: string; status: string }>;
+      statusCounts?: Record<string, number>;
+    }>('/api/admin/orders?page=1&pageSize=20&status=pending', 'GET');
+    assert.equal(adminPendingRes.ok, true);
+    if (adminPendingRes.ok) {
+      assert.equal(adminPendingRes.data.items.some((o) => o.id === fsOrderId), false);
+    }
+    const adminCancelledRes = await handleClientlessApiRequest<{
+      items: Array<{ id: string; status: string }>;
+      statusCounts?: Record<string, number>;
+    }>('/api/admin/orders?page=1&pageSize=20&status=cancelled', 'GET');
+    assert.equal(adminCancelledRes.ok, true);
+    if (adminCancelledRes.ok) {
+      assert.equal(adminCancelledRes.data.items.some((o) => o.id === fsOrderId && o.status === 'cancelled'), true);
+      assert.equal(adminCancelledRes.data.statusCounts?.cancelled, 1);
+    }
+
+    // Admin cannot reopen a cancelled order back to pending/confirmed (409)
+    const reopenAttempt = await handleClientlessApiRequest(`/api/admin/orders/${fsOrderId}/status`, 'PATCH', {
+      status: 'confirmed',
+    });
+    assert.equal(reopenAttempt.ok, false);
+    if (!reopenAttempt.ok) assert.equal(reopenAttempt.status, 409);
+
+    // Admin approves legacy pending cancel request -> transitions to cancelled cleanly once & second approve fails with 409
+    const approveLegacyFs = await handleClientlessApiRequest<{
       order: { fulfillmentStatus: string; stockRestoredAt: number | null };
-    }>(`/api/admin/orders/${fsOrderId}/resolve-request`, 'POST', {
+    }>('/api/admin/orders/ord_legacy_fs_1/resolve-request', 'POST', {
       decision: 'approved',
       requestType: 'cancel',
-      note: 'Approved in clientless mode',
+      note: 'Approved legacy cancel request',
     });
-    assert.equal(approveFs.ok, true);
-    if (approveFs.ok) {
-      assert.equal(approveFs.data.order.fulfillmentStatus, 'cancelled');
-      assert.ok(approveFs.data.order.stockRestoredAt);
+    assert.equal(approveLegacyFs.ok, true);
+    if (approveLegacyFs.ok) {
+      assert.equal(approveLegacyFs.data.order.fulfillmentStatus, 'cancelled');
     }
-    assert.equal((docs.get('products/prod_silk_1')?.data.stock_qty as number), 6);
-
-    // Second approve hits 409 CONCURRENCY_CONFLICT and does not restore stock again
-    const approveAgain = await handleClientlessApiRequest(`/api/admin/orders/${fsOrderId}/resolve-request`, 'POST', {
+    const approveAgain = await handleClientlessApiRequest('/api/admin/orders/ord_legacy_fs_1/resolve-request', 'POST', {
       decision: 'approved',
       requestType: 'cancel',
     });
     assert.equal(approveAgain.ok, false);
     if (!approveAgain.ok) assert.equal(approveAgain.status, 409);
-    assert.equal((docs.get('products/prod_silk_1')?.data.stock_qty as number), 6);
 
     // Owner delete account is strictly blocked
     const ownerDel = await handleClientlessApiRequest('/api/account/profile', 'DELETE', {

@@ -100,8 +100,11 @@ function BoutiqueShell() {
     queryMode,
     nextPath,
     productSlug,
+    colorParam,
+    variantParam,
     accountSection,
     navigate,
+    updateQueryParams,
     navigateToSection,
   } = useBoutiqueRouter();
 
@@ -115,6 +118,7 @@ function BoutiqueShell() {
   const [quickViewProduct, setQuickViewProduct] = useState<Product | null>(null);
   const [wishlistOpen, setWishlistOpen] = useState(false);
   const [bagOpen, setBagOpen] = useState(false);
+  const [bagInitialStep, setBagInitialStep] = useState<'bag' | 'checkout'>('bag');
   const [stylistOpen, setStylistOpen] = useState(false);
   const [stylistProductContext, setStylistProductContext] =
     useState<WhatsAppStylistProductContext | null>(null);
@@ -398,7 +402,10 @@ function BoutiqueShell() {
             wishlistProducts={wishlistProducts}
             onRemoveWishlistItem={removeFromWishlist}
             onAddToBag={addToBag}
-            onOpenBag={() => setBagOpen(true)}
+            onOpenBag={() => {
+              setBagInitialStep('bag');
+              setBagOpen(true);
+            }}
             onOpenWishlist={() => setWishlistOpen(true)}
             onNavigate={navigate}
           />
@@ -424,7 +431,10 @@ function BoutiqueShell() {
             wishlistCount={loadingCatalog ? wishlistCount : wishlistProducts.length}
             bagCount={bagCount}
             onOpenWishlist={() => setWishlistOpen(true)}
-            onOpenBag={() => setBagOpen(true)}
+            onOpenBag={() => {
+              setBagInitialStep('bag');
+              setBagOpen(true);
+            }}
             onOpenSearch={handleOpenSearch}
             onNavigateAuth={(target, options) => navigate(target, options)}
             onNavigateSection={navigateToSection}
@@ -520,6 +530,11 @@ function BoutiqueShell() {
 
       <QuickViewModal
         product={quickViewProduct}
+        initialColorParam={colorParam}
+        initialVariantParam={variantParam}
+        onSelectColorUrl={(colorSlug) => {
+          updateQueryParams({ color: colorSlug, variant: null });
+        }}
         isWishlisted={quickViewProduct ? isWishlisted(quickViewProduct.id) : false}
         onToggleWishlist={toggleWishlist}
         onAddToBag={addToBag}
@@ -529,6 +544,7 @@ function BoutiqueShell() {
           if (typeof window !== 'undefined' && window.location.pathname.startsWith('/products/')) {
             window.history.replaceState(null, '', '/');
           }
+          setBagInitialStep('checkout');
           setBagOpen(true);
         }}
         onAskStylist={(product, selectedSize, selectedColor) => {
@@ -585,8 +601,12 @@ function BoutiqueShell() {
 
       <BagDrawer
         isOpen={bagOpen}
+        initialStep={bagInitialStep}
         items={bagItems}
-        onClose={() => setBagOpen(false)}
+        onClose={() => {
+          setBagOpen(false);
+          setBagInitialStep('bag');
+        }}
         onUpdateQty={updateItemQty}
         onRemoveItem={removeBagItem}
         onAcceptPriceUpdates={acceptPriceUpdates}

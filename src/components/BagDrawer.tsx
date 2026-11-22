@@ -36,6 +36,7 @@ import { BoutiqueImage } from './BoutiqueImage';
 
 interface BagDrawerProps {
   isOpen: boolean;
+  initialStep?: 'bag' | 'checkout';
   items: BagItem[];
   onClose: () => void;
   onUpdateQty: (productId: string, variantId: string, quantity: number) => void;
@@ -70,6 +71,7 @@ function formatSavedAddressText(addr: CustomerAddress): string {
 
 export function BagDrawer({
   isOpen,
+  initialStep = 'bag',
   items,
   onClose,
   onUpdateQty,
@@ -224,9 +226,12 @@ export function BagDrawer({
   useEffect(() => {
     if (!isOpen) return;
     setReceipt(null);
+    if (initialStep === 'checkout' && items.length > 0) {
+      setCheckoutOpen(true);
+    }
     void revalidateBag();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen, items.length]);
+  }, [isOpen, items.length, initialStep]);
 
   const displaySubtotalPaise =
     validation?.subtotalPaise ??
@@ -911,15 +916,36 @@ export function BagDrawer({
                     {receipt.items.map((line, idx) => (
                       <li
                         key={`${line.sku}-${idx}`}
-                        className="flex items-center justify-between py-2.5 text-sm"
+                        className="flex items-center justify-between gap-3 py-2.5 text-sm"
                       >
-                        <div className="min-w-0 pr-3">
-                          <p className="truncate font-medium text-[#49243E]">
-                            {line.productTitle}
-                          </p>
-                          <p className="text-xs text-[#242124]/65">
-                            {line.variantLabel} &times; {line.quantity}
-                          </p>
+                        <div className="flex min-w-0 items-center gap-3 pr-2">
+                          {line.imageUrl && (
+                            <div className="h-14 w-11 shrink-0 overflow-hidden rounded-lg border border-[#49243E]/10 bg-[#F8F1ED]">
+                              <BoutiqueImage
+                                src={line.imageUrl}
+                                alt={`${line.productTitle}${line.colorName ? ` — ${line.colorName}` : ''}`}
+                                loading="eager"
+                                fallbackTitle={line.productTitle}
+                                className="h-full w-full object-cover object-top"
+                              />
+                            </div>
+                          )}
+                          <div className="min-w-0">
+                            <p className="truncate font-medium text-[#49243E]">
+                              {line.productTitle}
+                            </p>
+                            <p className="text-xs text-[#242124]/65">
+                              {line.colorName || line.size
+                                ? [line.colorName, line.size].filter(Boolean).join(' · ')
+                                : line.variantLabel}{' '}
+                              &times; {line.quantity}
+                            </p>
+                            {line.sku && (
+                              <p className="text-[11px] text-[#49243E]/50 tabular-nums">
+                                SKU: {line.sku}
+                              </p>
+                            )}
+                          </div>
                         </div>
                         <span className="shrink-0 font-semibold tabular-nums text-[#242124]">
                           {formatPaiseINR(line.lineTotalPaise)}
@@ -1141,9 +1167,25 @@ export function BagDrawer({
                               <h3 className="line-clamp-2 font-serif text-base font-semibold leading-snug text-[#49243E]">
                                 {vItem?.title || item.fallbackTitle}
                               </h3>
-                              <p className="mt-0.5 text-xs text-[#242124]/65">
-                                {vItem?.variantLabel || item.fallbackVariant}
+                              <p className="mt-0.5 text-xs text-[#242124]/70">
+                                {vItem?.colorName || item.fallbackColorName ? (
+                                  <>
+                                    <span className="font-medium text-[#49243E]/85">
+                                      {vItem?.colorName || item.fallbackColorName}
+                                    </span>
+                                    {(vItem?.size || item.fallbackSize) && (
+                                      <span> · Size {vItem?.size || item.fallbackSize}</span>
+                                    )}
+                                  </>
+                                ) : (
+                                  vItem?.variantLabel || item.fallbackVariant
+                                )}
                               </p>
+                              {(vItem?.sku || item.fallbackSku) && (
+                                <p className="mt-0.5 text-[11px] text-[#49243E]/50 tabular-nums">
+                                  SKU: {vItem?.sku || item.fallbackSku}
+                                </p>
+                              )}
 
                               {!unavailable && (
                                 <div className="mt-1 flex items-baseline gap-2">

@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Eye, Heart } from 'lucide-react';
 import { motion } from 'motion/react';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 import { Product } from '../types/boutique';
+import { countActiveColors, normalizeProductColors } from '../utils/colorVariants';
 import { formatINR } from '../utils/format';
 import { BoutiqueImage } from './BoutiqueImage';
 
@@ -23,7 +24,17 @@ export function ProductCard({
   const [isHovered, setIsHovered] = useState(false);
   const [tilt, setTilt] = useState({ rx: 0, ry: 0 });
 
-  const hasSecondaryImage = product.images.length > 1;
+  const normalizedColors = useMemo(() => normalizeProductColors(product), [product]);
+  const activeColorCount = useMemo(() => countActiveColors(product), [product]);
+  const primaryColor = normalizedColors.find((c) => c.inStock) || normalizedColors[0];
+  const cardImages = useMemo(() => {
+    if (primaryColor && primaryColor.images.length > 0) {
+      return primaryColor.images;
+    }
+    return product.images;
+  }, [primaryColor, product.images]);
+
+  const hasSecondaryImage = cardImages.length > 1;
 
   const handleMouseMove = (event: React.MouseEvent<HTMLElement>) => {
     if (prefersReducedMotion) return;
@@ -73,8 +84,8 @@ export function ProductCard({
           className="block h-full w-full text-left focus-visible:outline-offset-[-4px]"
         >
           <BoutiqueImage
-            src={product.images[0]?.src || ''}
-            alt={product.images[0]?.alt || product.name}
+            src={cardImages[0]?.src || product.images[0]?.src || ''}
+            alt={cardImages[0]?.alt || product.images[0]?.alt || product.name}
             loading="lazy"
             fallbackTitle={product.name}
             className={`h-full w-full object-cover object-top transition-all duration-700 ease-out ${
@@ -86,8 +97,8 @@ export function ProductCard({
 
           {hasSecondaryImage && (
             <BoutiqueImage
-              src={product.images[1].src}
-              alt={product.images[1].alt}
+              src={cardImages[1].src}
+              alt={cardImages[1].alt}
               loading="lazy"
               fallbackTitle={product.name}
               className={`absolute inset-0 h-full w-full object-cover object-top transition-all duration-700 ease-out ${
@@ -144,19 +155,31 @@ export function ProductCard({
             </button>
           </h3>
 
-          {/* Color Swatches & Sizes */}
-          <div className="mt-2.5 flex items-center gap-1.5" aria-label="Available colors">
-            {product.colors.map((color) => (
-              <span
-                key={color.name}
-                title={color.name}
-                className="h-3.5 w-3.5 rounded-full border border-[#242124]/20 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.35)]"
-                style={{ backgroundColor: color.hex }}
-              />
-            ))}
-            <span className="ml-1 text-[11px] text-[#242124]/58 truncate">
-              {product.sizes.join(' · ')}
-            </span>
+          {/* Colour availability & sizes */}
+          <div className="mt-2.5 space-y-1">
+            {activeColorCount > 1 && (
+              <p className="text-[11px] font-medium text-[#49243E]/75">
+                Available in {activeColorCount} colours
+              </p>
+            )}
+            <div className="flex items-center gap-1.5" aria-label="Available colours and sizes">
+              {normalizedColors.slice(0, 5).map((color) => (
+                <span
+                  key={color.id}
+                  title={color.name}
+                  className="h-3.5 w-3.5 shrink-0 rounded-full border border-[#242124]/20 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.35)]"
+                  style={{ backgroundColor: color.hex }}
+                />
+              ))}
+              {normalizedColors.length > 5 && (
+                <span className="text-[10px] font-medium text-[#49243E]/65 tabular-nums">
+                  +{normalizedColors.length - 5}
+                </span>
+              )}
+              <span className="ml-1 truncate text-[11px] text-[#242124]/58">
+                {product.sizes.join(' · ')}
+              </span>
+            </div>
           </div>
         </div>
 

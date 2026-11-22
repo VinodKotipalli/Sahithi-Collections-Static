@@ -40,6 +40,7 @@ export function normalizeAdminOverview(value: unknown): AdminOverviewResponse {
     'totalCategories',
     'totalOrders',
     'pendingOrders',
+    'cancelledOrders',
     'totalRevenuePaise',
     'unreadMessages',
     'totalMessages',
@@ -63,37 +64,34 @@ export function normalizeAdminOverview(value: unknown): AdminOverviewResponse {
     recentOrders: rows(data.recentOrders).map((o) => {
       const history = parseOrderHistory(o.statusHistory ?? o.status_history ?? o.status_history_json);
       const rawPaymentMethod = text(o.paymentMethod ?? o.payment_method);
+      const rzPaymentId = o.razorpayPaymentId ?? o.razorpay_payment_id ?? null;
       const norm = normalizeOrderRequestsAndStatus({
         rawStatus: text(o.status) || undefined,
         rawFulfillmentStatus: text(o.fulfillmentStatus ?? o.fulfillment_status) || undefined,
         rawCancelRequest: o.cancelRequest ?? o.cancel_request ?? o.cancel_request_json,
         rawReturnRequest: o.returnRequest ?? o.return_request ?? o.return_request_json,
+        rawPaymentStatus: o.paymentStatus ?? o.payment_status,
+        rawRefundStatus: o.refundStatus ?? o.refund_status,
+        rawCancelledAt: o.cancelledAt ?? o.cancelled_at,
+        rawCancelledBy: o.cancelledBy ?? o.cancelled_by,
+        rawCancelReason: o.cancelReason ?? o.cancel_reason,
+        razorpayPaymentId: rzPaymentId,
         history,
         paymentMethod: rawPaymentMethod || undefined,
       });
       const fulfillmentStatus: OrderFulfillmentStatus =
+        norm.fulfillmentStatus === 'pending' ||
+        norm.fulfillmentStatus === 'placed' ||
         norm.fulfillmentStatus === 'confirmed' ||
         norm.fulfillmentStatus === 'packed' ||
         norm.fulfillmentStatus === 'shipped' ||
         norm.fulfillmentStatus === 'delivered' ||
         norm.fulfillmentStatus === 'cancelled' ||
-        norm.fulfillmentStatus === 'return_requested' ||
-        norm.fulfillmentStatus === 'returned' ||
-        norm.fulfillmentStatus === 'pending'
+        norm.fulfillmentStatus === 'returned'
           ? (norm.fulfillmentStatus as OrderFulfillmentStatus)
-          : 'placed';
+          : 'unknown';
       const status = fulfillmentStatus;
-      const rzPaymentId = o.razorpayPaymentId ?? o.razorpay_payment_id ?? null;
-      const rawPaymentStatus =
-        text(o.paymentStatus ?? o.payment_status) ||
-        (rzPaymentId ? 'paid' : 'unpaid');
-      const paymentStatus: OrderPaymentStatus =
-        rawPaymentStatus === 'paid' ||
-        rawPaymentStatus === 'pending' ||
-        rawPaymentStatus === 'failed' ||
-        rawPaymentStatus === 'refunded'
-          ? rawPaymentStatus
-          : 'unpaid';
+      const paymentStatus: OrderPaymentStatus = norm.paymentStatus;
       const paymentMethod: 'cod' | 'razorpay' | undefined =
         rawPaymentMethod === 'razorpay' || rawPaymentMethod === 'cod'
           ? rawPaymentMethod
@@ -113,6 +111,7 @@ export function normalizeAdminOverview(value: unknown): AdminOverviewResponse {
         shippingAddress: text(o.shippingAddress ?? o.shipping_address),
         status,
         paymentStatus,
+        refundStatus: norm.refundStatus,
         fulfillmentStatus,
         paymentMethod,
         paymentCollectedAt:
@@ -142,6 +141,9 @@ export function normalizeAdminOverview(value: unknown): AdminOverviewResponse {
         totalPaise: number(o.totalPaise ?? o.total_paise),
         currency: text(o.currency) || 'INR',
         statusHistory: parseJsonField(o.statusHistory ?? o.status_history ?? o.status_history_json, []),
+        cancelledAt: norm.cancelledAt,
+        cancelledBy: norm.cancelledBy,
+        cancelReason: norm.cancelReason,
         cancelRequest: norm.cancelRequest,
         returnRequest: norm.returnRequest,
         hiddenByCustomer: Boolean(o.hiddenByCustomer ?? o.hidden_by_customer),

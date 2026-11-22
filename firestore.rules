@@ -283,34 +283,45 @@ service cloud.firestore {
             (
               isOwner()
               && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-                'status', 'fulfillment_status', 'payment_status', 'payment_collected_at', 'payment_collected_by',
+                'status', 'fulfillment_status', 'payment_status', 'refund_status',
+                'cancelled_at', 'cancelled_by', 'cancel_reason',
+                'payment_collected_at', 'payment_collected_by',
                 'status_history', 'status_history_json',
                 'cancel_request', 'cancel_request_json',
                 'return_request', 'return_request_json',
                 'stock_restored_at', 'updated_at'
               ])
-              && request.resource.data.status in ['pending', 'placed', 'confirmed', 'packed', 'shipped', 'delivered', 'cancelled', 'return_requested', 'returned']
+              && request.resource.data.status in ['pending', 'placed', 'confirmed', 'packed', 'shipped', 'delivered', 'cancelled', 'returned']
+              && (!(currentOrderFulfillment(resource.data) in ['cancelled', 'returned']) || request.resource.data.status == currentOrderFulfillment(resource.data))
+              && (!('refund_status' in request.resource.data) || request.resource.data.refund_status in ['none', 'not_required', 'pending_refund', 'refund_initiated', 'refunded'])
             )
             || (
               isSignedIn()
               && resource.data.customer_user_id == request.auth.uid
               && (
                 (
-                  request.resource.data.diff(resource.data).affectedKeys().hasOnly(['cancel_request', 'cancel_request_json', 'status_history', 'status_history_json', 'updated_at'])
-                  && (
-                    currentOrderFulfillment(resource.data) in ['pending', 'placed', 'confirmed', 'packed']
-                    || (
-                      currentOrderFulfillment(resource.data) == 'return_requested'
-                      && 'return_request' in resource.data
-                      && resource.data.return_request is map
-                      && resource.data.return_request.type == 'cancel'
-                    )
-                  )
-                  && request.resource.data.cancel_request is map
-                  && request.resource.data.cancel_request.status in ['pending', 'withdrawn']
-                  && request.resource.data.cancel_request.reason is string
-                  && request.resource.data.cancel_request.reason.size() >= 3
-                  && request.resource.data.cancel_request.reason.size() <= 500
+                  request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                    'status', 'fulfillment_status',
+                    'cancelled_at', 'cancelled_by', 'cancel_reason', 'refund_status',
+                    'cancel_request', 'cancel_request_json',
+                    'status_history', 'status_history_json',
+                    'updated_at'
+                  ])
+                  && currentOrderFulfillment(resource.data) in ['pending', 'placed', 'confirmed', 'packed']
+                  && request.resource.data.status == 'cancelled'
+                  && request.resource.data.fulfillment_status == 'cancelled'
+                  && request.resource.data.cancelled_by == 'customer'
+                  && request.resource.data.cancelled_at is number
+                  && request.resource.data.cancelled_at > 0
+                  && (request.resource.data.cancel_reason == null || (request.resource.data.cancel_reason is string && request.resource.data.cancel_reason.size() <= 500))
+                  && request.resource.data.refund_status == (('payment_status' in resource.data && resource.data.payment_status == 'paid') ? 'pending_refund' : 'not_required')
+                  && (!('cancel_request' in request.resource.data) || (
+                    request.resource.data.cancel_request is map
+                    && request.resource.data.cancel_request.status == 'approved'
+                    && request.resource.data.cancel_request.reason is string
+                    && request.resource.data.cancel_request.reason.size() <= 500
+                  ))
+                  && request.resource.data.updated_at is number
                 )
                 || (
                   request.resource.data.diff(resource.data).affectedKeys().hasOnly(['return_request', 'return_request_json', 'status_history', 'status_history_json', 'updated_at'])

@@ -21,6 +21,7 @@
     "catalog:cutover": "tsx server/catalog-cli.ts cutover",
     "catalog:verify": "tsx server/catalog-cli.ts verify",
     "catalog:rollback": "tsx server/catalog-cli.ts rollback",
+    "repair:cancelled-orders": "tsx server/repair-cancelled-orders.ts",
     "build:static": "vite build --mode static"
   },
   "dependencies": {

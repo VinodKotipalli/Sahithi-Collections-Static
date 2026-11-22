@@ -90,7 +90,7 @@ export function AdminOverviewSection({
     {
       label: 'Total Orders',
       value: String(metrics.totalOrders),
-      detail: `${metrics.pendingOrders} awaiting fulfillment`,
+      detail: `${metrics.pendingOrders} awaiting fulfillment · ${metrics.cancelledOrders ?? 0} cancelled`,
       icon: ShoppingBag,
       onClick: () => onNavigateTab('orders'),
     },
@@ -257,7 +257,17 @@ export function AdminOverviewSection({
                     : isCod
                       ? 'COD · payment due'
                       : `Payment ${pay}`;
-                const ful = (order.fulfillmentStatus || order.status || 'placed').replace(/_/g, ' ');
+                const rawFul = order.status || order.fulfillmentStatus || 'unknown';
+                const ful =
+                  rawFul === 'unknown' ? 'unknown (needs review)' : rawFul.replace(/_/g, ' ');
+                const refundTag =
+                  order.refundStatus === 'pending_refund'
+                    ? ' · Refund pending'
+                    : order.refundStatus === 'refund_initiated'
+                      ? ' · Refund initiated'
+                      : order.refundStatus === 'refunded'
+                        ? ' · Refunded'
+                        : '';
                 return (
                   <li key={order.id} className="flex items-center justify-between gap-3 py-3 text-xs">
                     <div className="min-w-0">
@@ -268,8 +278,15 @@ export function AdminOverviewSection({
                         </span>
                       </p>
                       <p className="mt-0.5 truncate tabular-nums text-[#242124]/60">
-                        {payLabel} · Fulfillment {ful}
-                        {order.cancelRequest?.status === 'pending' ? ' · Cancel requested' : ''}
+                        <span className={rawFul === 'cancelled' ? 'font-semibold text-[#9B2C3E]' : ''}>
+                          Order: {ful}
+                        </span>
+                        {' · '}
+                        {payLabel}
+                        {refundTag}
+                        {rawFul !== 'cancelled' && order.cancelRequest?.status === 'pending'
+                          ? ' · Cancel requested'
+                          : ''}
                         {order.returnRequest?.status === 'pending' ? ' · Return requested' : ''}
                         {' · '}
                         {formatTimestamp(order.createdAt)}

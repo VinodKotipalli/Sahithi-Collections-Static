@@ -10,13 +10,18 @@ import {
   mergeStorefrontContent,
 } from '../../server/storefront-defaults.ts';
 import {
+  isOrderAwaitingDispatch,
   normalizeOrderRequestsAndStatus,
+  normalizePaymentAndRefundStatus,
+  normalizeRawOrderStatusValue,
   parseNotificationPrefs,
   parseOrderHistory,
   PRE_CUTOFF_DELIVERY_EDIT_STATES,
   PRE_SHIPPING_CANCEL_STATES,
   RETURN_ELIGIBLE_STATES,
+  VALID_FULFILLMENT_STATES,
   validateNonSensitivePaymentMethodInput,
+  validateOrderStatusTransition,
   type NotificationPreferencesData,
 } from '../../server/order-utils.ts';
 import { PRODUCTS, SEED_SKU_BY_ID } from '../config/products';
@@ -25,7 +30,15 @@ import type {
   LoyaltyConfig,
   OrderReturnRequest,
   OrderStatusHistoryEntry,
+  ProductColor,
 } from '../types/boutique';
+import {
+  formatVariantDisplayLabel,
+  isVariantColorActiveInMetadata,
+  makeStableColorId,
+  resolveVariantSnapshotImageUrl,
+  validateColorVariantMatrix,
+} from '../utils/colorVariants';
 
 export const AUTHORIZED_OWNER_EMAIL = 'saivinodkotipalli2003@gmail.com';
 const PASSWORD_MIN_LENGTH = 8;
@@ -1026,7 +1039,7 @@ function parseJsonOrValue<T>(raw: unknown, fallback: T): T {
   return raw && typeof raw === 'object' ? (raw as T) : fallback;
 }
 
-function serializeClientOrderDoc(o: Record<string, unknown>) {
+export function serializeClientOrderDoc(o: Record<string, unknown>) {
   const createdAt = Number(o.created_at || Date.now());
   const updatedAt = Number(o.updated_at || createdAt);
   const rzPaymentId =
@@ -1034,12 +1047,7 @@ function serializeClientOrderDoc(o: Record<string, unknown>) {
   const rzOrderId =
     typeof o.razorpay_order_id === 'string' && o.razorpay_order_id ? o.razorpay_order_id : null;
   const paymentMethod = String(o.payment_method || (rzOrderId || rzPaymentId ? 'razorpay' : 'cod'));
-  const paymentStatus = String(o.payment_status || (rzPaymentId ? 'paid' : 'unpaid'));
   const parsedHistory = parseOrderHistory(o.status_history ?? o.status_history_json);
-  const statusHistory: OrderStatusHistoryEntry[] =
-    parsedHistory.length > 0
-      ? (parsedHistory as OrderStatusHistoryEntry[])
-      : [{ status: paymentMethod === 'cod' ? 'placed' : 'confirmed', note: 'Order placed', actor: 'system', at: createdAt }];
 
   const norm = normalizeOrderRequestsAndStatus({
     rawStatus: typeof o.status === 'string' ? o.status : undefined,
@@ -1047,9 +1055,20 @@ function serializeClientOrderDoc(o: Record<string, unknown>) {
       typeof o.fulfillment_status === 'string' ? o.fulfillment_status : undefined,
     rawCancelRequest: o.cancel_request ?? o.cancel_request_json,
     rawReturnRequest: o.return_request ?? o.return_request_json,
-    history: statusHistory,
+    rawPaymentStatus: o.payment_status,
+    rawRefundStatus: o.refund_status,
+    rawCancelledAt: o.cancelled_at,
+    rawCancelledBy: o.cancelled_by,
+    rawCancelReason: o.cancel_reason,
+    razorpayPaymentId: rzPaymentId,
+    history: parsedHistory,
     paymentMethod,
   });
+
+  const statusHistory: OrderStatusHistoryEntry[] =
+    parsedHistory.length > 0
+      ? (parsedHistory as OrderStatusHistoryEntry[])
+      : [];
 
   const subtotalPaise = Number(o.subtotal_paise || 0);
   const totalPaise = Number(o.total_paise || 0);
@@ -1064,7 +1083,8 @@ function serializeClientOrderDoc(o: Record<string, unknown>) {
     customerEmail: String(o.customer_email || ''),
     shippingAddress: String(o.shipping_address || ''),
     status: norm.status,
-    paymentStatus,
+    paymentStatus: norm.paymentStatus,
+    refundStatus: norm.refundStatus,
     fulfillmentStatus: norm.fulfillmentStatus,
     paymentMethod,
     paymentCollectedAt:
@@ -1084,6 +1104,9 @@ function serializeClientOrderDoc(o: Record<string, unknown>) {
     statusHistory,
     cancelRequest: norm.cancelRequest,
     returnRequest: norm.returnRequest,
+    cancelledAt: norm.cancelledAt,
+    cancelledBy: norm.cancelledBy,
+    cancelReason: norm.cancelReason,
     hiddenByCustomer: Boolean(o.hidden_by_customer === true || o.hidden_by_customer === 1),
     hiddenAt: typeof o.hidden_at === 'number' ? Number(o.hidden_at) : null,
     deliveryDetailsEditedAt:
@@ -1100,6 +1123,9 @@ function serializeClientOrderDoc(o: Record<string, unknown>) {
     items: items.map((it) => {
       const qty = Number(it.quantity ?? it.qty ?? 1);
       const unitPaise = Number(it.unit_price_paise || 0);
+      const colorName = String(it.color_name || it.color_snapshot || '').trim();
+      const size = String(it.size || it.size_snapshot || '').trim();
+      const imageUrl = String(it.image_url || '').trim();
       return {
         id: String(it.id || ''),
         productId: String(it.product_id || ''),
@@ -1109,13 +1135,16 @@ function serializeClientOrderDoc(o: Record<string, unknown>) {
         variantLabel:
           String(
             it.variant_label ||
-              [it.size_snapshot, it.color_snapshot].filter(Boolean).join(' / ') ||
+              (colorName || size ? formatVariantDisplayLabel(colorName, size) : '') ||
               'Standard'
           ),
+        colorName: colorName || undefined,
+        size: size || undefined,
+        imageUrl: imageUrl || undefined,
         sku: String(it.sku || it.sku_snapshot || ''),
         skuSnapshot: String(it.sku_snapshot || it.sku || ''),
-        sizeSnapshot: String(it.size_snapshot || ''),
-        colorSnapshot: String(it.color_snapshot || ''),
+        sizeSnapshot: size,
+        colorSnapshot: colorName,
         unitPricePaise: unitPaise,
         unitPrice: Number((unitPaise / 100).toFixed(2)),
         quantity: qty,
@@ -1173,12 +1202,12 @@ async function reconcilePendingRazorpayOrdersAsOwner(
     .filter((d) => {
       const method = String(d.payment_method || '');
       const payStatus = String(d.payment_status || '');
-      const orderStatus = String(d.status || '');
+      const serialized = serializeClientOrderDoc(d);
       const rzpOid = typeof d.razorpay_order_id === 'string' ? d.razorpay_order_id : '';
       return (
         method === 'razorpay' &&
         payStatus !== 'paid' &&
-        !['cancelled', 'refunded'].includes(orderStatus) &&
+        !['cancelled', 'returned'].includes(serialized.status) &&
         rzpOid.length > 0 &&
         typeof d.id === 'string' &&
         d.id.length > 0
@@ -1195,11 +1224,52 @@ async function reconcilePendingRazorpayOrdersAsOwner(
       const check = await verifyRazorpayOrderStatusFromServer(rzpOid, rzpPid, ownerIdToken);
       if (!check?.confirmed) return;
 
+      const docId = String(doc.id);
+      const freshMeta = await firestoreGetDocWithMeta<Record<string, unknown>>(
+        'orders',
+        docId,
+        ownerIdToken
+      ).catch(() => null);
+      if (!freshMeta) return;
+
+      const freshData = freshMeta.data;
+      const freshSerialized = serializeClientOrderDoc(freshData);
       const now = Date.now();
       const existingHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
-        doc.status_history ?? doc.status_history_json,
+        freshData.status_history ?? freshData.status_history_json,
         []
       );
+
+      // Never reactivate an order that was cancelled while payment verification was in flight
+      if (freshSerialized.status === 'cancelled') {
+        const nextHistory: OrderStatusHistoryEntry[] = [
+          ...existingHistory,
+          {
+            status: 'payment_received_after_cancellation',
+            note: 'Payment verified via Razorpay after cancellation — flagged for refund review',
+            actor: 'system',
+            at: now,
+          },
+        ];
+        const patch: Record<string, unknown> = {
+          payment_status: 'paid',
+          refund_status: 'pending_refund',
+          status_history: nextHistory,
+          status_history_json: JSON.stringify(nextHistory),
+          updated_at: now,
+        };
+        await firestoreSetDoc(
+          'orders',
+          docId,
+          patch,
+          ownerIdToken,
+          Object.keys(patch),
+          { updateTime: freshMeta.updateTime }
+        ).catch(() => {});
+        Object.assign(doc, freshData, patch);
+        return;
+      }
+
       const nextHistory: OrderStatusHistoryEntry[] = existingHistory.some(
         (h) => h.status === 'confirmed'
       )
@@ -1214,35 +1284,24 @@ async function reconcilePendingRazorpayOrdersAsOwner(
             },
           ];
 
-      const docId = String(doc.id);
+      const patch: Record<string, unknown> = {
+        status: 'confirmed',
+        fulfillment_status: 'confirmed',
+        payment_status: 'paid',
+        status_history: nextHistory,
+        status_history_json: JSON.stringify(nextHistory),
+        updated_at: now,
+      };
       await firestoreSetDoc(
         'orders',
         docId,
-        {
-          status: 'confirmed',
-          fulfillment_status: 'confirmed',
-          payment_status: 'paid',
-          status_history: nextHistory,
-          status_history_json: JSON.stringify(nextHistory),
-          updated_at: now,
-        },
+        patch,
         ownerIdToken,
-        [
-          'status',
-          'fulfillment_status',
-          'payment_status',
-          'status_history',
-          'status_history_json',
-          'updated_at',
-        ]
+        Object.keys(patch),
+        { updateTime: freshMeta.updateTime }
       ).catch(() => {});
 
-      doc.status = 'confirmed';
-      doc.fulfillment_status = 'confirmed';
-      doc.payment_status = 'paid';
-      doc.status_history = nextHistory;
-      doc.status_history_json = JSON.stringify(nextHistory);
-      doc.updated_at = now;
+      Object.assign(doc, freshData, patch);
     })
   );
 }
@@ -1347,11 +1406,14 @@ interface StoredProductDoc {
     product_id: string;
     sku: string;
     size: string;
+    color_id?: string | null;
     color_name: string;
     color_hex: string;
     price_paise: number;
+    price_override_paise?: number | null;
     compare_at_paise: number | null;
     stock_qty: number;
+    active?: boolean | number;
     position: number;
     created_at?: number;
     updated_at?: number;
@@ -1360,6 +1422,7 @@ interface StoredProductDoc {
     id: string;
     product_id: string;
     media_id?: string | null;
+    color_id?: string | null;
     url: string;
     alt_text: string;
     is_cover: number | boolean;
@@ -1514,19 +1577,31 @@ function sanitizeProductDocForFirestore(
             vCompareRaw !== null && Number.isFinite(vCompareRaw) && vCompareRaw >= 100
               ? Math.max(vPrice, Math.min(100_000_000, vCompareRaw))
               : null;
+          const vPriceOverride =
+            v.price_override_paise !== null &&
+            v.price_override_paise !== undefined &&
+            Number.isFinite(Number(v.price_override_paise)) &&
+            Math.round(Number(v.price_override_paise)) >= 100
+              ? Math.min(100_000_000, Math.round(Number(v.price_override_paise)))
+              : null;
           return {
             id: String(v.id || `${safeId}-var-${idx + 1}`),
             product_id: safeId,
             sku: String(v.sku || `${safeSku}-V${idx + 1}`).toUpperCase().slice(0, 64),
             size: String(v.size || 'Free Size').slice(0, 40),
+            ...(typeof v.color_id === 'string' && v.color_id.trim()
+              ? { color_id: v.color_id.trim().slice(0, 80) }
+              : {}),
             color_name: String(v.color_name || 'Signature').slice(0, 60),
             color_hex: String(v.color_hex || '#49243E').slice(0, 16),
-            price_paise: vPrice,
+            price_paise: vPriceOverride ?? vPrice,
+            ...(vPriceOverride !== null ? { price_override_paise: vPriceOverride } : {}),
             compare_at_paise: vCompare,
             stock_qty: Math.max(
               0,
               Math.min(1_000_000, Math.round(Number(v.stock_qty ?? 0) || 0))
             ),
+            active: v.active === false || v.active === 0 ? false : true,
             position: idx,
           };
         })
@@ -1544,15 +1619,19 @@ function sanitizeProductDocForFirestore(
               0,
               Math.min(1_000_000, Math.round(Number(raw.stock_qty ?? 1) || 0))
             ),
+            active: true,
             position: 0,
           },
         ];
 
+  const safeColorsJson = String(raw.colors_json || '[]').slice(0, 10_000);
   const safeStockQty = Math.max(
     0,
     Math.min(
       1_000_000,
-      safeVariants.reduce((sum, v) => sum + v.stock_qty, 0)
+      safeVariants
+        .filter((v) => v.active !== false && isVariantColorActiveInMetadata(safeColorsJson, v))
+        .reduce((sum, v) => sum + v.stock_qty, 0)
     )
   );
   const safeLowStock = Math.max(
@@ -1581,6 +1660,9 @@ function sanitizeProductDocForFirestore(
     id: String(img.id || `${safeId}-img-${idx + 1}`),
     product_id: safeId,
     media_id: typeof img.media_id === 'string' ? img.media_id : null,
+    ...(typeof img.color_id === 'string' && img.color_id.trim()
+      ? { color_id: img.color_id.trim().slice(0, 80) }
+      : {}),
     url: String(img.url || ''),
     alt_text: String(img.alt_text || safeTitlePadded).slice(0, 240),
     is_cover: Boolean(img.is_cover ?? idx === 0),
@@ -1588,7 +1670,6 @@ function sanitizeProductDocForFirestore(
     created_at: Number(img.created_at) > 0 ? Math.round(Number(img.created_at)) : safeCreatedAt,
   }));
 
-  const safeColorsJson = String(raw.colors_json || '[]').slice(0, 10_000);
   const safeSizesJson = String(raw.sizes_json || '[]').slice(0, 5_000);
   const safeVersion = Math.max(1, Math.round(Number(raw.version || 1)));
 
@@ -2011,7 +2092,7 @@ interface ValidatedClientProductPayload {
   lowStockThreshold: number;
   featured: boolean;
   status: 'draft' | 'published' | 'archived';
-  colors: Array<{ name: string; hex: string }>;
+  colors: ProductColor[];
   sizes: string[];
   variants: NonNullable<StoredProductDoc['variants']>;
   images: NonNullable<StoredProductDoc['images']>;
@@ -2159,8 +2240,91 @@ function validateClientProductPayload(params: {
   const featured =
     body.featured !== undefined ? Boolean(body.featured) : Boolean(existing?.featured);
 
+  // Explicit colour options (optional; backward-compatible when omitted)
+  let explicitColors: ProductColor[] = [];
+  if (Array.isArray(body.colors) && body.colors.length > 0) {
+    const seenColorNames = new Set<string>();
+    const seenColorIds = new Set<string>();
+    for (let idx = 0; idx < body.colors.length; idx += 1) {
+      const rawC = body.colors[idx] as Record<string, unknown>;
+      if (!rawC || typeof rawC !== 'object') {
+        const msg = 'Invalid colour entry.';
+        return { ok: false, error: msg, fieldErrors: { colors: msg } };
+      }
+      const name = String(rawC.name || '').trim().slice(0, 60);
+      if (!name) {
+        const msg = 'Every colour option must have a name.';
+        return { ok: false, error: msg, fieldErrors: { colors: msg } };
+      }
+      const normName = name.toLowerCase();
+      if (seenColorNames.has(normName)) {
+        const msg = `Duplicate colour name "${name}". Each colour option must be unique.`;
+        return { ok: false, error: msg, fieldErrors: { colors: msg } };
+      }
+      seenColorNames.add(normName);
+
+      let cid =
+        typeof rawC.id === 'string' && rawC.id.trim()
+          ? rawC.id.trim().slice(0, 80)
+          : makeStableColorId(name, idx);
+      if (seenColorIds.has(cid)) {
+        cid = `${cid}-${idx + 1}`;
+      }
+      seenColorIds.add(cid);
+
+      const hex =
+        typeof rawC.hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(rawC.hex.trim())
+          ? rawC.hex.trim()
+          : '#49243E';
+      const thumbUrl =
+        typeof rawC.thumbnailUrl === 'string' && rawC.thumbnailUrl.trim()
+          ? rawC.thumbnailUrl.trim()
+          : null;
+      if (
+        thumbUrl &&
+        !thumbUrl.startsWith('https://') &&
+        !thumbUrl.startsWith('http://') &&
+        !thumbUrl.startsWith('/') &&
+        !thumbUrl.startsWith('data:image/')
+      ) {
+        const msg = `Thumbnail image URL for colour "${name}" must be a valid image path or URL.`;
+        return { ok: false, error: msg, fieldErrors: { colors: msg } };
+      }
+
+      explicitColors.push({
+        id: cid,
+        name,
+        hex,
+        thumbnailUrl: thumbUrl,
+        position: typeof rawC.position === 'number' ? rawC.position : idx,
+        active: rawC.active === false ? false : true,
+      });
+    }
+    explicitColors.sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+    explicitColors = explicitColors.map((c, idx) => ({ ...c, position: idx }));
+  } else if (existing?.colors_json) {
+    try {
+      const parsed = JSON.parse(existing.colors_json);
+      if (Array.isArray(parsed)) {
+        explicitColors = parsed
+          .filter((c): c is ProductColor => Boolean(c && typeof c === 'object' && typeof c.name === 'string'))
+          .map((c, idx) => ({
+            id: c.id || makeStableColorId(c.name, idx),
+            name: c.name,
+            hex: c.hex || '#49243E',
+            thumbnailUrl: c.thumbnailUrl ?? null,
+            position: typeof c.position === 'number' ? c.position : idx,
+            active: c.active === false ? false : true,
+          }));
+      }
+    } catch {
+      explicitColors = [];
+    }
+  }
+
   const normalizedImages: NonNullable<StoredProductDoc['images']> = Array.isArray(body.images)
     ? body.images
+        .slice(0, 20)
         .filter((img): img is Record<string, unknown> => Boolean(img && typeof img === 'object'))
         .map((img, idx) => ({
           id:
@@ -2169,6 +2333,10 @@ function validateClientProductPayload(params: {
               : `${productId}-img-${idx + 1}`,
           product_id: productId,
           media_id: typeof img.mediaId === 'string' ? img.mediaId : null,
+          color_id:
+            typeof img.colorId === 'string' && img.colorId.trim()
+              ? img.colorId.trim().slice(0, 80)
+              : null,
           url: String(img.url || img.src || '').trim(),
           alt_text: String(img.alt || title).trim().slice(0, 240) || title,
           is_cover: Boolean(img.isCover ?? idx === 0),
@@ -2186,10 +2354,21 @@ function validateClientProductPayload(params: {
     normalizedImages[0].is_cover = true;
   }
 
+  const colorById = new Map<string, ProductColor>();
+  const colorByName = new Map<string, ProductColor>();
+  for (const c of explicitColors) {
+    if (c.id) colorById.set(c.id, c);
+    colorByName.set(c.name.toLowerCase(), c);
+  }
+
   const normalizedVariants: NonNullable<StoredProductDoc['variants']> = [];
   if (Array.isArray(body.variants)) {
     if (body.variants.length === 0) {
-      const msg = 'Add at least one size/color variant before saving.';
+      const msg = 'Add at least one size/colour variant before saving.';
+      return { ok: false, error: msg, fieldErrors: { variants: msg } };
+    }
+    if (body.variants.length > 100) {
+      const msg = 'A product can have up to 100 colour/size variants.';
       return { ok: false, error: msg, fieldErrors: { variants: msg } };
     }
     const seenCombos = new Set<string>();
@@ -2209,14 +2388,20 @@ function validateClientProductPayload(params: {
         return { ok: false, error: msg, fieldErrors: { variants: msg } };
       }
       const size = String(rawV.size || '').trim();
-      const colorName = String(rawV.colorName || '').trim();
+      const rawColorId =
+        typeof rawV.colorId === 'string' && rawV.colorId.trim() ? rawV.colorId.trim() : null;
+      const matchedColor =
+        (rawColorId ? colorById.get(rawColorId) : undefined) ||
+        colorByName.get(String(rawV.colorName || '').trim().toLowerCase());
+      const colorName = String(rawV.colorName || matchedColor?.name || '').trim();
+      const resolvedColorId = matchedColor?.id ?? rawColorId ?? (colorName ? makeStableColorId(colorName, idx) : null);
       if (!size || !colorName) {
-        const msg = 'Every variant row must specify both a size and a color name.';
+        const msg = 'Every variant row must specify both a size and a colour name.';
         return { ok: false, error: msg, fieldErrors: { variants: msg } };
       }
       const comboKey = `${size.toLowerCase()}::${colorName.toLowerCase()}`;
       if (seenCombos.has(comboKey)) {
-        const msg = `Duplicate variant for size "${size}" and color "${colorName}".`;
+        const msg = `Duplicate variant for size "${size}" and colour "${colorName}".`;
         return { ok: false, error: msg, fieldErrors: { variants: msg } };
       }
       seenCombos.add(comboKey);
@@ -2239,12 +2424,31 @@ function validateClientProductPayload(params: {
         return { ok: false, error: msg, fieldErrors: { variants: msg } };
       }
 
+      let priceOverridePaise: number | null = null;
+      if (rawV.priceOverridePaise !== undefined && rawV.priceOverridePaise !== null && rawV.priceOverridePaise !== '') {
+        const n = Number(rawV.priceOverridePaise);
+        if (!Number.isFinite(n) || n < 100 || n > 100_000_000) {
+          const msg = `Enter a valid INR price override (at least ₹1) for variant ${size} / ${colorName}.`;
+          return { ok: false, error: msg, fieldErrors: { variants: msg } };
+        }
+        priceOverridePaise = Math.round(n);
+      } else if (rawV.priceOverrideInr !== undefined && rawV.priceOverrideInr !== null && rawV.priceOverrideInr !== '') {
+        const n = Math.round(Number(rawV.priceOverrideInr) * 100);
+        if (!Number.isFinite(n) || n < 100 || n > 100_000_000) {
+          const msg = `Enter a valid INR price override (at least ₹1) for variant ${size} / ${colorName}.`;
+          return { ok: false, error: msg, fieldErrors: { variants: msg } };
+        }
+        priceOverridePaise = n;
+      }
+
       const vPricePaise =
-        rawV.pricePaise !== undefined
-          ? Number(rawV.pricePaise)
-          : rawV.priceInr !== undefined
-            ? Math.round(Number(rawV.priceInr) * 100)
-            : basePricePaise;
+        priceOverridePaise !== null
+          ? priceOverridePaise
+          : rawV.pricePaise !== undefined
+            ? Number(rawV.pricePaise)
+            : rawV.priceInr !== undefined
+              ? Math.round(Number(rawV.priceInr) * 100)
+              : basePricePaise;
       if (!Number.isFinite(vPricePaise) || vPricePaise < 100 || vPricePaise > 100_000_000) {
         const msg = `Enter a valid INR price (at least ₹1) for variant ${size} / ${colorName}.`;
         return { ok: false, error: msg, fieldErrors: { variants: msg } };
@@ -2292,26 +2496,32 @@ function validateClientProductPayload(params: {
         product_id: productId,
         sku: vSku,
         size,
+        color_id: resolvedColorId,
         color_name: colorName,
         color_hex:
           typeof rawV.colorHex === 'string' && /^#[0-9a-fA-F]{6}$/.test(rawV.colorHex.trim())
             ? rawV.colorHex.trim()
-            : '#49243E',
+            : matchedColor?.hex || '#49243E',
         price_paise: Math.round(vPricePaise),
+        price_override_paise: priceOverridePaise,
         compare_at_paise: vComparePaise,
         stock_qty: stockNum,
+        active: rawV.active === false || rawV.active === 0 ? false : true,
         position: idx,
       });
     }
   } else if (existing?.variants && existing.variants.length > 0) {
     existing.variants.forEach((v, idx) => {
+      const override = v.price_override_paise ?? null;
       normalizedVariants.push({
         ...v,
         position: idx,
         price_paise:
-          body.pricePaise !== undefined || body.priceInr !== undefined
-            ? basePricePaise
-            : Number(v.price_paise),
+          override !== null
+            ? override
+            : body.pricePaise !== undefined || body.priceInr !== undefined
+              ? basePricePaise
+              : Number(v.price_paise),
         compare_at_paise:
           body.compareAtPaise !== undefined || body.compareAtInr !== undefined
             ? baseCompareAtPaise
@@ -2320,6 +2530,7 @@ function validateClientProductPayload(params: {
           body.stockQty !== undefined && idx === 0
             ? Math.max(0, Math.round(Number(body.stockQty)))
             : Number(v.stock_qty),
+        active: v.active === false || v.active === 0 ? false : true,
       });
     });
   } else {
@@ -2329,26 +2540,98 @@ function validateClientProductPayload(params: {
       product_id: productId,
       sku: `${sku}-STD-1`,
       size: 'Free Size',
-      color_name: 'Signature',
-      color_hex: '#49243E',
+      color_id: explicitColors[0]?.id ?? makeStableColorId(explicitColors[0]?.name || 'Signature', 0),
+      color_name: explicitColors[0]?.name || 'Signature',
+      color_hex: explicitColors[0]?.hex || '#49243E',
       price_paise: basePricePaise,
+      price_override_paise: null,
       compare_at_paise: baseCompareAtPaise,
       stock_qty: singleStock,
+      active: true,
       position: 0,
     });
   }
 
-  const derivedColors = Array.from(
-    new Map(
-      normalizedVariants.map((v) => [
-        v.color_name,
-        { name: v.color_name, hex: v.color_hex },
-      ])
-    ).values()
+  // Build final colour list preserving explicit metadata (thumbnailUrl, position, active)
+  const finalColorsMap = new Map<string, ProductColor>();
+  for (const c of explicitColors) {
+    finalColorsMap.set(c.name.toLowerCase(), { ...c });
+  }
+  for (const v of normalizedVariants) {
+    const key = v.color_name.toLowerCase();
+    if (!finalColorsMap.has(key)) {
+      finalColorsMap.set(key, {
+        id: v.color_id || makeStableColorId(v.color_name, finalColorsMap.size),
+        name: v.color_name,
+        hex: v.color_hex,
+        thumbnailUrl: null,
+        position: finalColorsMap.size,
+        active: true,
+      });
+    }
+  }
+  const derivedColors = Array.from(finalColorsMap.values())
+    .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+    .map((c, idx) => {
+      const cid = c.id || makeStableColorId(c.name, idx);
+      const colorImgs = normalizedImages.filter((img) => img.color_id === cid);
+      const thumb =
+        c.thumbnailUrl ||
+        colorImgs.find((img) => img.is_cover)?.url ||
+        colorImgs[0]?.url ||
+        (finalColorsMap.size === 1
+          ? normalizedImages.find((img) => img.is_cover)?.url || normalizedImages[0]?.url || null
+          : null);
+      return {
+        ...c,
+        id: cid,
+        thumbnailUrl: thumb,
+        position: idx,
+        active: c.active !== false,
+      };
+    });
+
+  // Backfill canonical color_id on variants
+  const canonicalColorIdByName = new Map(derivedColors.map((c) => [c.name.toLowerCase(), c.id!]));
+  for (const v of normalizedVariants) {
+    const cid = canonicalColorIdByName.get(v.color_name.toLowerCase());
+    if (cid) v.color_id = cid;
+  }
+
+  const matrixCheck = validateColorVariantMatrix({
+    colors: derivedColors,
+    variants: normalizedVariants.map((v) => ({
+      sku: v.sku,
+      size: v.size,
+      colorId: v.color_id ?? null,
+      colorName: v.color_name,
+      pricePaise: v.price_paise,
+      priceOverridePaise: v.price_override_paise ?? null,
+      stockQty: v.stock_qty,
+      active: v.active !== false,
+    })),
+    images: normalizedImages.map((img) => ({
+      url: img.url,
+      colorId: img.color_id ?? null,
+    })),
+    requireCompleteForPublish: requestedStatus === 'published',
+  });
+  if (!matrixCheck.ok) {
+    const firstMsg = matrixCheck.errors[0] || 'Invalid colour variant configuration.';
+    return {
+      ok: false,
+      error: firstMsg,
+      fieldErrors: { ...matrixCheck.fieldErrors, variants: firstMsg },
+    };
+  }
+
+  const activeVariantPool = normalizedVariants.filter(
+    (v) => v.active !== false && isVariantColorActiveInMetadata(derivedColors, v)
   );
-  const derivedSizes = Array.from(new Set(normalizedVariants.map((v) => v.size)));
-  const minPricePaise = Math.min(...normalizedVariants.map((v) => Number(v.price_paise)));
-  const lowestVariant = normalizedVariants.find((v) => Number(v.price_paise) === minPricePaise);
+  const priceSourceVariants = activeVariantPool.length > 0 ? activeVariantPool : normalizedVariants;
+  const derivedSizes = Array.from(new Set(priceSourceVariants.map((v) => v.size)));
+  const minPricePaise = Math.min(...priceSourceVariants.map((v) => Number(v.price_paise)));
+  const lowestVariant = priceSourceVariants.find((v) => Number(v.price_paise) === minPricePaise);
 
   return {
     ok: true,
@@ -2376,26 +2659,24 @@ function validateClientProductPayload(params: {
 function formatProductDto(doc: StoredProductDoc, includeAdmin = false, orderCount = 0) {
   const variants = Array.isArray(doc.variants) ? doc.variants : [];
   const images = Array.isArray(doc.images) ? doc.images : [];
-  const totalStock =
-    variants.length > 0
-      ? variants.reduce((sum, v) => sum + Number(v.stock_qty || 0), 0)
-      : Number(doc.stock_qty || 0);
-  const effectivePricePaise =
-    variants.length > 0
-      ? Math.min(...variants.map((v) => Number(v.price_paise || doc.price_paise)))
-      : Number(doc.price_paise || 0);
-  const minVariant =
-    variants.find((v) => Number(v.price_paise) === effectivePricePaise) ||
-    variants[0] ||
-    null;
-  const effectiveComparePaise = minVariant
-    ? minVariant.compare_at_paise
-    : doc.compare_at_paise;
 
-  let colors: Array<{ name: string; hex: string }> = [];
+  let colors: ProductColor[] = [];
   let sizes: string[] = [];
   try {
-    colors = JSON.parse(doc.colors_json || '[]') as Array<{ name: string; hex: string }>;
+    const parsed = JSON.parse(doc.colors_json || '[]');
+    if (Array.isArray(parsed)) {
+      colors = parsed
+        .filter((c): c is ProductColor => Boolean(c && typeof c === 'object' && typeof c.name === 'string'))
+        .map((c, idx) => ({
+          id: c.id || makeStableColorId(c.name, idx),
+          name: c.name,
+          hex: c.hex || '#49243E',
+          thumbnailUrl: c.thumbnailUrl ?? null,
+          position: typeof c.position === 'number' ? c.position : idx,
+          active: c.active === false ? false : true,
+        }))
+        .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+    }
   } catch {
     colors = [];
   }
@@ -2404,6 +2685,27 @@ function formatProductDto(doc: StoredProductDoc, includeAdmin = false, orderCoun
   } catch {
     sizes = [];
   }
+
+  const activeVariants = variants.filter(
+    (v) => v.active !== false && v.active !== 0 && isVariantColorActiveInMetadata(colors, v)
+  );
+  const effectiveVariants = activeVariants.length > 0 ? activeVariants : variants;
+
+  const totalStock =
+    variants.length > 0
+      ? activeVariants.reduce((sum, v) => sum + Number(v.stock_qty || 0), 0)
+      : Number(doc.stock_qty || 0);
+  const effectivePricePaise =
+    effectiveVariants.length > 0
+      ? Math.min(...effectiveVariants.map((v) => Number(v.price_paise || doc.price_paise)))
+      : Number(doc.price_paise || 0);
+  const minVariant =
+    effectiveVariants.find((v) => Number(v.price_paise) === effectivePricePaise) ||
+    effectiveVariants[0] ||
+    null;
+  const effectiveComparePaise = minVariant
+    ? minVariant.compare_at_paise
+    : doc.compare_at_paise;
 
   const dateSource = doc.published_at || doc.created_at || Date.now();
   const dateAdded = new Date(dateSource).toISOString().slice(0, 10);
@@ -2427,10 +2729,13 @@ function formatProductDto(doc: StoredProductDoc, includeAdmin = false, orderCoun
     stockQty: totalStock,
     lowStockThreshold: Number(doc.low_stock_threshold ?? 2),
     inStock: totalStock > 0,
-    images: images.map((img) => ({
+    images: images.map((img, idx) => ({
+      id: img.id,
       src: img.url,
       alt: img.alt_text || doc.title,
       isCover: Boolean(img.is_cover),
+      colorId: img.color_id ?? null,
+      position: Number(img.position ?? idx),
     })),
     colors,
     sizes,
@@ -2438,11 +2743,14 @@ function formatProductDto(doc: StoredProductDoc, includeAdmin = false, orderCoun
       id: v.id,
       sku: v.sku,
       size: v.size,
+      colorId: v.color_id ?? null,
       colorName: v.color_name,
       colorHex: v.color_hex,
       pricePaise: Number(v.price_paise),
+      priceOverridePaise: v.price_override_paise ?? null,
       compareAtPaise: v.compare_at_paise,
       stockQty: Number(v.stock_qty),
+      active: v.active === false || v.active === 0 ? false : true,
       position: Number(v.position),
     })),
     featured: Boolean(doc.featured),
@@ -2473,12 +2781,13 @@ function formatProductDto(doc: StoredProductDoc, includeAdmin = false, orderCoun
     archivedAt: doc.archived_at,
     createdAt: Number(doc.created_at || Date.now()),
     orderCount,
-    rawImages: images.map((img) => ({
+    rawImages: images.map((img, idx) => ({
       id: img.id,
       url: img.url,
       alt: img.alt_text || doc.title,
       isCover: Boolean(img.is_cover),
-      position: Number(img.position || 0),
+      colorId: img.color_id ?? null,
+      position: Number(img.position ?? idx),
     })),
   };
 }
@@ -2844,7 +3153,8 @@ export async function handleClientlessApiRequest<T>(
   rawBody?: unknown
 ): Promise<ApiResult<T>> {
   const upperMethod = (method || 'GET').toUpperCase();
-  const [pathname] = rawPath.split('?');
+  const [pathname, rawQuery = ''] = rawPath.split('?');
+  const queryParams = new URLSearchParams(rawQuery);
   const cleanPath = pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
 
   let body: Record<string, unknown> = {};
@@ -3992,9 +4302,20 @@ export async function handleClientlessApiRequest<T>(
               session.idToken
             );
             if (check?.confirmed) {
-              item.status = 'confirmed';
-              item.paymentStatus = 'paid';
-              item.fulfillmentStatus = 'confirmed';
+              const serverOrderStatus = String(
+                check.order?.status || check.order?.fulfillmentStatus || ''
+              ).toLowerCase();
+              if (serverOrderStatus === 'cancelled' || item.status === 'cancelled') {
+                item.status = 'cancelled';
+                item.fulfillmentStatus = 'cancelled';
+                item.paymentStatus = 'paid';
+                item.refundStatus =
+                  (check.order?.refundStatus as typeof item.refundStatus) || 'pending_refund';
+              } else {
+                item.status = 'confirmed';
+                item.paymentStatus = 'paid';
+                item.fulfillmentStatus = 'confirmed';
+              }
               if (check.paymentId) item.razorpayPaymentId = check.paymentId;
             }
           })
@@ -4132,6 +4453,263 @@ export async function handleClientlessApiRequest<T>(
       };
     }
 
+    const performCustomerOrderCancellation = async (params: {
+      orderId: string;
+      reason: string;
+      expectedUpdatedAt?: number | null;
+      session: ClientFirebaseSession;
+    }): Promise<ApiResult<T>> => {
+      const { orderId, reason, expectedUpdatedAt = null, session } = params;
+      if (reason.length > 500) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          error: 'Cancellation reason must be 500 characters or fewer.',
+        };
+      }
+
+      // 1. Prefer trusted backend /api/cancel-order (handles atomic stock restoration + notification + rules)
+      if (typeof fetch === 'function') {
+        try {
+          const serverRes = await fetch('/api/cancel-order', {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+              Authorization: `Bearer ${session.idToken}`,
+            },
+            body: JSON.stringify({
+              orderId,
+              ...(reason ? { reason } : {}),
+              ...(typeof expectedUpdatedAt === 'number' && Number.isFinite(expectedUpdatedAt)
+                ? { expectedUpdatedAt }
+                : {}),
+            }),
+          });
+          const contentType = serverRes.headers.get('content-type') || '';
+          const payload = contentType.includes('application/json')
+            ? ((await serverRes.json().catch(() => ({}))) as Record<string, unknown>)
+            : null;
+
+          if (serverRes.ok && payload && payload.order) {
+            emitBoutiqueSyncEvent('orders');
+            return {
+              ok: true,
+              data: payload as unknown as T,
+            };
+          }
+
+          // Return explicit business/auth/concurrency errors directly without falling back
+          if (
+            payload &&
+            (serverRes.status === 400 ||
+              serverRes.status === 401 ||
+              serverRes.status === 403 ||
+              serverRes.status === 409 ||
+              serverRes.status === 422 ||
+              (serverRes.status === 404 && payload.code === 'ORDER_NOT_FOUND'))
+          ) {
+            return {
+              ok: false,
+              status: serverRes.status,
+              code: typeof payload.code === 'string' ? payload.code : 'CANCEL_FAILED',
+              error:
+                typeof payload.error === 'string'
+                  ? payload.error
+                  : 'Unable to cancel this order.',
+            };
+          }
+        } catch {
+          // Network unreachable (e.g. offline static host or local mock); fall through to direct Firestore path
+        }
+      }
+
+      // 2. Direct Firestore atomic self-cancel fallback (optimistic updateTime precondition + strict rules)
+      const meta = await firestoreGetDocWithMeta<Record<string, unknown>>(
+        'orders',
+        orderId,
+        session.idToken
+      );
+      if (!meta) {
+        return {
+          ok: false,
+          status: 404,
+          code: 'ORDER_NOT_FOUND',
+          error: 'Order not found.',
+        };
+      }
+      const existing = meta.data;
+      if (existing.customer_user_id !== session.uid) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'FORBIDDEN',
+          error: 'You can only cancel your own orders.',
+        };
+      }
+      const prevHistory = parseOrderHistory(existing.status_history ?? existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: typeof existing.status === 'string' ? existing.status : undefined,
+        rawFulfillmentStatus:
+          typeof existing.fulfillment_status === 'string' ? existing.fulfillment_status : undefined,
+        rawCancelRequest: existing.cancel_request ?? existing.cancel_request_json,
+        rawReturnRequest: existing.return_request ?? existing.return_request_json,
+        rawPaymentStatus: existing.payment_status,
+        rawRefundStatus: existing.refund_status,
+        rawCancelledAt: existing.cancelled_at,
+        rawCancelledBy: existing.cancelled_by,
+        rawCancelReason: existing.cancel_reason,
+        razorpayPaymentId: existing.razorpay_payment_id,
+        history: prevHistory,
+        paymentMethod:
+          typeof existing.payment_method === 'string' ? existing.payment_method : undefined,
+      });
+
+      if (norm.status === 'cancelled') {
+        return {
+          ok: true,
+          data: {
+            ok: true,
+            alreadyCancelled: true,
+            order: serializeClientOrderDoc(existing),
+          } as unknown as T,
+        };
+      }
+
+      const currentUpdatedAt = Number(existing.updated_at || existing.created_at || 0);
+      if (
+        typeof expectedUpdatedAt === 'number' &&
+        Number.isFinite(expectedUpdatedAt) &&
+        currentUpdatedAt !== expectedUpdatedAt
+      ) {
+        return {
+          ok: false,
+          status: 409,
+          code: 'CONCURRENCY_CONFLICT',
+          error:
+            'This order was updated by the studio while you were viewing it. Please refresh to see the latest status.',
+        };
+      }
+
+      if (!PRE_SHIPPING_CANCEL_STATES.has(norm.fulfillmentStatus)) {
+        return {
+          ok: false,
+          status: 409,
+          code: 'CANCELLATION_CUTOFF_PASSED',
+          error: `Cancellation is unavailable because the order is already ${norm.fulfillmentStatus}.`,
+        };
+      }
+
+      const now = Date.now();
+      const { refundStatus } = normalizePaymentAndRefundStatus({
+        rawPaymentStatus: existing.payment_status,
+        rawRefundStatus: existing.refund_status,
+        paymentMethod: existing.payment_method,
+        orderStatus: 'cancelled',
+        razorpayPaymentId: existing.razorpay_payment_id,
+      });
+      const cancelRecord: OrderReturnRequest = {
+        id: norm.cancelRequest?.id || `req_${now.toString(36)}_${randomHex(3)}`,
+        type: 'cancel',
+        reason: reason || 'Cancelled by customer',
+        status: 'approved',
+        requestedAt: norm.cancelRequest?.requestedAt || now,
+        updatedAt: now,
+        resolvedAt: now,
+        resolutionNote: 'Cancelled directly by customer prior to dispatch',
+      };
+      const nextHistory: OrderStatusHistoryEntry[] = [
+        ...(prevHistory as OrderStatusHistoryEntry[]),
+        {
+          status: 'cancelled',
+          note: reason ? `Order cancelled by customer: ${reason}` : 'Order cancelled by customer',
+          actor: 'customer',
+          at: now,
+        },
+      ];
+      const patch: Record<string, unknown> = {
+        status: 'cancelled',
+        fulfillment_status: 'cancelled',
+        cancelled_at: now,
+        cancelled_by: 'customer',
+        cancel_reason: reason || null,
+        refund_status: refundStatus,
+        cancel_request: cancelRecord,
+        cancel_request_json: JSON.stringify(cancelRecord),
+        status_history: nextHistory,
+        status_history_json: JSON.stringify(nextHistory),
+        updated_at: now,
+      };
+      try {
+        await firestoreSetDoc(
+          'orders',
+          orderId,
+          patch,
+          session.idToken,
+          Object.keys(patch),
+          { updateTime: meta.updateTime }
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('FAILED_PRECONDITION') || msg.includes('409') || msg.includes('412')) {
+          return {
+            ok: false,
+            status: 409,
+            code: 'CONCURRENCY_CONFLICT',
+            error:
+              'This order was updated concurrently. Please refresh and verify its latest status.',
+          };
+        }
+        return {
+          ok: false,
+          status: msg.includes('PERMISSION_DENIED') || msg.includes('403') ? 403 : 500,
+          code: 'CANCEL_PERSIST_FAILED',
+          error: 'Could not save order cancellation. Please try again.',
+        };
+      }
+      emitBoutiqueSyncEvent('orders');
+      return {
+        ok: true,
+        data: {
+          ok: true,
+          alreadyCancelled: false,
+          order: serializeClientOrderDoc({ ...existing, ...patch }),
+        } as unknown as T,
+      };
+    };
+
+    if (
+      cleanPath.startsWith('/api/account/orders/') &&
+      cleanPath.endsWith('/cancel') &&
+      upperMethod === 'POST'
+    ) {
+      const session = await getValidClientSession();
+      if (!session) {
+        return {
+          ok: false,
+          status: 401,
+          code: 'AUTH_REQUIRED',
+          error: 'Authentication required.',
+        };
+      }
+      const orderId = decodeURIComponent(
+        cleanPath.slice('/api/account/orders/'.length, -'/cancel'.length)
+      );
+      const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+      const expectedUpdatedAt =
+        typeof body.expectedUpdatedAt === 'number' && Number.isFinite(body.expectedUpdatedAt)
+          ? body.expectedUpdatedAt
+          : null;
+      return performCustomerOrderCancellation({
+        orderId,
+        reason,
+        expectedUpdatedAt,
+        session,
+      });
+    }
+
     if (
       cleanPath.startsWith('/api/account/orders/') &&
       cleanPath.endsWith('/request') &&
@@ -4149,6 +4727,19 @@ export async function handleClientlessApiRequest<T>(
       const orderId = decodeURIComponent(
         cleanPath.slice('/api/account/orders/'.length, -'/request'.length)
       );
+      if (upperMethod === 'POST' && body.type === 'cancel') {
+        const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+        const expectedUpdatedAt =
+          typeof body.expectedUpdatedAt === 'number' && Number.isFinite(body.expectedUpdatedAt)
+            ? body.expectedUpdatedAt
+            : null;
+        return performCustomerOrderCancellation({
+          orderId,
+          reason,
+          expectedUpdatedAt,
+          session,
+        });
+      }
       const meta = await firestoreGetDocWithMeta<Record<string, unknown>>(
         'orders',
         orderId,
@@ -5595,25 +6186,45 @@ export async function handleClientlessApiRequest<T>(
         }
 
         const variants = Array.isArray(doc.variants) ? doc.variants : [];
+        const activeVariants = variants.filter(
+          (v) => v.active !== false && v.active !== 0 && isVariantColorActiveInMetadata(doc.colors_json, v)
+        );
         const variant =
-          (variantId ? variants.find((v) => v.id === variantId) : variants[0]) ||
-          variants[0] ||
+          (variantId ? variants.find((v) => v.id === variantId) : activeVariants[0] || variants[0]) ||
           null;
+        const variantMissingOrInactive =
+          (Boolean(variantId) && variants.length > 0 && !variant) ||
+          Boolean(
+            variant &&
+              (variant.active === false ||
+                variant.active === 0 ||
+                !isVariantColorActiveInMetadata(doc.colors_json, variant))
+          );
         const unitPricePaise = variant ? Number(variant.price_paise) : Number(doc.price_paise);
-        const availableStock = variant ? Number(variant.stock_qty) : Number(doc.stock_qty);
-        const available = availableStock >= quantity && availableStock > 0;
+        const availableStock = variantMissingOrInactive
+          ? 0
+          : variant
+            ? Number(variant.stock_qty)
+            : Number(doc.stock_qty);
+        const available = !variantMissingOrInactive && availableStock >= quantity && availableStock > 0;
         if (!available) hasUnavailable = true;
 
-        const priceChanged = seenPricePaise > 0 && seenPricePaise !== unitPricePaise;
+        const priceChanged = !variantMissingOrInactive && seenPricePaise > 0 && seenPricePaise !== unitPricePaise;
         if (priceChanged) hasPriceChanges = true;
 
         const lineTotalPaise = available ? unitPricePaise * quantity : 0;
         subtotalPaise += lineTotalPaise;
-        const statusReason = !available
-          ? availableStock <= 0
-            ? 'Currently out of stock.'
-            : `Only ${availableStock} left in stock.`
-          : null;
+        const statusReason = variantMissingOrInactive
+          ? 'This colour or size option is no longer available.'
+          : !available
+            ? availableStock <= 0
+              ? 'Currently out of stock.'
+              : `Only ${availableStock} left in stock.`
+            : null;
+        const resolvedImage =
+          resolveVariantSnapshotImageUrl(doc.colors_json, doc.images, variant) ||
+          doc.images?.[0]?.url ||
+          '';
 
         return {
           productId: doc.id,
@@ -5626,9 +6237,13 @@ export async function handleClientlessApiRequest<T>(
           reason: statusReason,
           title: doc.title,
           productTitle: doc.title,
-          variantLabel: variant ? `${variant.size} · ${variant.color_name}` : 'Standard',
+          variantLabel: variant
+            ? formatVariantDisplayLabel(variant.color_name, variant.size)
+            : 'Standard',
+          colorName: variant?.color_name || undefined,
+          size: variant?.size || undefined,
           sku: variant?.sku || doc.sku,
-          imageUrl: doc.images?.[0]?.url || '',
+          imageUrl: resolvedImage,
           currentPricePaise: unitPricePaise,
           previousPricePaise: seenPricePaise || unitPricePaise,
           priceChanged,
@@ -5736,6 +6351,9 @@ export async function handleClientlessApiRequest<T>(
         variant_id: string;
         product_title: string;
         variant_label: string;
+        color_name: string;
+        size: string;
+        image_url: string;
         sku: string;
         unit_price_paise: number;
         quantity: number;
@@ -5762,10 +6380,26 @@ export async function handleClientlessApiRequest<T>(
         }
 
         const variants = Array.isArray(doc.variants) ? doc.variants : [];
+        const activeVariants = variants.filter(
+          (v) => v.active !== false && v.active !== 0 && isVariantColorActiveInMetadata(doc.colors_json, v)
+        );
         const variant =
-          (variantId ? variants.find((v) => v.id === variantId) : variants[0]) ||
-          variants[0] ||
+          (variantId ? variants.find((v) => v.id === variantId) : activeVariants[0] || variants[0]) ||
           null;
+        if (
+          (variantId && variants.length > 0 && !variant) ||
+          (variant &&
+            (variant.active === false ||
+              variant.active === 0 ||
+              !isVariantColorActiveInMetadata(doc.colors_json, variant)))
+        ) {
+          return {
+            ok: false,
+            status: 409,
+            code: 'VARIANT_UNAVAILABLE',
+            error: `Selected colour or size for "${doc.title}" is no longer available.`,
+          };
+        }
         const unitPricePaise = variant ? Number(variant.price_paise) : Number(doc.price_paise);
         const availableStock = variant ? Number(variant.stock_qty) : Number(doc.stock_qty);
 
@@ -5793,13 +6427,22 @@ export async function handleClientlessApiRequest<T>(
         const lineTotalPaise = unitPricePaise * quantity;
         subtotalPaise += lineTotalPaise;
         productIds.add(doc.id);
+        const resolvedImg =
+          resolveVariantSnapshotImageUrl(doc.colors_json, doc.images, variant) ||
+          doc.images?.[0]?.url ||
+          '';
         orderItems.push({
           id: `item_${orderId}_${orderItems.length + 1}`,
           order_id: orderId,
           product_id: doc.id,
           variant_id: variant?.id || doc.id,
           product_title: doc.title,
-          variant_label: variant ? `${variant.size} / ${variant.color_name}` : 'Standard',
+          variant_label: variant
+            ? formatVariantDisplayLabel(variant.color_name, variant.size)
+            : 'Standard',
+          color_name: variant?.color_name || '',
+          size: variant?.size || '',
+          image_url: resolvedImg,
           sku: variant?.sku || doc.sku,
           unit_price_paise: unitPricePaise,
           quantity,
@@ -6134,18 +6777,23 @@ export async function handleClientlessApiRequest<T>(
 
         const paidOrders = serializedOrders.filter(
           (o) =>
-            !['cancelled', 'refunded'].includes(o.status) &&
-            (o.paymentStatus === 'paid' ||
-              (o.paymentMethod !== 'cod' && ['paid', 'fulfilled'].includes(o.status)))
+            !['cancelled', 'returned'].includes(o.status) &&
+            o.paymentStatus === 'paid'
         );
         const totalRevenuePaise = paidOrders.reduce(
           (sum, o) => sum + Number(o.totalPaise || 0),
           0
         );
+        const pendingOrders = serializedOrders.filter((o) =>
+          isOrderAwaitingDispatch(o.status)
+        ).length;
+        const cancelledOrders = serializedOrders.filter(
+          (o) => o.status === 'cancelled'
+        ).length;
         const openReturnRequests = serializedOrders.filter(
           (o) =>
-            o.cancelRequest?.status === 'pending' ||
-            o.returnRequest?.status === 'pending'
+            o.returnRequest?.status === 'pending' ||
+            (o.status !== 'cancelled' && o.cancelRequest?.status === 'pending')
         ).length;
 
         return {
@@ -6163,9 +6811,8 @@ export async function handleClientlessApiRequest<T>(
               outOfStockCount,
               totalCategories: categories.length || INITIAL_SEED_CATEGORIES.length,
               totalOrders: serializedOrders.length,
-              pendingOrders: serializedOrders.filter(
-                (o) => !['delivered', 'cancelled', 'returned'].includes(o.fulfillmentStatus)
-              ).length,
+              pendingOrders,
+              cancelledOrders,
               totalRevenuePaise,
               totalRevenue: Number((totalRevenuePaise / 100).toFixed(2)),
               unreadMessages: messages.filter(
@@ -6484,17 +7131,51 @@ export async function handleClientlessApiRequest<T>(
       if (cleanPath === '/api/admin/orders' && upperMethod === 'GET') {
         const docs = await firestoreListDocs<Record<string, unknown>>('orders', idToken);
         await reconcilePendingRazorpayOrdersAsOwner(docs, idToken).catch(() => {});
-        const items = docs
+        const allItems = docs
           .map((o) => serializeClientOrderDoc(o))
           .sort((a, b) => b.createdAt - a.createdAt);
+        const statusCounts: Record<string, number> = {
+          all: allItems.length,
+          pending: 0,
+          placed: 0,
+          confirmed: 0,
+          packed: 0,
+          shipped: 0,
+          delivered: 0,
+          cancelled: 0,
+          returned: 0,
+          unknown: 0,
+        };
+        for (const item of allItems) {
+          if (item.status in statusCounts) {
+            statusCounts[item.status] += 1;
+          } else {
+            statusCounts.unknown += 1;
+          }
+          if (item.status !== 'pending' && isOrderAwaitingDispatch(item.status)) {
+            statusCounts.pending += 1;
+          }
+        }
+        const rawStatusFilter = (queryParams.get('status') || 'all').trim().toLowerCase();
+        const statusFilter =
+          rawStatusFilter && rawStatusFilter !== 'all'
+            ? normalizeRawOrderStatusValue(rawStatusFilter)
+            : 'all';
+        const filteredItems =
+          statusFilter === 'all'
+            ? allItems
+            : statusFilter === 'pending'
+              ? allItems.filter((o) => isOrderAwaitingDispatch(o.status))
+              : allItems.filter((o) => o.status === statusFilter);
         return {
           ok: true,
           data: {
-            items,
-            total: items.length,
+            items: filteredItems,
+            total: filteredItems.length,
             page: 1,
-            pageSize: 50,
+            pageSize: Math.max(50, filteredItems.length),
             totalPages: 1,
+            statusCounts,
           } as unknown as T,
         };
       }
@@ -6759,13 +7440,48 @@ export async function handleClientlessApiRequest<T>(
                       ? 'archived'
                       : 'draft';
 
-          if (targetStatus === 'published' && (!existing.images || existing.images.length === 0)) {
-            return {
-              ok: false,
-              status: 400,
-              code: 'VALIDATION_ERROR',
-              error: 'Add at least one photo before publishing this product to the storefront.',
-            };
+          if (targetStatus === 'published') {
+            if (!existing.images || existing.images.length === 0) {
+              return {
+                ok: false,
+                status: 400,
+                code: 'VALIDATION_ERROR',
+                error: 'Add at least one photo before publishing this product to the storefront.',
+              };
+            }
+            let parsedColors: ProductColor[] = [];
+            try {
+              const p = JSON.parse(existing.colors_json || '[]');
+              if (Array.isArray(p)) parsedColors = p;
+            } catch {
+              parsedColors = [];
+            }
+            const matrixCheck = validateColorVariantMatrix({
+              colors: parsedColors,
+              variants: (existing.variants || []).map((v) => ({
+                sku: v.sku,
+                size: v.size,
+                colorId: v.color_id ?? null,
+                colorName: v.color_name,
+                pricePaise: Number(v.price_paise),
+                priceOverridePaise: v.price_override_paise ?? null,
+                stockQty: Number(v.stock_qty),
+                active: v.active !== false && v.active !== 0,
+              })),
+              images: (existing.images || []).map((img) => ({
+                url: img.url,
+                colorId: img.color_id ?? null,
+              })),
+              requireCompleteForPublish: true,
+            });
+            if (!matrixCheck.ok) {
+              return {
+                ok: false,
+                status: 400,
+                code: 'INCOMPLETE_COLOR_VARIANTS',
+                error: matrixCheck.errors[0] || 'Complete all active colour galleries and variants before publishing.',
+              };
+            }
           }
 
           const updatedRaw: StoredProductDoc = {
@@ -6918,16 +7634,55 @@ export async function handleClientlessApiRequest<T>(
               };
             }
             const targetStatus = body.status as 'published' | 'draft' | 'archived';
-            if (targetStatus === 'published' && (!existing.images || existing.images.length === 0)) {
-              return {
-                ok: false,
-                status: 400,
-                code: 'VALIDATION_ERROR',
-                error: 'Add at least one photo before publishing this product to the storefront.',
-                fieldErrors: {
-                  images: 'Add at least one photo before publishing this product to the storefront.',
-                },
-              };
+            if (targetStatus === 'published') {
+              if (!existing.images || existing.images.length === 0) {
+                return {
+                  ok: false,
+                  status: 400,
+                  code: 'VALIDATION_ERROR',
+                  error: 'Add at least one photo before publishing this product to the storefront.',
+                  fieldErrors: {
+                    images: 'Add at least one photo before publishing this product to the storefront.',
+                  },
+                };
+              }
+              let parsedColors: ProductColor[] = [];
+              try {
+                const p = JSON.parse(existing.colors_json || '[]');
+                if (Array.isArray(p)) parsedColors = p;
+              } catch {
+                parsedColors = [];
+              }
+              const matrixCheck = validateColorVariantMatrix({
+                colors: parsedColors,
+                variants: (existing.variants || []).map((v) => ({
+                  sku: v.sku,
+                  size: v.size,
+                  colorId: v.color_id ?? null,
+                  colorName: v.color_name,
+                  pricePaise: Number(v.price_paise),
+                  priceOverridePaise: v.price_override_paise ?? null,
+                  stockQty: Number(v.stock_qty),
+                  active: v.active !== false && v.active !== 0,
+                })),
+                images: (existing.images || []).map((img) => ({
+                  url: img.url,
+                  colorId: img.color_id ?? null,
+                })),
+                requireCompleteForPublish: true,
+              });
+              if (!matrixCheck.ok) {
+                const msg =
+                  matrixCheck.errors[0] ||
+                  'Complete all active colour galleries and variants before publishing.';
+                return {
+                  ok: false,
+                  status: 400,
+                  code: 'INCOMPLETE_COLOR_VARIANTS',
+                  error: msg,
+                  fieldErrors: { ...matrixCheck.fieldErrors, variants: msg },
+                };
+              }
             }
             const updatedRaw: StoredProductDoc = {
               ...existing,
@@ -7664,15 +8419,137 @@ export async function handleClientlessApiRequest<T>(
           };
         }
 
+        if (rawSub.endsWith('/collect-payment') && upperMethod === 'POST') {
+          const orderId = decodeURIComponent(rawSub.slice(0, -'/collect-payment'.length));
+          const meta = await firestoreGetDocWithMeta<Record<string, unknown>>(
+            'orders',
+            orderId,
+            idToken
+          );
+          if (!meta) {
+            return {
+              ok: false,
+              status: 404,
+              code: 'ORDER_NOT_FOUND',
+              error: 'Order not found.',
+            };
+          }
+          const existing = meta.data;
+          const prevHistory = parseOrderHistory(
+            existing.status_history ?? existing.status_history_json
+          );
+          const norm = normalizeOrderRequestsAndStatus({
+            rawStatus: typeof existing.status === 'string' ? existing.status : undefined,
+            rawFulfillmentStatus:
+              typeof existing.fulfillment_status === 'string'
+                ? existing.fulfillment_status
+                : undefined,
+            rawCancelRequest: existing.cancel_request ?? existing.cancel_request_json,
+            rawReturnRequest: existing.return_request ?? existing.return_request_json,
+            rawPaymentStatus: existing.payment_status,
+            rawRefundStatus: existing.refund_status,
+            rawCancelledAt: existing.cancelled_at,
+            rawCancelledBy: existing.cancelled_by,
+            rawCancelReason: existing.cancel_reason,
+            razorpayPaymentId: existing.razorpay_payment_id,
+            history: prevHistory,
+            paymentMethod:
+              typeof existing.payment_method === 'string' ? existing.payment_method : undefined,
+          });
+          if (norm.status === 'cancelled') {
+            return {
+              ok: false,
+              status: 409,
+              code: 'ORDER_CANCELLED',
+              error: 'Payment cannot be collected for a cancelled order.',
+            };
+          }
+          if (norm.paymentStatus === 'paid') {
+            const serialized = serializeClientOrderDoc(existing);
+            return {
+              ok: true,
+              data: { id: orderId, paymentStatus: 'paid', order: serialized } as unknown as T,
+            };
+          }
+          const now = Date.now();
+          const note =
+            typeof body.note === 'string' && body.note.trim()
+              ? body.note.trim().slice(0, 300)
+              : 'Cash payment collected on delivery';
+          const nextHistory: OrderStatusHistoryEntry[] = [
+            ...(prevHistory as OrderStatusHistoryEntry[]),
+            {
+              status: 'payment_collected',
+              note,
+              actor: 'owner',
+              at: now,
+            },
+          ];
+          const patch: Record<string, unknown> = {
+            payment_status: 'paid',
+            payment_collected_at: now,
+            payment_collected_by: session.uid,
+            status_history: nextHistory,
+            status_history_json: JSON.stringify(nextHistory),
+            updated_at: now,
+          };
+          await firestoreSetDoc(
+            'orders',
+            orderId,
+            patch,
+            idToken,
+            Object.keys(patch),
+            { updateTime: meta.updateTime }
+          );
+          const customerUid =
+            typeof existing.customer_user_id === 'string' ? existing.customer_user_id : null;
+          if (customerUid) {
+            const custDoc = await firestoreGetDoc<{
+              notification_prefs_json?: string | null;
+              notification_prefs?: unknown;
+            }>('users', customerUid, idToken).catch(() => null);
+            const prefs = parseNotificationPrefs(
+              custDoc?.notification_prefs ?? custDoc?.notification_prefs_json
+            );
+            if (prefs.orderUpdates) {
+              const notifId = `notif_paid_${orderId}_${now}`;
+              await firestoreSetDoc(
+                `users/${encodeURIComponent(customerUid)}/notifications`,
+                notifId,
+                {
+                  id: notifId,
+                  user_id: customerUid,
+                  type: 'order_status',
+                  title: `Payment collected for ${String(existing.order_number || orderId)}`,
+                  message: `We have recorded Cash on Delivery payment for order ${String(existing.order_number || orderId)}.`,
+                  order_id: orderId,
+                  order_number: String(existing.order_number || ''),
+                  is_read: 0,
+                  read: false,
+                  read_at: null,
+                  created_at: now,
+                },
+                idToken
+              ).catch(() => undefined);
+            }
+          }
+          emitBoutiqueSyncEvent('orders');
+          const serialized = serializeClientOrderDoc({ ...existing, ...patch });
+          return {
+            ok: true,
+            data: { id: orderId, paymentStatus: 'paid', order: serialized } as unknown as T,
+          };
+        }
+
         const orderId = decodeURIComponent(
           rawSub.endsWith('/status') ? rawSub.slice(0, -'/status'.length) : rawSub
         );
-        const existing = await firestoreGetDoc<Record<string, unknown>>(
+        const meta = await firestoreGetDocWithMeta<Record<string, unknown>>(
           'orders',
           orderId,
           idToken
         );
-        if (!existing) {
+        if (!meta) {
           return {
             ok: false,
             status: 404,
@@ -7680,20 +8557,48 @@ export async function handleClientlessApiRequest<T>(
             error: 'Order not found.',
           };
         }
-        const allowedStatuses = new Set([
-          'pending',
-          'placed',
-          'confirmed',
-          'packed',
-          'shipped',
-          'delivered',
-          'cancelled',
-          'return_requested',
-          'returned',
-        ]);
-        const nextStatus =
-          typeof body.status === 'string' ? body.status.trim().toLowerCase() : String(existing.status || 'pending');
-        if (!allowedStatuses.has(nextStatus)) {
+        const existing = meta.data;
+        const prevHistory = parseOrderHistory(
+          existing.status_history ?? existing.status_history_json
+        );
+        const norm = normalizeOrderRequestsAndStatus({
+          rawStatus: typeof existing.status === 'string' ? existing.status : undefined,
+          rawFulfillmentStatus:
+            typeof existing.fulfillment_status === 'string'
+              ? existing.fulfillment_status
+              : undefined,
+          rawCancelRequest: existing.cancel_request ?? existing.cancel_request_json,
+          rawReturnRequest: existing.return_request ?? existing.return_request_json,
+          rawPaymentStatus: existing.payment_status,
+          rawRefundStatus: existing.refund_status,
+          rawCancelledAt: existing.cancelled_at,
+          rawCancelledBy: existing.cancelled_by,
+          rawCancelReason: existing.cancel_reason,
+          razorpayPaymentId: existing.razorpay_payment_id,
+          history: prevHistory,
+          paymentMethod:
+            typeof existing.payment_method === 'string' ? existing.payment_method : undefined,
+        });
+
+        const expectedUpdatedAt =
+          typeof body.expectedUpdatedAt === 'number' && Number.isFinite(body.expectedUpdatedAt)
+            ? body.expectedUpdatedAt
+            : null;
+        const currentUpdatedAt = Number(existing.updated_at || existing.created_at || 0);
+        if (expectedUpdatedAt !== null && currentUpdatedAt !== expectedUpdatedAt) {
+          return {
+            ok: false,
+            status: 409,
+            code: 'CONCURRENCY_CONFLICT',
+            error:
+              'This order was modified in another session (for example, cancelled by the customer). Reloading latest status.',
+          };
+        }
+
+        const nextStatus = normalizeRawOrderStatusValue(
+          typeof body.status === 'string' ? body.status : norm.status
+        );
+        if (!VALID_FULFILLMENT_STATES.has(nextStatus)) {
           return {
             ok: false,
             status: 400,
@@ -7701,30 +8606,138 @@ export async function handleClientlessApiRequest<T>(
             error: 'Invalid fulfillment status.',
           };
         }
+        const transitionCheck = validateOrderStatusTransition(norm.status, nextStatus);
+        if (!transitionCheck.ok) {
+          return {
+            ok: false,
+            status: 409,
+            code: transitionCheck.code,
+            error: transitionCheck.error,
+          };
+        }
+
+        const rawRefundStatus =
+          typeof body.refundStatus === 'string' ? body.refundStatus.trim().toLowerCase() : '';
+        const validRefundStatuses = new Set([
+          'none',
+          'not_required',
+          'pending_refund',
+          'refund_initiated',
+          'refunded',
+        ]);
+        if (rawRefundStatus && !validRefundStatuses.has(rawRefundStatus)) {
+          return {
+            ok: false,
+            status: 400,
+            code: 'VALIDATION_ERROR',
+            error: 'Invalid refund status.',
+          };
+        }
+
         const now = Date.now();
         const note = typeof body.note === 'string' ? body.note.trim().slice(0, 300) : '';
-        const prevHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
-          existing.status_history ?? existing.status_history_json,
-          []
-        );
+        const derivedPayRef = normalizePaymentAndRefundStatus({
+          rawPaymentStatus: existing.payment_status,
+          rawRefundStatus: rawRefundStatus || existing.refund_status,
+          paymentMethod: existing.payment_method,
+          orderStatus: nextStatus,
+          razorpayPaymentId: existing.razorpay_payment_id,
+        });
+        const historyStatus =
+          rawRefundStatus && nextStatus === norm.status
+            ? `refund_${rawRefundStatus}`
+            : nextStatus;
         const nextHistory: OrderStatusHistoryEntry[] = [
-          ...prevHistory,
+          ...(prevHistory as OrderStatusHistoryEntry[]),
           {
-            status: nextStatus,
-            note: note || `Updated to ${nextStatus.replace(/_/g, ' ')}`,
+            status: historyStatus,
+            note:
+              note ||
+              (rawRefundStatus && nextStatus === norm.status
+                ? `Refund status updated to ${rawRefundStatus.replace(/_/g, ' ')}`
+                : `Updated to ${nextStatus.replace(/_/g, ' ')}`),
             actor: 'owner',
             at: now,
           },
         ];
-        const updated = {
-          ...existing,
+
+        const shouldRestoreStock =
+          nextStatus === 'cancelled' &&
+          norm.status !== 'cancelled' &&
+          !existing.stock_restored_at;
+
+        const patch: Record<string, unknown> = {
           status: nextStatus,
           fulfillment_status: nextStatus,
+          refund_status: derivedPayRef.refundStatus,
           status_history: nextHistory,
           status_history_json: JSON.stringify(nextHistory),
           updated_at: now,
         };
-        await firestoreSetDoc('orders', orderId, updated, idToken);
+        if (nextStatus === 'cancelled' && norm.status !== 'cancelled') {
+          patch.cancelled_at = norm.cancelledAt || now;
+          patch.cancelled_by = norm.cancelledBy || 'owner';
+          patch.cancel_reason = note || norm.cancelReason || null;
+        }
+        if (shouldRestoreStock) {
+          patch.stock_restored_at = now;
+        }
+
+        try {
+          await firestoreSetDoc(
+            'orders',
+            orderId,
+            patch,
+            idToken,
+            Object.keys(patch),
+            { updateTime: meta.updateTime }
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('FAILED_PRECONDITION') || msg.includes('409') || msg.includes('412')) {
+            return {
+              ok: false,
+              status: 409,
+              code: 'CONCURRENCY_CONFLICT',
+              error:
+                'This order was modified concurrently. Please refresh to see the latest status.',
+            };
+          }
+          throw err;
+        }
+
+        // Restore variant stock once and only once AFTER optimistic lock succeeds
+        if (shouldRestoreStock && Array.isArray(existing.items)) {
+          const qtyByProduct = new Map<string, Map<string | null, number>>();
+          for (const item of existing.items as Array<Record<string, unknown>>) {
+            const pid = typeof item.product_id === 'string' ? item.product_id : '';
+            if (!pid) continue;
+            const vid = typeof item.variant_id === 'string' && item.variant_id ? item.variant_id : null;
+            const qty = Math.max(0, Number(item.quantity ?? item.qty ?? 0));
+            if (!qty) continue;
+            const inner = qtyByProduct.get(pid) || new Map<string | null, number>();
+            inner.set(vid, (inner.get(vid) || 0) + qty);
+            qtyByProduct.set(pid, inner);
+          }
+          for (const [pid, varMap] of qtyByProduct.entries()) {
+            const prodDoc = await firestoreGetDoc<StoredProductDoc>('products', pid, idToken).catch(() => null);
+            if (!prodDoc || !Array.isArray(prodDoc.variants)) continue;
+            const cloned = prodDoc.variants.map((v) => ({ ...v }));
+            for (const [vid, qty] of varMap.entries()) {
+              const idx = vid ? cloned.findIndex((v) => v.id === vid) : 0;
+              if (idx >= 0) cloned[idx].stock_qty += qty;
+            }
+            const totalStock = cloned.reduce((sum, v) => sum + Number(v.stock_qty || 0), 0);
+            await firestoreSetDoc(
+              'products',
+              pid,
+              { variants: cloned, stock_qty: totalStock, updated_at: now },
+              idToken,
+              ['variants', 'stock_qty', 'updated_at']
+            ).catch(() => undefined);
+          }
+        }
+
         const customerUid =
           typeof existing.customer_user_id === 'string' ? existing.customer_user_id : null;
         if (customerUid) {
@@ -7758,105 +8771,10 @@ export async function handleClientlessApiRequest<T>(
           }
         }
         emitBoutiqueSyncEvent('orders');
-        const serialized = serializeClientOrderDoc(updated);
+        const serialized = serializeClientOrderDoc({ ...existing, ...patch });
         return {
           ok: true,
-          data: { id: orderId, status: nextStatus, order: serialized, item: serialized } as unknown as T,
-        };
-      }
-
-      if (cleanPath.match(/^\/api\/admin\/orders\/[^/]+\/collect-payment$/) && upperMethod === 'POST') {
-        const orderId = decodeURIComponent(cleanPath.split('/')[4] || '');
-        const existing = await firestoreGetDoc<Record<string, unknown>>('orders', orderId, idToken);
-        if (!existing) {
-          return {
-            ok: false,
-            status: 404,
-            code: 'ORDER_NOT_FOUND',
-            error: 'Order not found.',
-          };
-        }
-        const currentFulfillment = String(existing.fulfillment_status || existing.status || 'placed');
-        if (currentFulfillment === 'cancelled' || existing.status === 'cancelled') {
-          return {
-            ok: false,
-            status: 409,
-            code: 'ORDER_CANCELLED',
-            error: 'Payment cannot be collected for a cancelled order.',
-          };
-        }
-        if (existing.payment_status === 'paid') {
-          const serialized = serializeClientOrderDoc(existing);
-          return {
-            ok: true,
-            data: { id: orderId, paymentStatus: 'paid', order: serialized } as unknown as T,
-          };
-        }
-        const now = Date.now();
-        const note =
-          typeof body.note === 'string' && body.note.trim()
-            ? body.note.trim().slice(0, 300)
-            : 'Cash payment collected on delivery';
-        const prevHistory = parseJsonOrValue<OrderStatusHistoryEntry[]>(
-          existing.status_history ?? existing.status_history_json,
-          []
-        );
-        const nextHistory: OrderStatusHistoryEntry[] = [
-          ...prevHistory,
-          {
-            status: 'payment_collected',
-            note,
-            actor: 'owner',
-            at: now,
-          },
-        ];
-        const updated = {
-          ...existing,
-          payment_status: 'paid',
-          payment_collected_at: now,
-          payment_collected_by: session.uid,
-          status_history: nextHistory,
-          status_history_json: JSON.stringify(nextHistory),
-          updated_at: now,
-        };
-        await firestoreSetDoc('orders', orderId, updated, idToken);
-        const customerUid =
-          typeof existing.customer_user_id === 'string' ? existing.customer_user_id : null;
-        if (customerUid) {
-          const custDoc = await firestoreGetDoc<{
-            notification_prefs_json?: string | null;
-            notification_prefs?: unknown;
-          }>('users', customerUid, idToken).catch(() => null);
-          const prefs = parseNotificationPrefs(
-            custDoc?.notification_prefs ?? custDoc?.notification_prefs_json
-          );
-          if (prefs.orderUpdates) {
-            const notifId = `notif_paid_${orderId}_${now}`;
-            await firestoreSetDoc(
-              `users/${encodeURIComponent(customerUid)}/notifications`,
-              notifId,
-              {
-                id: notifId,
-                user_id: customerUid,
-                type: 'order_status',
-                title: `Payment collected for ${String(existing.order_number || orderId)}`,
-                message: `We have recorded Cash on Delivery payment for order ${String(existing.order_number || orderId)}.`,
-                order_id: orderId,
-                order_number: String(existing.order_number || ''),
-                is_read: 0,
-                read: false,
-                read_at: null,
-                created_at: now,
-              },
-              idToken
-            ).catch(() => undefined);
-          }
-        }
-        emitBoutiqueSyncEvent('orders');
-        const serialized = serializeClientOrderDoc(updated);
-        return {
-          ok: true,
-          data: { id: orderId, paymentStatus: 'paid', order: serialized } as unknown as T,
+          data: { id: orderId, status: serialized.status, order: serialized, item: serialized } as unknown as T,
         };
       }
 

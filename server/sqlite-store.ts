@@ -9,6 +9,12 @@ import {
 } from './db.ts';
 import type { RuntimeTargetEnv } from './env.ts';
 import {
+  formatVariantDisplayLabel,
+  isVariantColorActiveInMetadata,
+  resolveVariantSnapshotImageUrl,
+  validateColorVariantMatrix,
+} from '../src/utils/colorVariants.ts';
+import {
   slugifyProductTitle,
   StoreHttpError,
   type AdminBindingRow,
@@ -56,13 +62,17 @@ import {
   mergeStorefrontContent,
 } from './storefront-defaults.ts';
 import {
+  isOrderPendingFulfillment,
   normalizeOrderRequestsAndStatus,
+  normalizePaymentAndRefundStatus,
+  normalizeRawOrderStatusValue,
   parseNotificationPrefs,
   parseOrderHistory,
   PRE_CUTOFF_DELIVERY_EDIT_STATES,
   PRE_SHIPPING_CANCEL_STATES,
   RETURN_ELIGIBLE_STATES,
   validateNonSensitivePaymentMethodInput,
+  validateOrderStatusTransition,
 } from './order-utils.ts';
 
 export class SqliteBoutiqueStore implements BoutiqueStore {
@@ -563,26 +573,54 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       this.db.prepare(`SELECT COUNT(*) AS cnt FROM categories`).get() as { cnt: number }
     ).cnt;
 
-    const orderAgg = this.db
-      .prepare(
-        `SELECT
-           COUNT(*) AS totalOrders,
-           SUM(CASE WHEN COALESCE(fulfillment_status, status) NOT IN ('delivered', 'cancelled', 'returned') THEN 1 ELSE 0 END) AS pendingOrders,
-           COALESCE(SUM(
-             CASE
-               WHEN status != 'cancelled'
-                 AND COALESCE(fulfillment_status, status) != 'cancelled'
-                 AND (
-                   payment_status = 'paid'
-                   OR (payment_method != 'cod' AND status IN ('paid', 'fulfilled'))
-                 )
-               THEN total_paise
-               ELSE 0
-             END
-           ), 0) AS totalRevenuePaise
-         FROM orders`
-      )
-      .get() as Record<string, number | null>;
+    const allOrderRows = this.db
+      .prepare(`SELECT * FROM orders ORDER BY created_at DESC`)
+      .all() as unknown as OrderRow[];
+
+    let pendingOrders = 0;
+    let cancelledOrders = 0;
+    let totalRevenuePaise = 0;
+    let openReturnRequests = 0;
+
+    for (const row of allOrderRows) {
+      const history = parseOrderHistory(row.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: row.status,
+        rawFulfillmentStatus: row.fulfillment_status,
+        rawCancelRequest: row.cancel_request_json,
+        rawReturnRequest: row.return_request_json,
+        rawPaymentStatus: row.payment_status,
+        rawRefundStatus: row.refund_status,
+        rawCancelledAt: row.cancelled_at,
+        rawCancelledBy: row.cancelled_by,
+        rawCancelReason: row.cancel_reason,
+        razorpayPaymentId: row.razorpay_payment_id,
+        history,
+        paymentMethod: row.payment_method,
+      });
+
+      if (norm.status === 'cancelled') {
+        cancelledOrders += 1;
+      } else if (isOrderPendingFulfillment(norm.status)) {
+        pendingOrders += 1;
+      }
+
+      if (
+        norm.status !== 'cancelled' &&
+        norm.refundStatus !== 'refunded' &&
+        (norm.paymentStatus === 'paid' ||
+          (row.payment_method !== 'cod' && ['paid', 'fulfilled'].includes(row.status)))
+      ) {
+        totalRevenuePaise += Number(row.total_paise || 0);
+      }
+
+      if (
+        norm.returnRequest?.status === 'pending' ||
+        (norm.status !== 'cancelled' && norm.cancelRequest?.status === 'pending')
+      ) {
+        openReturnRequests += 1;
+      }
+    }
 
     const msgAgg = this.db
       .prepare(
@@ -601,14 +639,6 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       this.db
         .prepare(
           `SELECT COUNT(*) AS cnt FROM users WHERE (email_verified = 1 OR phone_verified = 1) AND deleted_at IS NULL`
-        )
-        .get() as { cnt: number }
-    ).cnt;
-
-    const openReturnRequests = (
-      this.db
-        .prepare(
-          `SELECT COUNT(*) AS cnt FROM orders WHERE return_request_json LIKE '%"status":"pending"%' OR cancel_request_json LIKE '%"status":"pending"%'`
         )
         .get() as { cnt: number }
     ).cnt;
@@ -648,9 +678,10 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
         lowStockProducts: Number(counts.lowStockProducts || 0),
         outOfStockProducts: Number(counts.outOfStockProducts || 0),
         totalCategories,
-        totalOrders: Number(orderAgg.totalOrders || 0),
-        pendingOrders: Number(orderAgg.pendingOrders || 0),
-        totalRevenuePaise: Number(orderAgg.totalRevenuePaise || 0),
+        totalOrders: allOrderRows.length,
+        pendingOrders,
+        cancelledOrders,
+        totalRevenuePaise,
         unreadMessages: Number(msgAgg.unreadMessages || 0),
         totalMessages: Number(msgAgg.totalMessages || 0),
         totalAuditEvents: auditCount,
@@ -740,7 +771,13 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
   async createProduct(input: {
     product: ProductRow;
     variants: ProductVariantRow[];
-    images: Array<{ mediaId: string | null; url: string; alt: string; isCover: boolean }>;
+    images: Array<{
+      mediaId: string | null;
+      colorId?: string | null;
+      url: string;
+      alt: string;
+      isCover: boolean;
+    }>;
     actorUserId: string;
     auditAction: string;
     auditSummary: string;
@@ -790,9 +827,9 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
 
       const insertVariant = this.db.prepare(
         `INSERT INTO product_variants (
-          id, product_id, sku, size, color_name, color_hex,
-          price_paise, compare_at_paise, stock_qty, position
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          id, product_id, sku, size, color_id, color_name, color_hex,
+          price_paise, price_override_paise, compare_at_paise, stock_qty, active, position
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       for (const v of input.variants) {
         insertVariant.run(
@@ -800,25 +837,29 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           p.id,
           v.sku,
           v.size,
+          v.color_id ?? null,
           v.color_name,
           v.color_hex,
           v.price_paise,
+          v.price_override_paise ?? null,
           v.compare_at_paise,
           v.stock_qty,
+          v.active === undefined || v.active === null ? 1 : v.active ? 1 : 0,
           v.position
         );
       }
 
       const insertImg = this.db.prepare(
         `INSERT INTO product_images (
-          id, product_id, media_id, url, alt_text, is_cover, position, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          id, product_id, media_id, color_id, url, alt_text, is_cover, position, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       input.images.forEach((img, idx) => {
         insertImg.run(
           crypto.randomUUID(),
           p.id,
           img.mediaId,
+          img.colorId ?? null,
           img.url,
           img.alt,
           img.isCover ? 1 : 0,
@@ -874,7 +915,13 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     publishedAtIfNull: number | null;
     now: number;
     variants: ProductVariantRow[];
-    images: Array<{ mediaId: string | null; url: string; alt: string; isCover: boolean }>;
+    images: Array<{
+      mediaId: string | null;
+      colorId?: string | null;
+      url: string;
+      alt: string;
+      isCover: boolean;
+    }>;
     actorUserId: string;
     auditAction: string;
     auditSummary: string;
@@ -972,17 +1019,20 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
 
       const upsertVariant = this.db.prepare(
         `INSERT INTO product_variants (
-          id, product_id, sku, size, color_name, color_hex,
-          price_paise, compare_at_paise, stock_qty, position
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, product_id, sku, size, color_id, color_name, color_hex,
+          price_paise, price_override_paise, compare_at_paise, stock_qty, active, position
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           sku = excluded.sku,
           size = excluded.size,
+          color_id = excluded.color_id,
           color_name = excluded.color_name,
           color_hex = excluded.color_hex,
           price_paise = excluded.price_paise,
+          price_override_paise = excluded.price_override_paise,
           compare_at_paise = excluded.compare_at_paise,
           stock_qty = excluded.stock_qty,
+          active = excluded.active,
           position = excluded.position`
       );
       for (const v of input.variants) {
@@ -991,11 +1041,14 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           existing.id,
           v.sku,
           v.size,
+          v.color_id ?? null,
           v.color_name,
           v.color_hex,
           v.price_paise,
+          v.price_override_paise ?? null,
           v.compare_at_paise,
           v.stock_qty,
+          v.active === undefined || v.active === null ? 1 : v.active ? 1 : 0,
           v.position
         );
       }
@@ -1003,14 +1056,15 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       this.db.prepare(`DELETE FROM product_images WHERE product_id = ?`).run(existing.id);
       const insertImg = this.db.prepare(
         `INSERT INTO product_images (
-          id, product_id, media_id, url, alt_text, is_cover, position, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          id, product_id, media_id, color_id, url, alt_text, is_cover, position, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       input.images.forEach((img, idx) => {
         insertImg.run(
           crypto.randomUUID(),
           existing.id,
           img.mediaId,
+          img.colorId ?? null,
           img.url,
           img.alt,
           img.isCover ? 1 : 0,
@@ -1088,9 +1142,9 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
 
       const insertVar = this.db.prepare(
         `INSERT INTO product_variants (
-          id, product_id, sku, size, color_name, color_hex,
-          price_paise, compare_at_paise, stock_qty, position
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          id, product_id, sku, size, color_id, color_name, color_hex,
+          price_paise, price_override_paise, compare_at_paise, stock_qty, active, position
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       variants.forEach((v, idx) => {
         insertVar.run(
@@ -1098,25 +1152,29 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           newId,
           `${copySku}-${idx + 1}`,
           v.size,
+          v.color_id ?? null,
           v.color_name,
           v.color_hex,
           v.price_paise,
+          v.price_override_paise ?? null,
           v.compare_at_paise,
           v.stock_qty,
+          v.active === undefined || v.active === null ? 1 : v.active ? 1 : 0,
           v.position
         );
       });
 
       const insertImg = this.db.prepare(
         `INSERT INTO product_images (
-          id, product_id, media_id, url, alt_text, is_cover, position, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          id, product_id, media_id, color_id, url, alt_text, is_cover, position, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       for (const img of images) {
         insertImg.run(
           crypto.randomUUID(),
           newId,
           img.media_id,
+          img.color_id ?? null,
           img.url,
           img.alt_text,
           img.is_cover,
@@ -1165,13 +1223,55 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     }
 
     if (input.targetStatus === 'published') {
-      const imgCount = (
-        this.db
-          .prepare(`SELECT COUNT(*) AS cnt FROM product_images WHERE product_id = ?`)
-          .get(existing.id) as { cnt: number }
-      ).cnt;
-      if (imgCount === 0) {
+      const { variants, images } = this.fetchProductParts(existing.id);
+      if (images.length === 0) {
         return { ok: false as const, code: 'NO_IMAGES' as const };
+      }
+      let parsedColors: Array<{
+        id?: string;
+        name: string;
+        hex?: string;
+        thumbnailUrl?: string | null;
+        position?: number;
+        active?: boolean;
+      }> = [];
+      try {
+        const raw = JSON.parse(existing.colors_json || '[]');
+        if (Array.isArray(raw)) parsedColors = raw;
+      } catch {
+        parsedColors = [];
+      }
+      const matrixCheck = validateColorVariantMatrix({
+        status: 'published',
+        colors: parsedColors,
+        images: images.map((img) => ({
+          id: img.id,
+          url: img.url,
+          alt: img.alt_text,
+          isCover: Boolean(img.is_cover),
+          colorId: img.color_id ?? null,
+          position: img.position,
+        })),
+        variants: variants.map((v) => ({
+          id: v.id,
+          sku: v.sku,
+          size: v.size,
+          colorId: v.color_id ?? null,
+          colorName: v.color_name,
+          colorHex: v.color_hex,
+          pricePaise: v.price_paise,
+          priceOverridePaise: v.price_override_paise ?? null,
+          compareAtPaise: v.compare_at_paise,
+          stockQty: v.stock_qty,
+          active: v.active === undefined || v.active === null ? true : Boolean(v.active),
+        })),
+      });
+      if (!matrixCheck.ok) {
+        return {
+          ok: false as const,
+          code: 'INCOMPLETE_COLOR_VARIANTS' as const,
+          message: matrixCheck.error,
+        };
       }
     }
 
@@ -1467,16 +1567,23 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
         `SELECT * FROM product_variants WHERE id = ? AND product_id = ? LIMIT 1`
       );
       const fetchFirstVariant = this.db.prepare(
-        `SELECT * FROM product_variants WHERE product_id = ? ORDER BY position ASC LIMIT 1`
+        `SELECT * FROM product_variants WHERE product_id = ? AND COALESCE(active, 1) = 1 ORDER BY position ASC LIMIT 1`
+      );
+      const fetchProductImages = this.db.prepare(
+        `SELECT * FROM product_images WHERE product_id = ? ORDER BY is_cover DESC, position ASC, created_at ASC`
       );
 
       let subtotalPaise = 0;
       const pendingVariantStock = new Map<string, number>();
+      const productImagesCache = new Map<string, ProductImageRow[]>();
       const resolvedLines: Array<{
         productId: string;
         variantId: string;
         productTitle: string;
         variantLabel: string;
+        colorName: string;
+        size: string;
+        imageUrl: string;
         sku: string;
         unitPricePaise: number;
         quantity: number;
@@ -1506,11 +1613,21 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           );
         }
 
+        const variantActive = variant.active === undefined || variant.active === null ? true : Boolean(variant.active);
+        const colorActive = isVariantColorActiveInMetadata(product.colors_json, variant);
+        if (!variantActive || !colorActive) {
+          throw new StoreHttpError(
+            409,
+            'VARIANT_UNAVAILABLE',
+            `The selected colour/size (${variant.color_name} · ${variant.size}) for "${product.title}" is no longer available.`
+          );
+        }
+
         if (raw.expectedPricePaise !== null && raw.expectedPricePaise !== variant.price_paise) {
           throw new StoreHttpError(
             409,
             'PRICE_CHANGED',
-            `The price for "${product.title}" (${variant.size} · ${variant.color_name}) recently changed to ₹${(
+            `The price for "${product.title}" (${variant.color_name} · ${variant.size}) recently changed to ₹${(
               variant.price_paise / 100
             ).toLocaleString('en-IN')}. Please review your bag and confirm.`
           );
@@ -1522,8 +1639,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
             409,
             'INSUFFICIENT_STOCK',
             availableStock === 0
-              ? `"${product.title}" (${variant.size} · ${variant.color_name}) is currently out of stock.`
-              : `Only ${availableStock} unit(s) left for "${product.title}" (${variant.size} · ${variant.color_name}).`
+              ? `"${product.title}" (${variant.color_name} · ${variant.size}) is currently out of stock.`
+              : `Only ${availableStock} unit(s) left for "${product.title}" (${variant.color_name} · ${variant.size}).`
           );
         }
 
@@ -1533,11 +1650,21 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
         const lineTotalPaise = variant.price_paise * raw.quantity;
         subtotalPaise += lineTotalPaise;
 
+        let pImages = productImagesCache.get(product.id);
+        if (!pImages) {
+          pImages = fetchProductImages.all(product.id) as unknown as ProductImageRow[];
+          productImagesCache.set(product.id, pImages);
+        }
+        const imageUrl = resolveVariantSnapshotImageUrl(product.colors_json, pImages, variant);
+
         resolvedLines.push({
           productId: product.id,
           variantId: variant.id,
           productTitle: product.title,
-          variantLabel: `${variant.size} · ${variant.color_name}`,
+          variantLabel: formatVariantDisplayLabel(variant.color_name, variant.size),
+          colorName: variant.color_name,
+          size: variant.size,
+          imageUrl,
           sku: variant.sku,
           unitPricePaise: variant.price_paise,
           quantity: raw.quantity,
@@ -1642,8 +1769,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       const insertOrderItem = this.db.prepare(
         `INSERT INTO order_items (
           id, order_id, product_id, variant_id, product_title, variant_label,
-          sku, unit_price_paise, quantity, line_total_paise
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          color_name, size, image_url, sku, unit_price_paise, quantity, line_total_paise
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       const updateVariantStock = this.db.prepare(
         `UPDATE product_variants SET stock_qty = ? WHERE id = ?`
@@ -1660,6 +1787,9 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           line.variantId,
           line.productTitle,
           line.variantLabel,
+          line.colorName,
+          line.size,
+          line.imageUrl,
           line.sku,
           line.unitPricePaise,
           line.quantity,
@@ -1674,6 +1804,9 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
           variant_id: line.variantId,
           product_title: line.productTitle,
           variant_label: line.variantLabel,
+          color_name: line.colorName,
+          size: line.size,
+          image_url: line.imageUrl,
           sku: line.sku,
           unit_price_paise: line.unitPricePaise,
           quantity: line.quantity,
@@ -1683,7 +1816,7 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
 
       for (const pid of touchedProducts) {
         const sumRow = this.db
-          .prepare(`SELECT COALESCE(SUM(stock_qty), 0) AS total FROM product_variants WHERE product_id = ?`)
+          .prepare(`SELECT COALESCE(SUM(stock_qty), 0) AS total FROM product_variants WHERE product_id = ? AND COALESCE(active, 1) = 1`)
           .get(pid) as { total: number };
         this.db
           .prepare(`UPDATE products SET stock_qty = ?, updated_at = ? WHERE id = ?`)
@@ -1802,6 +1935,35 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     return Boolean(updated);
   }
 
+  private restoreOrderStockSync(orderId: string, now: number): void {
+    const orderItems = this.db
+      .prepare(`SELECT product_id, variant_id, quantity FROM order_items WHERE order_id = ?`)
+      .all(orderId) as Array<{ product_id: string; variant_id: string | null; quantity: number }>;
+    const touchedProducts = new Set<string>();
+    for (const item of orderItems) {
+      const qty = Math.max(0, Number(item.quantity || 0));
+      if (qty <= 0) continue;
+      if (item.variant_id) {
+        this.db
+          .prepare(`UPDATE product_variants SET stock_qty = stock_qty + ? WHERE id = ?`)
+          .run(qty, item.variant_id);
+      }
+      touchedProducts.add(item.product_id);
+    }
+    for (const pid of touchedProducts) {
+      const sumRow = this.db
+        .prepare(
+          `SELECT COALESCE(SUM(stock_qty), 0) AS total FROM product_variants WHERE product_id = ? AND COALESCE(active, 1) = 1`
+        )
+        .get(pid) as { total: number } | undefined;
+      if (sumRow) {
+        this.db
+          .prepare(`UPDATE products SET stock_qty = ?, updated_at = ? WHERE id = ?`)
+          .run(sumRow.total, now, pid);
+      }
+    }
+  }
+
   async updateOrderStatusWithHistory(
     orderId: string,
     nextStatus: string,
@@ -1809,39 +1971,147 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       actor?: 'owner' | 'system' | 'customer';
       note?: string;
       notifyCustomer?: boolean;
+      expectedUpdatedAt?: number | null;
+      paymentStatus?: string;
+      refundStatus?: string;
     }
   ): Promise<OrderWithItems | null> {
-    const existing = this.db
-      .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
-      .get(orderId) as OrderRow | undefined;
-    if (!existing) return null;
-
-    const now = Date.now();
-    let history: OrderStatusHistoryEntry[] = [];
+    this.db.exec('BEGIN IMMEDIATE;');
+    let existing: OrderRow | undefined;
+    let normalizedNext = normalizeRawOrderStatusValue(nextStatus);
+    let changed = false;
+    let now = Date.now();
     try {
-      const parsed = JSON.parse(existing.status_history_json || '[]') as unknown;
-      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
-    } catch {
-      history = [];
-    }
+      existing = this.db
+        .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+        .get(orderId) as OrderRow | undefined;
+      if (!existing) {
+        this.db.exec('ROLLBACK;');
+        return null;
+      }
 
-    const changed =
-      existing.status !== nextStatus || existing.fulfillment_status !== nextStatus;
-    if (changed || options?.note) {
-      history.push({
-        status: nextStatus,
-        note: options?.note?.trim() || undefined,
-        actor: options?.actor || 'owner',
-        at: now,
+      if (
+        typeof options?.expectedUpdatedAt === 'number' &&
+        Number.isFinite(options.expectedUpdatedAt) &&
+        Number(existing.updated_at || existing.created_at || 0) !== Number(options.expectedUpdatedAt)
+      ) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          409,
+          'CONCURRENCY_CONFLICT',
+          'This order was updated elsewhere. Refresh to view the latest status before saving.'
+        );
+      }
+
+      const history = parseOrderHistory(existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.status,
+        rawFulfillmentStatus: existing.fulfillment_status,
+        rawCancelRequest: existing.cancel_request_json,
+        rawReturnRequest: existing.return_request_json,
+        rawPaymentStatus: existing.payment_status,
+        rawRefundStatus: existing.refund_status,
+        rawCancelledAt: existing.cancelled_at,
+        rawCancelledBy: existing.cancelled_by,
+        rawCancelReason: existing.cancel_reason,
+        razorpayPaymentId: existing.razorpay_payment_id,
+        history,
+        paymentMethod: existing.payment_method,
       });
-    }
 
-    const historyJson = JSON.stringify(history);
-    this.db
-      .prepare(
-        `UPDATE orders SET status = ?, fulfillment_status = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
-      )
-      .run(nextStatus, nextStatus, historyJson, now, orderId);
+      const transition = validateOrderStatusTransition(norm.status, nextStatus);
+      if (!transition.ok) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          transition.code === 'VALIDATION_ERROR' ? 400 : 409,
+          transition.code,
+          transition.error
+        );
+      }
+      normalizedNext = normalizeRawOrderStatusValue(nextStatus);
+
+      now = Date.now();
+      const payNorm = normalizePaymentAndRefundStatus({
+        rawPaymentStatus: options?.paymentStatus ?? existing.payment_status,
+        rawRefundStatus: options?.refundStatus ?? existing.refund_status,
+        paymentMethod: existing.payment_method,
+        orderStatus: normalizedNext,
+        razorpayPaymentId: existing.razorpay_payment_id,
+      });
+
+      const statusChanged =
+        norm.status !== normalizedNext ||
+        existing.status !== normalizedNext ||
+        existing.fulfillment_status !== normalizedNext;
+      const refundChanged =
+        Boolean(options?.refundStatus) && payNorm.refundStatus !== norm.refundStatus;
+      changed = statusChanged;
+
+      let cancelledAt = existing.cancelled_at ?? norm.cancelledAt ?? null;
+      let cancelledBy = existing.cancelled_by ?? norm.cancelledBy ?? null;
+      let cancelReason = existing.cancel_reason ?? norm.cancelReason ?? null;
+      let stockRestoredAt = existing.stock_restored_at ?? null;
+
+      if (normalizedNext === 'cancelled') {
+        if (!cancelledAt) cancelledAt = now;
+        if (!cancelledBy) cancelledBy = options?.actor || 'owner';
+        if (!cancelReason && options?.note?.trim()) {
+          cancelReason = options.note.trim().slice(0, 500);
+        }
+        if (!stockRestoredAt) {
+          this.restoreOrderStockSync(orderId, now);
+          stockRestoredAt = now;
+        }
+      }
+
+      if (statusChanged || refundChanged || options?.note) {
+        history.push({
+          status: statusChanged ? normalizedNext : `refund_${payNorm.refundStatus}`,
+          note: options?.note?.trim() || undefined,
+          actor: options?.actor || 'owner',
+          at: now,
+        });
+      }
+
+      const historyJson = JSON.stringify(history);
+      this.db
+        .prepare(
+          `UPDATE orders
+           SET status = ?,
+               fulfillment_status = ?,
+               payment_status = ?,
+               refund_status = ?,
+               cancelled_at = ?,
+               cancelled_by = ?,
+               cancel_reason = ?,
+               stock_restored_at = ?,
+               status_history_json = ?,
+               updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          normalizedNext,
+          normalizedNext,
+          payNorm.paymentStatus,
+          payNorm.refundStatus,
+          cancelledAt,
+          cancelledBy,
+          cancelReason,
+          stockRestoredAt,
+          historyJson,
+          now,
+          orderId
+        );
+
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
 
     if (
       options?.notifyCustomer !== false &&
@@ -1853,8 +2123,8 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
         .get(existing.customer_user_id) as { notification_prefs_json?: string | null } | undefined;
       const prefs = parseNotificationPrefs(custRow?.notification_prefs_json);
       if (prefs.orderUpdates) {
-        const label = nextStatus.replace(/_/g, ' ');
-        const notifId = `notif_status_${orderId}_${nextStatus}_${now}`;
+        const label = normalizedNext.replace(/_/g, ' ');
+        const notifId = `notif_status_${orderId}_${normalizedNext}_${now}`;
         this.db
           .prepare(
             `INSERT INTO customer_notifications (
@@ -1878,6 +2148,171 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     return this.getOrderById(orderId);
   }
 
+  async cancelCustomerOrder(input: {
+    orderId: string;
+    userId: string;
+    reason?: string;
+    expectedUpdatedAt?: number | null;
+  }): Promise<{ orderWithItems: OrderWithItems; alreadyCancelled: boolean } | null> {
+    const cleanReason = typeof input.reason === 'string' ? input.reason.trim().slice(0, 500) : '';
+    let existingOrderNumber = '';
+    let existingCustomerUserId: string | null = null;
+    let alreadyCancelled = false;
+    let now = Date.now();
+
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const existing = this.db
+        .prepare(`SELECT * FROM orders WHERE id = ? LIMIT 1`)
+        .get(input.orderId) as OrderRow | undefined;
+      if (!existing) {
+        this.db.exec('ROLLBACK;');
+        return null;
+      }
+      if (existing.customer_user_id !== input.userId) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          403,
+          'FORBIDDEN',
+          'You can only cancel orders belonging to your own account.'
+        );
+      }
+
+      existingOrderNumber = existing.order_number;
+      existingCustomerUserId = existing.customer_user_id;
+
+      const history = parseOrderHistory(existing.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.status,
+        rawFulfillmentStatus: existing.fulfillment_status,
+        rawCancelRequest: existing.cancel_request_json,
+        rawReturnRequest: existing.return_request_json,
+        rawPaymentStatus: existing.payment_status,
+        rawRefundStatus: existing.refund_status,
+        rawCancelledAt: existing.cancelled_at,
+        rawCancelledBy: existing.cancelled_by,
+        rawCancelReason: existing.cancel_reason,
+        razorpayPaymentId: existing.razorpay_payment_id,
+        history,
+        paymentMethod: existing.payment_method,
+      });
+
+      // Idempotent handling: already cancelled orders return current cancelled state without re-restoring stock
+      if (norm.status === 'cancelled') {
+        alreadyCancelled = true;
+        this.db.exec('COMMIT;');
+        const current = await this.getOrderById(input.orderId);
+        return current ? { orderWithItems: current, alreadyCancelled: true } : null;
+      }
+
+      if (
+        typeof input.expectedUpdatedAt === 'number' &&
+        Number.isFinite(input.expectedUpdatedAt) &&
+        Number(existing.updated_at || existing.created_at || 0) !== Number(input.expectedUpdatedAt)
+      ) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          409,
+          'CONCURRENCY_CONFLICT',
+          'This order was updated just before your request. Please refresh and check its latest status.'
+        );
+      }
+
+      if (!PRE_SHIPPING_CANCEL_STATES.has(norm.status)) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          409,
+          'CANCELLATION_CUTOFF_PASSED',
+          `Cancellation is unavailable once an order is ${norm.status}.`
+        );
+      }
+
+      now = Date.now();
+      const refundStatus = norm.paymentStatus === 'paid' ? 'pending_refund' : 'not_required';
+      const cancelRequestRecord: OrderReturnRequestRecord = {
+        id: norm.cancelRequest?.id || `req_${crypto.randomUUID().slice(0, 12)}`,
+        type: 'cancel',
+        reason: cleanReason || norm.cancelRequest?.reason || 'Cancelled by customer',
+        status: 'approved',
+        requestedAt: norm.cancelRequest?.requestedAt || now,
+        updatedAt: now,
+        resolvedAt: now,
+        resolutionNote: 'Cancelled directly by customer before shipment',
+      };
+
+      history.push({
+        status: 'cancelled',
+        note: cleanReason || 'Cancelled by customer before shipment',
+        actor: 'customer',
+        at: now,
+      });
+
+      let stockRestoredAt = existing.stock_restored_at ?? null;
+      if (!stockRestoredAt) {
+        this.restoreOrderStockSync(input.orderId, now);
+        stockRestoredAt = now;
+      }
+
+      this.db
+        .prepare(
+          `UPDATE orders
+           SET status = 'cancelled',
+               fulfillment_status = 'cancelled',
+               payment_status = ?,
+               refund_status = ?,
+               cancelled_at = ?,
+               cancelled_by = 'customer',
+               cancel_reason = ?,
+               cancel_request_json = ?,
+               stock_restored_at = ?,
+               status_history_json = ?,
+               updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          norm.paymentStatus,
+          refundStatus,
+          now,
+          cleanReason || null,
+          JSON.stringify(cancelRequestRecord),
+          stockRestoredAt,
+          JSON.stringify(history),
+          now,
+          input.orderId
+        );
+
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
+
+    if (!alreadyCancelled && existingCustomerUserId) {
+      const customerRow = await this.getUserById(existingCustomerUserId);
+      const prefs = parseNotificationPrefs(customerRow?.notification_prefs_json);
+      if (prefs.cancelReturnUpdates || prefs.orderUpdates) {
+        await this.createCustomerNotification({
+          id: `notif_cancelled_${input.orderId}`,
+          userId: existingCustomerUserId,
+          type: 'order_status',
+          title: `Order ${existingOrderNumber} cancelled`,
+          message: cleanReason
+            ? `Your order ${existingOrderNumber} has been cancelled (${cleanReason}).`
+            : `Your order ${existingOrderNumber} has been cancelled.`,
+          orderId: input.orderId,
+          orderNumber: existingOrderNumber,
+        }).catch(() => {});
+      }
+    }
+
+    const updated = await this.getOrderById(input.orderId);
+    return updated ? { orderWithItems: updated, alreadyCancelled: false } : null;
+  }
+
   async submitOrderReturnRequest(input: {
     orderId: string;
     userId: string;
@@ -1893,6 +2328,16 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
     type: 'cancel' | 'return';
     reason: string;
   }): Promise<OrderWithItems | null> {
+    // Customer cancellations transition immediately and authoritatively to 'cancelled'
+    if (input.type === 'cancel') {
+      const result = await this.cancelCustomerOrder({
+        orderId: input.orderId,
+        userId: input.userId,
+        reason: input.reason,
+      });
+      return result ? result.orderWithItems : null;
+    }
+
     const cleanReason = input.reason.trim().slice(0, 500);
     if (cleanReason.length < 3) {
       throw new StoreHttpError(
@@ -1926,58 +2371,41 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
         rawFulfillmentStatus: existing.fulfillment_status,
         rawCancelRequest: existing.cancel_request_json,
         rawReturnRequest: existing.return_request_json,
+        rawPaymentStatus: existing.payment_status,
+        rawRefundStatus: existing.refund_status,
+        rawCancelledAt: existing.cancelled_at,
+        rawCancelledBy: existing.cancelled_by,
+        rawCancelReason: existing.cancel_reason,
+        razorpayPaymentId: existing.razorpay_payment_id,
         history,
         paymentMethod: existing.payment_method,
       });
 
-      if (input.type === 'cancel') {
-        if (!PRE_SHIPPING_CANCEL_STATES.has(norm.fulfillmentStatus)) {
-          this.db.exec('ROLLBACK;');
-          throw new StoreHttpError(
-            409,
-            'CANCELLATION_CUTOFF_PASSED',
-            `Cancellation is unavailable once an order is ${norm.fulfillmentStatus}.`
-          );
+      if (!RETURN_ELIGIBLE_STATES.has(norm.fulfillmentStatus)) {
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          409,
+          'RETURN_NOT_ELIGIBLE',
+          'Return requests can only be submitted after your order is delivered.'
+        );
+      }
+      if (norm.returnRequest?.status === 'pending') {
+        if (norm.returnRequest.reason === cleanReason) {
+          this.db.exec('COMMIT;');
+          return this.getOrderById(input.orderId);
         }
-        if (norm.cancelRequest?.status === 'pending') {
-          if (norm.cancelRequest.reason === cleanReason) {
-            this.db.exec('COMMIT;');
-            return this.getOrderById(input.orderId);
-          }
-          this.db.exec('ROLLBACK;');
-          throw new StoreHttpError(
-            409,
-            'REQUEST_ALREADY_PENDING',
-            'A cancellation request is already pending for this order. You can edit or withdraw it below.'
-          );
-        }
-      } else {
-        if (!RETURN_ELIGIBLE_STATES.has(norm.fulfillmentStatus)) {
-          this.db.exec('ROLLBACK;');
-          throw new StoreHttpError(
-            409,
-            'RETURN_NOT_ELIGIBLE',
-            'Return requests can only be submitted after your order is delivered.'
-          );
-        }
-        if (norm.returnRequest?.status === 'pending') {
-          if (norm.returnRequest.reason === cleanReason) {
-            this.db.exec('COMMIT;');
-            return this.getOrderById(input.orderId);
-          }
-          this.db.exec('ROLLBACK;');
-          throw new StoreHttpError(
-            409,
-            'REQUEST_ALREADY_PENDING',
-            'A return request is already pending for this order. You can edit or withdraw it below.'
-          );
-        }
+        this.db.exec('ROLLBACK;');
+        throw new StoreHttpError(
+          409,
+          'REQUEST_ALREADY_PENDING',
+          'A return request is already pending for this order. You can edit or withdraw it below.'
+        );
       }
 
       const now = Date.now();
       const requestRecord: OrderReturnRequestRecord = {
         id: `req_${crypto.randomUUID().slice(0, 12)}`,
-        type: input.type,
+        type: 'return',
         reason: cleanReason,
         status: 'pending',
         requestedAt: now,
@@ -1986,40 +2414,24 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       };
 
       history.push({
-        status: input.type === 'cancel' ? 'cancellation_requested' : 'return_requested',
+        status: 'return_requested',
         note: cleanReason,
         actor: 'customer',
         at: now,
       });
 
-      if (input.type === 'cancel') {
-        // Store in cancel_request_json ONLY; preserve actual fulfillment_status and status!
-        this.db
-          .prepare(
-            `UPDATE orders SET status = ?, fulfillment_status = ?, cancel_request_json = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
-          )
-          .run(
-            norm.fulfillmentStatus,
-            norm.fulfillmentStatus,
-            JSON.stringify(requestRecord),
-            JSON.stringify(history),
-            now,
-            input.orderId
-          );
-      } else {
-        this.db
-          .prepare(
-            `UPDATE orders SET status = ?, fulfillment_status = ?, return_request_json = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
-          )
-          .run(
-            norm.fulfillmentStatus,
-            norm.fulfillmentStatus,
-            JSON.stringify(requestRecord),
-            JSON.stringify(history),
-            now,
-            input.orderId
-          );
-      }
+      this.db
+        .prepare(
+          `UPDATE orders SET status = ?, fulfillment_status = ?, return_request_json = ?, status_history_json = ?, updated_at = ? WHERE id = ?`
+        )
+        .run(
+          norm.fulfillmentStatus,
+          norm.fulfillmentStatus,
+          JSON.stringify(requestRecord),
+          JSON.stringify(history),
+          now,
+          input.orderId
+        );
 
       this.db.exec('COMMIT;');
       return this.getOrderById(input.orderId);
@@ -2348,30 +2760,25 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
 
       let stockRestoredAt = existing.stock_restored_at ?? null;
       if (input.decision === 'approved' && updatedReq.type === 'cancel' && !stockRestoredAt) {
-        const orderItems = this.db
-          .prepare(`SELECT product_id, variant_id, quantity FROM order_items WHERE order_id = ?`)
-          .all(input.orderId) as Array<{ product_id: string; variant_id: string | null; quantity: number }>;
-        const touchedProducts = new Set<string>();
-        for (const item of orderItems) {
-          if (item.variant_id) {
-            this.db
-              .prepare(`UPDATE product_variants SET stock_qty = stock_qty + ? WHERE id = ?`)
-              .run(Number(item.quantity || 0), item.variant_id);
-          }
-          touchedProducts.add(item.product_id);
-        }
-        for (const pid of touchedProducts) {
-          const sumRow = this.db
-            .prepare(`SELECT COALESCE(SUM(stock_qty), 0) AS total FROM product_variants WHERE product_id = ?`)
-            .get(pid) as { total: number } | undefined;
-          if (sumRow) {
-            this.db
-              .prepare(`UPDATE products SET stock_qty = ?, updated_at = ? WHERE id = ?`)
-              .run(sumRow.total, now, pid);
-          }
-        }
+        this.restoreOrderStockSync(input.orderId, now);
         stockRestoredAt = now;
       }
+
+      const payNorm = normalizePaymentAndRefundStatus({
+        rawPaymentStatus: existing.payment_status,
+        rawRefundStatus: existing.refund_status,
+        paymentMethod: existing.payment_method,
+        orderStatus: nextStatus,
+        razorpayPaymentId: existing.razorpay_payment_id,
+      });
+      const cancelledAt =
+        nextStatus === 'cancelled' ? existing.cancelled_at ?? now : existing.cancelled_at ?? null;
+      const cancelledBy =
+        nextStatus === 'cancelled' ? existing.cancelled_by ?? 'owner' : existing.cancelled_by ?? null;
+      const cancelReason =
+        nextStatus === 'cancelled'
+          ? existing.cancel_reason ?? updatedReq.reason ?? null
+          : existing.cancel_reason ?? null;
 
       const nextCancelJson =
         updatedReq.type === 'cancel'
@@ -2389,13 +2796,19 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
       this.db
         .prepare(
           `UPDATE orders
-           SET status = ?, fulfillment_status = ?, cancel_request_json = ?, return_request_json = ?,
+           SET status = ?, fulfillment_status = ?, refund_status = ?,
+               cancelled_at = ?, cancelled_by = ?, cancel_reason = ?,
+               cancel_request_json = ?, return_request_json = ?,
                stock_restored_at = ?, status_history_json = ?, updated_at = ?
            WHERE id = ?`
         )
         .run(
           nextStatus,
           nextFulfillment,
+          payNorm.refundStatus,
+          cancelledAt,
+          cancelledBy,
+          cancelReason,
           nextCancelJson,
           nextReturnJson,
           stockRestoredAt,

@@ -3,7 +3,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Razorpay from 'razorpay';
 import { PRODUCTS, SEED_SKU_BY_ID } from '../src/config/products.ts';
+import {
+  formatVariantDisplayLabel,
+  isVariantColorActiveInMetadata,
+  resolveVariantSnapshotImageUrl,
+} from '../src/utils/colorVariants.ts';
 import { verifyFirebaseIdToken } from './firebase-rest.ts';
+import {
+  normalizeOrderRequestsAndStatus,
+  normalizePaymentAndRefundStatus,
+  normalizeRawOrderStatusValue,
+  parseOrderHistory,
+  PRE_SHIPPING_CANCEL_STATES,
+} from './order-utils.ts';
 import {
   StoreHttpError,
   type BoutiqueStore,
@@ -86,6 +98,9 @@ export interface ValidatedOrderLine {
   variantId: string;
   productTitle: string;
   variantLabel: string;
+  colorName?: string;
+  size?: string;
+  imageUrl?: string;
   sku: string;
   unitPricePaise: number;
   quantity: number;
@@ -105,7 +120,12 @@ export interface SerializedOrderReceipt {
   customerUserId?: string | null;
   status: string;
   paymentStatus: string;
+  refundStatus?: string;
   fulfillmentStatus: string;
+  cancelledAt?: number | null;
+  cancelledBy?: string | null;
+  cancelReason?: string | null;
+  stockRestoredAt?: number | null;
   subtotalPaise: number;
   discountPaise: number;
   giftCardPaise: number;
@@ -126,6 +146,9 @@ export interface SerializedOrderReceipt {
     variantId: string | null;
     productTitle: string;
     variantLabel: string;
+    colorName?: string;
+    size?: string;
+    imageUrl?: string;
     sku: string;
     unitPricePaise: number;
     quantity: number;
@@ -843,9 +866,11 @@ export interface CatalogVariantInfo {
   id: string;
   sku: string;
   size: string;
+  color_id?: string | null;
   color_name: string;
   price_paise: number;
   stock_qty: number;
+  active?: boolean;
 }
 
 export interface CatalogProductInfo {
@@ -857,6 +882,8 @@ export interface CatalogProductInfo {
   category?: string;
   description?: string;
   fabric_note?: string;
+  colors_json?: string;
+  images?: Array<{ url: string; is_cover?: boolean | number; color_id?: string | null; position?: number }>;
   price_paise: number;
   stock_qty: number;
   variants: CatalogVariantInfo[];
@@ -890,9 +917,11 @@ function buildSeedCatalogProducts(): CatalogProductInfo[] {
           id: `${item.id}-var-${pos + 1}`,
           sku: `${sku}-${sizeCode}-${colorCode}-${pos + 1}`,
           size,
+          color_id: color.id ?? null,
           color_name: color.name,
           price_paise: pricePaise,
           stock_qty: 6,
+          active: color.active !== false,
         });
         pos += 1;
       }
@@ -908,6 +937,13 @@ function buildSeedCatalogProducts(): CatalogProductInfo[] {
       category: item.category,
       description: item.description,
       fabric_note: item.fabricNote,
+      colors_json: JSON.stringify(item.colors || []),
+      images: (item.images || []).map((img, idx) => ({
+        url: img.url,
+        is_cover: idx === 0,
+        color_id: img.colorId ?? null,
+        position: idx,
+      })),
       price_paise: pricePaise,
       stock_qty: totalStock,
       variants,
@@ -1059,10 +1095,22 @@ export async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, 
                 ? v.sku
                 : `${String(raw.sku || docId)}-V${idx + 1}`,
             size: typeof v.size === 'string' && v.size ? v.size : 'Free Size',
+            color_id: typeof v.color_id === 'string' && v.color_id ? v.color_id : null,
             color_name:
               typeof v.color_name === 'string' && v.color_name ? v.color_name : 'Signature',
             price_paise: Math.round(Number(v.price_paise ?? raw.price_paise ?? 0)),
             stock_qty: Math.round(Number(v.stock_qty ?? 0)),
+            active: v.active === false || v.active === 0 ? false : true,
+          }));
+
+        const rawImages = Array.isArray(raw.images) ? raw.images : [];
+        const images = rawImages
+          .filter((img): img is Record<string, unknown> => Boolean(img && typeof img === 'object' && typeof (img as Record<string, unknown>).url === 'string'))
+          .map((img, idx) => ({
+            url: String(img.url),
+            is_cover: Boolean(img.is_cover),
+            color_id: typeof img.color_id === 'string' && img.color_id ? img.color_id : null,
+            position: typeof img.position === 'number' ? img.position : idx,
           }));
 
         byId.set(docId, {
@@ -1074,6 +1122,8 @@ export async function fetchPublishedCatalogFromFirestore(): Promise<Map<string, 
           category: typeof raw.category === 'string' ? raw.category : undefined,
           description: typeof raw.description === 'string' ? raw.description : undefined,
           fabric_note: typeof raw.fabric_note === 'string' ? raw.fabric_note : undefined,
+          colors_json: typeof raw.colors_json === 'string' ? raw.colors_json : undefined,
+          images,
           price_paise: Math.round(Number(raw.price_paise ?? 0)),
           stock_qty: Math.round(Number(raw.stock_qty ?? 0)),
           variants,
@@ -1371,15 +1421,24 @@ async function validateCartAgainstCatalog(params: {
           title: found.product.title,
           sku: found.product.sku,
           status: found.product.status,
+          colors_json: found.product.colors_json,
+          images: found.images.map((img) => ({
+            url: img.url,
+            is_cover: img.is_cover,
+            color_id: img.color_id ?? null,
+            position: img.position,
+          })),
           price_paise: found.product.price_paise,
           stock_qty: found.product.stock_qty,
           variants: found.variants.map((v) => ({
             id: v.id,
             sku: v.sku,
             size: v.size,
+            color_id: v.color_id ?? null,
             color_name: v.color_name,
             price_paise: v.price_paise,
             stock_qty: v.stock_qty,
+            active: v.active === 0 ? false : true,
           })),
         };
       }
@@ -1395,9 +1454,11 @@ async function validateCartAgainstCatalog(params: {
       );
     }
 
+    const activeVariants = prod.variants.filter(
+      (v) => v.active !== false && isVariantColorActiveInMetadata(prod.colors_json, v)
+    );
     const variant =
-      (variantId ? prod.variants.find((v) => v.id === variantId) : prod.variants[0]) ||
-      prod.variants[0] ||
+      (variantId ? prod.variants.find((v) => v.id === variantId) : activeVariants[0] || prod.variants[0]) ||
       null;
 
     if (variantId && prod.variants.length > 0 && !prod.variants.some((v) => v.id === variantId)) {
@@ -1405,6 +1466,17 @@ async function validateCartAgainstCatalog(params: {
         409,
         'VARIANT_UNAVAILABLE',
         `Selected option for "${prod.title}" is no longer available.`
+      );
+    }
+
+    if (
+      variant &&
+      (variant.active === false || !isVariantColorActiveInMetadata(prod.colors_json, variant))
+    ) {
+      throw new StoreHttpError(
+        409,
+        'VARIANT_UNAVAILABLE',
+        `Selected colour or size for "${prod.title}" is no longer available.`
       );
     }
 
@@ -1439,11 +1511,21 @@ async function validateCartAgainstCatalog(params: {
 
     const lineTotalPaise = unitPricePaise * quantity;
     totalPaise += lineTotalPaise;
+    const resolvedImageUrl = resolveVariantSnapshotImageUrl(
+      prod.colors_json,
+      prod.images,
+      variant
+    );
     lines.push({
       productId: prod.id,
       variantId: variant?.id || prod.id,
       productTitle: prod.title,
-      variantLabel: variant ? `${variant.size} / ${variant.color_name}` : 'Standard',
+      variantLabel: variant
+        ? formatVariantDisplayLabel(variant.color_name, variant.size)
+        : 'Standard',
+      colorName: variant?.color_name || undefined,
+      size: variant?.size || undefined,
+      imageUrl: resolvedImageUrl || undefined,
       sku: variant?.sku || prod.sku,
       unitPricePaise,
       quantity,
@@ -2112,18 +2194,36 @@ async function fetchExistingFirestoreOrder(
       paymentMethodRaw === 'cod' || (!rzpOid && !rzpPid && paymentMethodRaw !== 'razorpay')
         ? 'cod'
         : 'razorpay';
+    const history = parseStatusHistorySafe(data.status_history_json ?? data.status_history);
+    const norm = normalizeOrderRequestsAndStatus({
+      rawStatus: typeof data.status === 'string' ? data.status : null,
+      rawFulfillmentStatus:
+        typeof data.fulfillment_status === 'string' ? data.fulfillment_status : null,
+      rawCancelRequest: data.cancel_request ?? data.cancel_request_json,
+      rawReturnRequest: data.return_request ?? data.return_request_json,
+      rawPaymentStatus: data.payment_status,
+      rawRefundStatus: data.refund_status,
+      rawCancelledAt: data.cancelled_at,
+      rawCancelledBy: data.cancelled_by,
+      rawCancelReason: data.cancel_reason,
+      razorpayPaymentId: rzpPid,
+      history,
+      paymentMethod,
+    });
     return {
       id: data.id,
       orderNumber: String(data.order_number || orderDocId),
       customerUserId:
         typeof data.customer_user_id === 'string' ? data.customer_user_id : null,
-      status: String(data.status || (paymentMethod === 'cod' ? 'placed' : 'confirmed')),
-      paymentStatus: String(
-        data.payment_status || (paymentMethod === 'razorpay' ? 'paid' : 'unpaid')
-      ),
-      fulfillmentStatus: String(
-        data.fulfillment_status || data.status || (paymentMethod === 'cod' ? 'placed' : 'confirmed')
-      ),
+      status: norm.status,
+      paymentStatus: norm.paymentStatus,
+      refundStatus: norm.refundStatus,
+      fulfillmentStatus: norm.fulfillmentStatus,
+      cancelledAt: norm.cancelledAt,
+      cancelledBy: norm.cancelledBy,
+      cancelReason: norm.cancelReason,
+      stockRestoredAt:
+        typeof data.stock_restored_at === 'number' ? data.stock_restored_at : null,
       subtotalPaise: Number(data.subtotal_paise || 0),
       discountPaise: Number(data.discount_paise || 0),
       giftCardPaise: Number(data.gift_card_paise || 0),
@@ -2140,7 +2240,7 @@ async function fetchExistingFirestoreOrder(
       paymentMethod,
       razorpayOrderId: rzpOid || (razorpayOrderId || null),
       razorpayPaymentId: rzpPid || (razorpayPaymentId || null),
-      statusHistory: parseStatusHistorySafe(data.status_history_json),
+      statusHistory: history,
       items: rawItems
         .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
         .map((it) => ({
@@ -2148,6 +2248,9 @@ async function fetchExistingFirestoreOrder(
           variantId: typeof it.variant_id === 'string' ? it.variant_id : null,
           productTitle: String(it.product_title || ''),
           variantLabel: String(it.variant_label || ''),
+          colorName: typeof it.color_name === 'string' && it.color_name ? it.color_name : undefined,
+          size: typeof it.size === 'string' && it.size ? it.size : undefined,
+          imageUrl: typeof it.image_url === 'string' && it.image_url ? it.image_url : undefined,
           sku: String(it.sku || ''),
           unitPricePaise: Number(it.unit_price_paise || 0),
           quantity: Number(it.quantity || 1),
@@ -2194,6 +2297,9 @@ async function persistOrderViaPublicRule(params: {
     variant_id: l.variantId,
     product_title: l.productTitle,
     variant_label: l.variantLabel,
+    color_name: l.colorName ?? '',
+    size: l.size ?? '',
+    image_url: l.imageUrl ?? '',
     sku: l.sku,
     unit_price_paise: l.unitPricePaise,
     quantity: l.quantity,
@@ -2381,6 +2487,9 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
     variant_id: l.variantId,
     product_title: l.productTitle,
     variant_label: l.variantLabel,
+    color_name: l.colorName ?? '',
+    size: l.size ?? '',
+    image_url: l.imageUrl ?? '',
     sku: l.sku,
     unit_price_paise: l.unitPricePaise,
     quantity: l.quantity,
@@ -2411,6 +2520,9 @@ async function persistConfirmedOrderToFirestoreOnce(params: {
       variantId: l.variantId,
       productTitle: l.productTitle,
       variantLabel: l.variantLabel,
+      colorName: l.colorName,
+      size: l.size,
+      imageUrl: l.imageUrl,
       sku: l.sku,
       unitPricePaise: l.unitPricePaise,
       quantity: l.quantity,
@@ -3551,54 +3663,119 @@ async function finalizePaidRazorpayOrder(params: {
   const runFinalization = async (): Promise<CheckoutHandlerResponse> => {
     const orderDocId = buildDeterministicOrderId(razorpayOrderId);
 
-    // 1. Check in-memory / store / Firestore idempotency state first
-    const memCompleted = completedCheckoutsMemory.get(razorpayOrderId);
-    if (memCompleted?.order) {
+    const serializeStoreOrder = (existingOrder: Awaited<ReturnType<BoutiqueStore['getOrderById']>> & {}): SerializedOrderReceipt => {
+      const history = parseStatusHistorySafe(existingOrder.order.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existingOrder.order.status,
+        rawFulfillmentStatus: existingOrder.order.fulfillment_status,
+        rawCancelRequest: existingOrder.order.cancel_request_json,
+        rawReturnRequest: existingOrder.order.return_request_json,
+        rawPaymentStatus: existingOrder.order.payment_status,
+        rawRefundStatus: existingOrder.order.refund_status,
+        rawCancelledAt: existingOrder.order.cancelled_at,
+        rawCancelledBy: existingOrder.order.cancelled_by,
+        rawCancelReason: existingOrder.order.cancel_reason,
+        razorpayPaymentId: existingOrder.order.razorpay_payment_id,
+        history,
+        paymentMethod: existingOrder.order.payment_method || 'razorpay',
+      });
       return {
-        status: 200,
-        body: {
-          ...memCompleted.responseBody,
-          already_processed: true,
-        },
+        id: existingOrder.order.id,
+        orderNumber: existingOrder.order.order_number,
+        customerUserId: existingOrder.order.customer_user_id,
+        status: norm.status,
+        paymentStatus: norm.paymentStatus,
+        refundStatus: norm.refundStatus,
+        fulfillmentStatus: norm.fulfillmentStatus,
+        cancelledAt: norm.cancelledAt,
+        cancelledBy: norm.cancelledBy,
+        cancelReason: norm.cancelReason,
+        stockRestoredAt: existingOrder.order.stock_restored_at ?? null,
+        subtotalPaise: existingOrder.order.subtotal_paise,
+        discountPaise: existingOrder.order.discount_paise || 0,
+        giftCardPaise: existingOrder.order.gift_card_paise || 0,
+        couponCode: existingOrder.order.coupon_code || null,
+        giftCardCode: existingOrder.order.gift_card_code || null,
+        totalPaise: existingOrder.order.total_paise,
+        currency: existingOrder.order.currency,
+        createdAt: existingOrder.order.created_at,
+        updatedAt: existingOrder.order.updated_at ?? existingOrder.order.created_at,
+        paymentMethod: (existingOrder.order.payment_method as 'razorpay' | 'cod') || 'razorpay',
+        razorpayOrderId: existingOrder.order.razorpay_order_id || razorpayOrderId,
+        razorpayPaymentId: existingOrder.order.razorpay_payment_id || razorpayPaymentId,
+        statusHistory: history,
+        items: existingOrder.items.map((l) => ({
+          productId: l.product_id,
+          variantId: l.variant_id,
+          productTitle: l.product_title,
+          variantLabel: l.variant_label,
+          colorName: l.color_name || undefined,
+          size: l.size || undefined,
+          imageUrl: l.image_url || undefined,
+          sku: l.sku,
+          unitPricePaise: l.unit_price_paise,
+          quantity: l.quantity,
+          lineTotalPaise: l.line_total_paise,
+        })),
       };
-    }
+    };
 
+    // 1. Check live store / Firestore state first so a cancelled order can NEVER be overwritten or served stale
     if (store) {
       const existingOrder = await store.getOrderById(orderDocId).catch(() => null);
       if (existingOrder) {
-        const serialized: SerializedOrderReceipt = {
-          id: existingOrder.order.id,
-          orderNumber: existingOrder.order.order_number,
-          customerUserId: existingOrder.order.customer_user_id,
-          status: existingOrder.order.status,
-          paymentStatus: existingOrder.order.payment_status || 'paid',
-          fulfillmentStatus:
-            existingOrder.order.fulfillment_status || existingOrder.order.status,
-          subtotalPaise: existingOrder.order.subtotal_paise,
-          discountPaise: existingOrder.order.discount_paise || 0,
-          giftCardPaise: existingOrder.order.gift_card_paise || 0,
-          couponCode: existingOrder.order.coupon_code || null,
-          giftCardCode: existingOrder.order.gift_card_code || null,
-          totalPaise: existingOrder.order.total_paise,
-          currency: existingOrder.order.currency,
-          createdAt: existingOrder.order.created_at,
-          paymentMethod: 'razorpay',
-          razorpayOrderId:
-            existingOrder.order.razorpay_order_id || razorpayOrderId,
-          razorpayPaymentId:
-            existingOrder.order.razorpay_payment_id || razorpayPaymentId,
-          statusHistory: parseStatusHistorySafe(existingOrder.order.status_history_json),
-          items: existingOrder.items.map((l) => ({
-            productId: l.product_id,
-            variantId: l.variant_id,
-            productTitle: l.product_title,
-            variantLabel: l.variant_label,
-            sku: l.sku,
-            unitPricePaise: l.unit_price_paise,
-            quantity: l.quantity,
-            lineTotalPaise: l.line_total_paise,
-          })),
-        };
+        let serialized = serializeStoreOrder(existingOrder);
+        if (serialized.status === 'cancelled') {
+          completedCheckoutsMemory.delete(razorpayOrderId);
+          // Delayed payment callback arrived after cancellation: preserve 'cancelled', record payment & flag refund review
+          if (serialized.paymentStatus !== 'paid') {
+            try {
+              const razorpay = (razorpayClientFactory || defaultRazorpayFactory)(keyId, keySecret);
+              const payCheck =
+                params.fetchedPaymentPreloaded ||
+                (await withTransientRetry(() => razorpay.payments.fetch(razorpayPaymentId)));
+              const captured =
+                payCheck.status === 'captured' ||
+                payCheck.captured === true;
+              if (captured) {
+                const updatedCancelled = await store.updateOrderStatusWithHistory(
+                  orderDocId,
+                  'cancelled',
+                  {
+                    actor: 'system',
+                    note: `Delayed Razorpay payment ${razorpayPaymentId} captured after cancellation — flagged for refund review`,
+                    paymentStatus: 'paid',
+                    refundStatus: 'pending_refund',
+                    notifyCustomer: true,
+                  }
+                );
+                if (updatedCancelled) {
+                  serialized = serializeStoreOrder(updatedCancelled);
+                }
+              }
+            } catch {
+              // Preserve cancelled state even if payment lookup fails
+            }
+          }
+          return {
+            status: 200,
+            body: {
+              success: true,
+              verified: true,
+              already_processed: true,
+              cancelled: true,
+              refund_required: serialized.paymentStatus === 'paid' && serialized.refundStatus !== 'refunded',
+              status: 'cancelled',
+              order_id: razorpayOrderId,
+              payment_id: serialized.razorpayPaymentId || razorpayPaymentId,
+              message:
+                serialized.paymentStatus === 'paid'
+                  ? 'Order was already cancelled; payment recorded for refund review.'
+                  : 'Order was already cancelled and cannot be reactivated.',
+              order: serialized,
+            },
+          };
+        }
         const responseBody: Record<string, unknown> = {
           success: true,
           verified: true,
@@ -3617,26 +3794,6 @@ async function finalizePaidRazorpayOrder(params: {
       }
     }
 
-    let pendingRecord = await loadPendingCheckoutRecord(razorpayOrderId, store, requestId);
-
-    if (pendingRecord?.status === 'confirmed' && pendingRecord.confirmedOrder) {
-      const responseBody: Record<string, unknown> = {
-        success: true,
-        verified: true,
-        already_processed: true,
-        order_id: razorpayOrderId,
-        payment_id: pendingRecord.razorpayPaymentId || razorpayPaymentId,
-        message: 'Payment already verified and order confirmed.',
-        order: pendingRecord.confirmedOrder,
-      };
-      completedCheckoutsMemory.set(razorpayOrderId, {
-        paymentId: pendingRecord.razorpayPaymentId || razorpayPaymentId,
-        order: pendingRecord.confirmedOrder,
-        responseBody,
-      });
-      return { status: 200, body: responseBody };
-    }
-
     if (!store) {
       const existingFsOrder = await fetchExistingFirestoreOrder(
         orderDocId,
@@ -3644,6 +3801,97 @@ async function finalizePaidRazorpayOrder(params: {
         razorpayPaymentId,
         { requestId, customerIdToken: params.customerIdToken }
       );
+      if (existingFsOrder && existingFsOrder.status === 'cancelled') {
+        completedCheckoutsMemory.delete(razorpayOrderId);
+        let finalCancelled = existingFsOrder;
+        if (existingFsOrder.paymentStatus !== 'paid') {
+          try {
+            const razorpay = (razorpayClientFactory || defaultRazorpayFactory)(keyId, keySecret);
+            const payCheck =
+              params.fetchedPaymentPreloaded ||
+              (await withTransientRetry(() => razorpay.payments.fetch(razorpayPaymentId)));
+            const captured =
+              payCheck.status === 'captured' ||
+              payCheck.captured === true;
+            if (captured) {
+              const ctx = getFirestoreContext();
+              const tokenRes = ctx
+                ? await resolveFirestoreServerBearerToken({
+                    operation: 'record_delayed_payment_on_cancelled_order',
+                    requestId,
+                    ctx,
+                  })
+                : null;
+              if (ctx && tokenRes?.ok) {
+                const now = Date.now();
+                const nextHistory: OrderStatusHistoryEntry[] = [
+                  ...existingFsOrder.statusHistory,
+                  {
+                    status: 'payment_received_after_cancellation',
+                    note: `Delayed Razorpay payment ${razorpayPaymentId} captured after cancellation — flagged for refund review`,
+                    actor: 'system',
+                    at: now,
+                  },
+                ];
+                const patchFields = {
+                  payment_status: 'paid',
+                  refund_status: 'pending_refund',
+                  razorpay_payment_id: razorpayPaymentId,
+                  status_history: nextHistory,
+                  status_history_json: JSON.stringify(nextHistory),
+                  updated_at: now,
+                };
+                const maskParams = Object.keys(patchFields)
+                  .map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`)
+                  .join('&');
+                const patchRes = await fetch(
+                  `${ctx.docBaseUrl}/environments/${ctx.namespace}/orders/${encodeURIComponent(orderDocId)}?${maskParams}`,
+                  {
+                    method: 'PATCH',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      Authorization: `Bearer ${tokenRes.token}`,
+                    },
+                    body: JSON.stringify({ fields: toFsFields(patchFields) }),
+                  }
+                );
+                if (patchRes.ok) {
+                  finalCancelled = {
+                    ...existingFsOrder,
+                    paymentStatus: 'paid',
+                    refundStatus: 'pending_refund',
+                    razorpayPaymentId,
+                    statusHistory: nextHistory,
+                    updatedAt: now,
+                  };
+                }
+              }
+            }
+          } catch {
+            // Preserve cancelled order even if delayed payment audit patch fails
+          }
+        }
+        return {
+          status: 200,
+          body: {
+            success: true,
+            verified: true,
+            already_processed: true,
+            cancelled: true,
+            refund_required:
+              finalCancelled.paymentStatus === 'paid' &&
+              finalCancelled.refundStatus !== 'refunded',
+            status: 'cancelled',
+            order_id: razorpayOrderId,
+            payment_id: finalCancelled.razorpayPaymentId || razorpayPaymentId,
+            message:
+              finalCancelled.paymentStatus === 'paid'
+                ? 'Order was already cancelled; payment recorded for refund review.'
+                : 'Order was already cancelled and cannot be reactivated.',
+            order: finalCancelled,
+          },
+        };
+      }
       if (existingFsOrder && existingFsOrder.paymentStatus === 'paid') {
         const responseBody: Record<string, unknown> = {
           success: true,
@@ -3661,6 +3909,41 @@ async function finalizePaidRazorpayOrder(params: {
         });
         return { status: 200, body: responseBody };
       }
+    }
+
+    const memCompleted = completedCheckoutsMemory.get(razorpayOrderId);
+    if (memCompleted?.order && memCompleted.order.status !== 'cancelled') {
+      return {
+        status: 200,
+        body: {
+          ...memCompleted.responseBody,
+          already_processed: true,
+        },
+      };
+    }
+
+    let pendingRecord = await loadPendingCheckoutRecord(razorpayOrderId, store, requestId);
+
+    if (
+      pendingRecord?.status === 'confirmed' &&
+      pendingRecord.confirmedOrder &&
+      pendingRecord.confirmedOrder.status !== 'cancelled'
+    ) {
+      const responseBody: Record<string, unknown> = {
+        success: true,
+        verified: true,
+        already_processed: true,
+        order_id: razorpayOrderId,
+        payment_id: pendingRecord.razorpayPaymentId || razorpayPaymentId,
+        message: 'Payment already verified and order confirmed.',
+        order: pendingRecord.confirmedOrder,
+      };
+      completedCheckoutsMemory.set(razorpayOrderId, {
+        paymentId: pendingRecord.razorpayPaymentId || razorpayPaymentId,
+        order: pendingRecord.confirmedOrder,
+        responseBody,
+      });
+      return { status: 200, body: responseBody };
     }
 
     const expectedAmountPaise =
@@ -3851,11 +4134,21 @@ async function finalizePaidRazorpayOrder(params: {
           const variants = storeProd?.variants ?? fsProd?.variants ?? [];
           const variant = variants.find((v) => v.id === tokItem.variantId) || variants[0];
           const unitPricePaise = tokItem.unitPricePaise;
+          const snapshotImg = resolveVariantSnapshotImageUrl(
+            storeProd?.product.colors_json ?? fsProd?.colors_json,
+            storeProd?.images ?? fsProd?.images,
+            variant
+          );
           return {
             productId: tokItem.productId,
             variantId: tokItem.variantId || variant?.id || tokItem.productId,
             productTitle: storeProd?.product.title || fsProd?.title || 'Boutique Piece',
-            variantLabel: variant ? `${variant.size} / ${variant.color_name}` : 'Standard',
+            variantLabel: variant
+              ? formatVariantDisplayLabel(variant.color_name, variant.size)
+              : 'Standard',
+            colorName: variant?.color_name || undefined,
+            size: variant?.size || undefined,
+            imageUrl: snapshotImg || undefined,
             sku: variant?.sku || storeProd?.product.sku || fsProd?.sku || tokItem.productId.toUpperCase(),
             unitPricePaise,
             quantity: tokItem.quantity,
@@ -3967,6 +4260,9 @@ async function finalizePaidRazorpayOrder(params: {
               variantId: l.variant_id,
               productTitle: l.product_title,
               variantLabel: l.variant_label,
+              colorName: l.color_name || undefined,
+              size: l.size || undefined,
+              imageUrl: l.image_url || undefined,
               sku: l.sku,
               unitPricePaise: l.unit_price_paise,
               quantity: l.quantity,
@@ -4645,13 +4941,31 @@ export async function handleOrderStatusRequest(params: {
           requestId
         );
       }
+      const history = parseStatusHistorySafe(existing.order.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: existing.order.status,
+        rawFulfillmentStatus: existing.order.fulfillment_status,
+        rawCancelRequest: existing.order.cancel_request_json,
+        rawReturnRequest: existing.order.return_request_json,
+        rawPaymentStatus: existing.order.payment_status,
+        rawRefundStatus: existing.order.refund_status,
+        rawCancelledAt: existing.order.cancelled_at,
+        rawCancelledBy: existing.order.cancelled_by,
+        rawCancelReason: existing.order.cancel_reason,
+        razorpayPaymentId: existing.order.razorpay_payment_id,
+        history,
+        paymentMethod: existing.order.payment_method || 'razorpay',
+      });
+      const isCancelled = norm.status === 'cancelled';
       return withSupportRef(
         200,
         {
-          confirmed: true,
+          confirmed: !isCancelled,
           pending_confirmation: false,
           failed: false,
-          status: 'confirmed',
+          cancelled: isCancelled,
+          refund_required: isCancelled && norm.paymentStatus === 'paid' && norm.refundStatus !== 'refunded',
+          status: isCancelled ? 'cancelled' : 'confirmed',
           order_id: cleanOid,
           internal_order_ref: orderDocId,
           payment_id: existing.order.razorpay_payment_id || razorpayPaymentId || null,
@@ -4659,9 +4973,14 @@ export async function handleOrderStatusRequest(params: {
             id: existing.order.id,
             orderNumber: existing.order.order_number,
             customerUserId: existing.order.customer_user_id,
-            status: existing.order.status,
-            paymentStatus: existing.order.payment_status || 'paid',
-            fulfillmentStatus: existing.order.fulfillment_status || existing.order.status,
+            status: norm.status,
+            paymentStatus: norm.paymentStatus,
+            refundStatus: norm.refundStatus,
+            fulfillmentStatus: norm.fulfillmentStatus,
+            cancelledAt: norm.cancelledAt,
+            cancelledBy: norm.cancelledBy,
+            cancelReason: norm.cancelReason,
+            stockRestoredAt: existing.order.stock_restored_at ?? null,
             subtotalPaise: existing.order.subtotal_paise,
             discountPaise: existing.order.discount_paise || 0,
             giftCardPaise: existing.order.gift_card_paise || 0,
@@ -4670,15 +4989,19 @@ export async function handleOrderStatusRequest(params: {
             totalPaise: existing.order.total_paise,
             currency: existing.order.currency,
             createdAt: existing.order.created_at,
-            paymentMethod: 'razorpay',
+            updatedAt: existing.order.updated_at ?? existing.order.created_at,
+            paymentMethod: (existing.order.payment_method as 'razorpay' | 'cod') || 'razorpay',
             razorpayOrderId: cleanOid,
             razorpayPaymentId: existing.order.razorpay_payment_id || razorpayPaymentId || '',
-            statusHistory: parseStatusHistorySafe(existing.order.status_history_json),
+            statusHistory: history,
             items: existing.items.map((l) => ({
               productId: l.product_id,
               variantId: l.variant_id,
               productTitle: l.product_title,
               variantLabel: l.variant_label,
+              colorName: l.color_name || undefined,
+              size: l.size || undefined,
+              imageUrl: l.image_url || undefined,
               sku: l.sku,
               unitPricePaise: l.unit_price_paise,
               quantity: l.quantity,
@@ -4697,6 +5020,25 @@ export async function handleOrderStatusRequest(params: {
       { requestId, customerIdToken }
     );
     if (existingFs) {
+      if (existingFs.status === 'cancelled') {
+        return withSupportRef(
+          200,
+          {
+            confirmed: false,
+            pending_confirmation: false,
+            failed: false,
+            cancelled: true,
+            refund_required:
+              existingFs.paymentStatus === 'paid' && existingFs.refundStatus !== 'refunded',
+            status: 'cancelled',
+            order_id: cleanOid,
+            internal_order_ref: orderDocId,
+            payment_id: existingFs.razorpayPaymentId || razorpayPaymentId || null,
+            order: existingFs,
+          },
+          requestId
+        );
+      }
       if (existingFs.paymentMethod !== 'razorpay' || existingFs.paymentStatus === 'paid') {
         return withSupportRef(
           200,
@@ -4704,6 +5046,7 @@ export async function handleOrderStatusRequest(params: {
             confirmed: true,
             pending_confirmation: false,
             failed: false,
+            cancelled: false,
             status: 'confirmed',
             order_id: cleanOid,
             internal_order_ref: orderDocId,
@@ -4760,6 +5103,7 @@ export async function handleOrderStatusRequest(params: {
               confirmed: true,
               pending_confirmation: false,
               failed: false,
+              cancelled: false,
               status: 'confirmed',
               order_id: cleanOid,
               internal_order_ref: orderDocId,
@@ -4777,6 +5121,7 @@ export async function handleOrderStatusRequest(params: {
           confirmed: false,
           pending_confirmation: true,
           failed: false,
+          cancelled: false,
           status: existingFs.paymentStatus || 'pending',
           order_id: cleanOid,
           internal_order_ref: orderDocId,
@@ -5049,6 +5394,9 @@ async function persistCodOrderToFirestoreOnce(params: {
           variantId: l.variantId,
           productTitle: l.productTitle,
           variantLabel: l.variantLabel,
+          colorName: l.colorName,
+          size: l.size,
+          imageUrl: l.imageUrl,
           sku: l.sku,
           unitPricePaise: l.unitPricePaise,
           quantity: l.quantity,
@@ -5085,6 +5433,9 @@ async function persistCodOrderToFirestoreOnce(params: {
       variantId: l.variantId,
       productTitle: l.productTitle,
       variantLabel: l.variantLabel,
+      colorName: l.colorName,
+      size: l.size,
+      imageUrl: l.imageUrl,
       sku: l.sku,
       unitPricePaise: l.unitPricePaise,
       quantity: l.quantity,
@@ -5207,6 +5558,9 @@ async function persistCodOrderToFirestoreOnce(params: {
     variant_id: l.variantId,
     product_title: l.productTitle,
     variant_label: l.variantLabel,
+    color_name: l.colorName ?? '',
+    size: l.size ?? '',
+    image_url: l.imageUrl ?? '',
     sku: l.sku,
     unit_price_paise: l.unitPricePaise,
     quantity: l.quantity,
@@ -5240,6 +5594,9 @@ async function persistCodOrderToFirestoreOnce(params: {
       variantId: l.variantId,
       productTitle: l.productTitle,
       variantLabel: l.variantLabel,
+      colorName: l.colorName,
+      size: l.size,
+      imageUrl: l.imageUrl,
       sku: l.sku,
       unitPricePaise: l.unitPricePaise,
       quantity: l.quantity,
@@ -5620,6 +5977,9 @@ export async function handlePlaceCodOrderRequest(params: {
             variantId: l.variant_id,
             productTitle: l.product_title,
             variantLabel: l.variant_label,
+            colorName: l.color_name || undefined,
+            size: l.size || undefined,
+            imageUrl: l.image_url || undefined,
             sku: l.sku,
             unitPricePaise: l.unit_price_paise,
             quantity: l.quantity,
@@ -5721,6 +6081,9 @@ export async function handlePlaceCodOrderRequest(params: {
           variantId: l.variant_id,
           productTitle: l.product_title,
           variantLabel: l.variant_label,
+          colorName: l.color_name || undefined,
+          size: l.size || undefined,
+          imageUrl: l.image_url || undefined,
           sku: l.sku,
           unitPricePaise: l.unit_price_paise,
           quantity: l.quantity,
@@ -5772,6 +6135,620 @@ export async function handlePlaceCodOrderRequest(params: {
       },
     };
   }
+}
+
+export async function handleCancelOrderRequest(params: {
+  orderId: string;
+  reason?: string;
+  expectedUpdatedAt?: number | null;
+  customerUserId: string;
+  customerIdToken?: string | null;
+  store?: BoutiqueStore | null;
+  requestId?: string;
+}): Promise<CheckoutHandlerResponse> {
+  const {
+    orderId,
+    reason,
+    expectedUpdatedAt = null,
+    customerUserId,
+    customerIdToken = null,
+    store = null,
+    requestId,
+  } = params;
+
+  const cleanOrderId = typeof orderId === 'string' ? orderId.trim() : '';
+  if (!cleanOrderId) {
+    return withSupportRef(
+      400,
+      { status: 400, code: 'VALIDATION_ERROR', error: 'orderId is required.' },
+      requestId
+    );
+  }
+  const cleanReason = typeof reason === 'string' ? reason.trim() : '';
+  if (cleanReason.length > 500) {
+    return withSupportRef(
+      400,
+      {
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        error: 'Cancellation reason must be 500 characters or fewer.',
+      },
+      requestId
+    );
+  }
+
+  if (store) {
+    try {
+      const result = await store.cancelCustomerOrder({
+        orderId: cleanOrderId,
+        userId: customerUserId,
+        reason: cleanReason || undefined,
+        expectedUpdatedAt,
+      });
+      if (!result) {
+        return withSupportRef(
+          404,
+          { status: 404, code: 'ORDER_NOT_FOUND', error: 'Order not found.' },
+          requestId
+        );
+      }
+      const { order, items } = result.orderWithItems;
+      if (order.razorpay_order_id) {
+        completedCheckoutsMemory.delete(order.razorpay_order_id);
+      }
+      const history = parseStatusHistorySafe(order.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: order.status,
+        rawFulfillmentStatus: order.fulfillment_status,
+        rawCancelRequest: order.cancel_request_json,
+        rawReturnRequest: order.return_request_json,
+        rawPaymentStatus: order.payment_status,
+        rawRefundStatus: order.refund_status,
+        rawCancelledAt: order.cancelled_at,
+        rawCancelledBy: order.cancelled_by,
+        rawCancelReason: order.cancel_reason,
+        razorpayPaymentId: order.razorpay_payment_id,
+        history,
+        paymentMethod: order.payment_method,
+      });
+      const receipt: SerializedOrderReceipt = {
+        id: order.id,
+        orderNumber: order.order_number,
+        customerUserId: order.customer_user_id,
+        status: norm.status,
+        paymentStatus: norm.paymentStatus,
+        refundStatus: norm.refundStatus,
+        fulfillmentStatus: norm.fulfillmentStatus,
+        cancelledAt: norm.cancelledAt,
+        cancelledBy: norm.cancelledBy,
+        cancelReason: norm.cancelReason,
+        stockRestoredAt: order.stock_restored_at ?? null,
+        subtotalPaise: order.subtotal_paise,
+        discountPaise: order.discount_paise || 0,
+        giftCardPaise: order.gift_card_paise || 0,
+        couponCode: order.coupon_code || null,
+        giftCardCode: order.gift_card_code || null,
+        totalPaise: order.total_paise,
+        currency: order.currency,
+        createdAt: order.created_at,
+        updatedAt: order.updated_at ?? order.created_at,
+        paymentCollectedAt: order.payment_collected_at ?? null,
+        idempotencyKey: order.idempotency_key ?? null,
+        paymentMethod: (order.payment_method as 'razorpay' | 'cod') || 'cod',
+        razorpayOrderId: order.razorpay_order_id ?? null,
+        razorpayPaymentId: order.razorpay_payment_id ?? null,
+        statusHistory: history,
+        items: items.map((l) => ({
+          productId: l.product_id,
+          variantId: l.variant_id,
+          productTitle: l.product_title,
+          variantLabel: l.variant_label,
+          colorName: l.color_name || undefined,
+          size: l.size || undefined,
+          imageUrl: l.image_url || undefined,
+          sku: l.sku,
+          unitPricePaise: l.unit_price_paise,
+          quantity: l.quantity,
+          lineTotalPaise: l.line_total_paise,
+        })),
+      };
+      return withSupportRef(
+        200,
+        {
+          ok: true,
+          alreadyCancelled: result.alreadyCancelled,
+          order: receipt,
+        },
+        requestId
+      );
+    } catch (err) {
+      if (err instanceof StoreHttpError) {
+        return withSupportRef(
+          err.httpStatus,
+          { status: err.httpStatus, code: err.code, error: err.message },
+          requestId
+        );
+      }
+      return withSupportRef(
+        500,
+        {
+          status: 500,
+          code: 'CANCEL_ORDER_FAILED',
+          error: err instanceof Error ? err.message : 'Unable to cancel order right now.',
+        },
+        requestId
+      );
+    }
+  }
+
+  // Firestore REST mode (Vercel serverless production)
+  const ctx = getFirestoreContext();
+  if (!ctx) {
+    return withSupportRef(
+      503,
+      { status: 503, code: 'FIREBASE_CONFIG_MISSING', error: 'Firebase configuration missing.' },
+      requestId
+    );
+  }
+
+  const serverTokenRes = await resolveFirestoreServerBearerToken({
+    operation: 'cancel_customer_order',
+    requestId,
+    ctx,
+  });
+  const useServerBearer = serverTokenRes.ok;
+  const authToken = serverTokenRes.ok ? serverTokenRes.token : customerIdToken;
+  if (!authToken) {
+    return withSupportRef(
+      503,
+      {
+        status: 503,
+        code: 'FIRESTORE_AUTH_UNAVAILABLE',
+        error: 'Unable to authenticate cancellation request against database.',
+      },
+      requestId
+    );
+  }
+
+  const keyParam = !useServerBearer && ctx.apiKey ? `?key=${encodeURIComponent(ctx.apiKey)}` : '';
+  const orderDocUrl = `${ctx.docBaseUrl}/environments/${ctx.namespace}/orders/${encodeURIComponent(cleanOrderId)}${keyParam}`;
+  const getRes = await withTransientRetry(() =>
+    fetch(orderDocUrl, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${authToken}` },
+    })
+  );
+  if (getRes.status === 404) {
+    return withSupportRef(
+      404,
+      { status: 404, code: 'ORDER_NOT_FOUND', error: 'Order not found.' },
+      requestId
+    );
+  }
+  if (!getRes.ok) {
+    const errText = await getRes.text().catch(() => '');
+    return withSupportRef(
+      getRes.status === 403 ? 403 : 503,
+      {
+        status: getRes.status === 403 ? 403 : 503,
+        code: getRes.status === 403 ? 'FORBIDDEN' : 'FIRESTORE_READ_FAILED',
+        error: errText || 'Unable to load order for cancellation.',
+      },
+      requestId
+    );
+  }
+
+  const rawDoc = (await getRes.json()) as {
+    updateTime?: string;
+    fields?: Record<string, FsFieldValue>;
+  };
+  const data = fromFsFields(rawDoc.fields);
+  if (typeof data.id !== 'string') {
+    return withSupportRef(
+      404,
+      { status: 404, code: 'ORDER_NOT_FOUND', error: 'Order not found.' },
+      requestId
+    );
+  }
+  if (data.customer_user_id !== customerUserId) {
+    return withSupportRef(
+      403,
+      {
+        status: 403,
+        code: 'FORBIDDEN',
+        error: 'You can only cancel your own orders.',
+      },
+      requestId
+    );
+  }
+
+  const history = parseOrderHistory(data.status_history ?? data.status_history_json);
+  const paymentMethod: 'razorpay' | 'cod' =
+    data.payment_method === 'razorpay' || data.razorpay_order_id ? 'razorpay' : 'cod';
+  const norm = normalizeOrderRequestsAndStatus({
+    rawStatus: typeof data.status === 'string' ? data.status : null,
+    rawFulfillmentStatus:
+      typeof data.fulfillment_status === 'string' ? data.fulfillment_status : null,
+    rawCancelRequest: data.cancel_request ?? data.cancel_request_json,
+    rawReturnRequest: data.return_request ?? data.return_request_json,
+    rawPaymentStatus: data.payment_status,
+    rawRefundStatus: data.refund_status,
+    rawCancelledAt: data.cancelled_at,
+    rawCancelledBy: data.cancelled_by,
+    rawCancelReason: data.cancel_reason,
+    razorpayPaymentId: data.razorpay_payment_id,
+    history,
+    paymentMethod,
+  });
+
+  const buildReceiptFromData = (
+    merged: Record<string, unknown>,
+    mergedNorm: ReturnType<typeof normalizeOrderRequestsAndStatus>,
+    mergedHistory: OrderStatusHistoryEntry[]
+  ): SerializedOrderReceipt => {
+    const rawItems = Array.isArray(merged.items) ? merged.items : [];
+    const createdAt = Number(merged.created_at || Date.now());
+    return {
+      id: String(merged.id),
+      orderNumber: String(merged.order_number || cleanOrderId),
+      customerUserId:
+        typeof merged.customer_user_id === 'string' ? merged.customer_user_id : null,
+      status: mergedNorm.status,
+      paymentStatus: mergedNorm.paymentStatus,
+      refundStatus: mergedNorm.refundStatus,
+      fulfillmentStatus: mergedNorm.fulfillmentStatus,
+      cancelledAt: mergedNorm.cancelledAt,
+      cancelledBy: mergedNorm.cancelledBy,
+      cancelReason: mergedNorm.cancelReason,
+      stockRestoredAt:
+        typeof merged.stock_restored_at === 'number' ? merged.stock_restored_at : null,
+      subtotalPaise: Number(merged.subtotal_paise || 0),
+      discountPaise: Number(merged.discount_paise || 0),
+      giftCardPaise: Number(merged.gift_card_paise || 0),
+      couponCode: typeof merged.coupon_code === 'string' ? merged.coupon_code : null,
+      giftCardCode: typeof merged.gift_card_code === 'string' ? merged.gift_card_code : null,
+      totalPaise: Number(merged.total_paise || 0),
+      currency: String(merged.currency || 'INR'),
+      createdAt,
+      updatedAt: Number(merged.updated_at || createdAt),
+      paymentCollectedAt:
+        typeof merged.payment_collected_at === 'number' ? merged.payment_collected_at : null,
+      idempotencyKey:
+        typeof merged.idempotency_key === 'string' ? merged.idempotency_key : null,
+      paymentMethod,
+      razorpayOrderId:
+        typeof merged.razorpay_order_id === 'string' ? merged.razorpay_order_id : null,
+      razorpayPaymentId:
+        typeof merged.razorpay_payment_id === 'string' ? merged.razorpay_payment_id : null,
+      statusHistory: mergedHistory,
+      items: rawItems
+        .filter((it): it is Record<string, unknown> => Boolean(it && typeof it === 'object'))
+        .map((it) => ({
+          productId: String(it.product_id || ''),
+          variantId: typeof it.variant_id === 'string' ? it.variant_id : null,
+          productTitle: String(it.product_title || ''),
+          variantLabel: String(it.variant_label || ''),
+          colorName: typeof it.color_name === 'string' && it.color_name ? it.color_name : undefined,
+          size: typeof it.size === 'string' && it.size ? it.size : undefined,
+          imageUrl: typeof it.image_url === 'string' && it.image_url ? it.image_url : undefined,
+          sku: String(it.sku || ''),
+          unitPricePaise: Number(it.unit_price_paise || 0),
+          quantity: Number(it.quantity || 1),
+          lineTotalPaise: Number(it.line_total_paise || 0),
+        })),
+    };
+  };
+
+  // Idempotent retry if already cancelled
+  if (norm.status === 'cancelled') {
+    if (typeof data.razorpay_order_id === 'string' && data.razorpay_order_id) {
+      completedCheckoutsMemory.delete(data.razorpay_order_id);
+    }
+    return withSupportRef(
+      200,
+      {
+        ok: true,
+        alreadyCancelled: true,
+        order: buildReceiptFromData(data, norm, history),
+      },
+      requestId
+    );
+  }
+
+  // Optimistic concurrency check if caller supplied expectedUpdatedAt
+  const currentUpdatedAt = Number(data.updated_at || data.created_at || 0);
+  if (
+    typeof expectedUpdatedAt === 'number' &&
+    Number.isFinite(expectedUpdatedAt) &&
+    currentUpdatedAt !== expectedUpdatedAt
+  ) {
+    return withSupportRef(
+      409,
+      {
+        status: 409,
+        code: 'CONCURRENCY_CONFLICT',
+        error: 'This order was updated by the studio while you were viewing it. Please refresh and check the latest status.',
+      },
+      requestId
+    );
+  }
+
+  if (!PRE_SHIPPING_CANCEL_STATES.has(norm.fulfillmentStatus)) {
+    return withSupportRef(
+      409,
+      {
+        status: 409,
+        code: 'CANCELLATION_CUTOFF_PASSED',
+        error: `Cancellation is unavailable because the order is already ${norm.fulfillmentStatus}.`,
+      },
+      requestId
+    );
+  }
+
+  const now = Date.now();
+  const effectiveReason = cleanReason || 'Cancelled by customer';
+  const { paymentStatus, refundStatus } = normalizePaymentAndRefundStatus({
+    rawPaymentStatus: data.payment_status,
+    rawRefundStatus: data.refund_status,
+    paymentMethod,
+    orderStatus: 'cancelled',
+    razorpayPaymentId: data.razorpay_payment_id,
+  });
+  const cancelRecord = {
+    id: norm.cancelRequest?.id || `req_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`,
+    type: 'cancel' as const,
+    reason: effectiveReason,
+    status: 'approved' as const,
+    requestedAt: norm.cancelRequest?.requestedAt || now,
+    updatedAt: now,
+    resolvedAt: now,
+    resolutionNote: 'Cancelled directly by customer prior to dispatch',
+  };
+  const nextHistory: OrderStatusHistoryEntry[] = [
+    ...history,
+    {
+      status: 'cancelled',
+      note:
+        cleanReason
+          ? `Order cancelled by customer: ${cleanReason}`
+          : 'Order cancelled by customer',
+      actor: 'customer',
+      at: now,
+    },
+  ];
+
+  const existingStockRestoredAt =
+    typeof data.stock_restored_at === 'number' && data.stock_restored_at > 0
+      ? data.stock_restored_at
+      : null;
+
+  const orderPatch: Record<string, unknown> = {
+    status: 'cancelled',
+    fulfillment_status: 'cancelled',
+    refund_status: refundStatus,
+    cancelled_at: now,
+    cancelled_by: 'customer',
+    cancel_reason: cleanReason || null,
+    cancel_request: cancelRecord,
+    cancel_request_json: JSON.stringify(cancelRecord),
+    status_history: nextHistory,
+    status_history_json: JSON.stringify(nextHistory),
+    updated_at: now,
+  };
+
+  if (useServerBearer) {
+    const writes: Array<Record<string, unknown>> = [];
+    const rawItems = Array.isArray(data.items)
+      ? data.items.filter((it): it is Record<string, unknown> => Boolean(it && typeof it === 'object'))
+      : [];
+    const shouldRestoreStock = !existingStockRestoredAt && rawItems.length > 0;
+    if (shouldRestoreStock) {
+      orderPatch.stock_restored_at = now;
+      const byProduct = new Map<string, Map<string, number>>();
+      for (const it of rawItems) {
+        const pid = typeof it.product_id === 'string' ? it.product_id : '';
+        const vid = typeof it.variant_id === 'string' ? it.variant_id : '';
+        const qty = Number(it.quantity || 0);
+        if (!pid || qty <= 0) continue;
+        if (!byProduct.has(pid)) byProduct.set(pid, new Map());
+        const vMap = byProduct.get(pid)!;
+        vMap.set(vid, (vMap.get(vid) || 0) + qty);
+      }
+      for (const [pid, variantQtyMap] of byProduct.entries()) {
+        try {
+          const prodRes = await fetch(
+            `${ctx.docBaseUrl}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}`,
+            { headers: { Authorization: `Bearer ${authToken}` } }
+          );
+          if (prodRes.ok) {
+            const prodDoc = (await prodRes.json()) as {
+              updateTime?: string;
+              fields?: Record<string, FsFieldValue>;
+            };
+            const prodData = fromFsFields(prodDoc.fields);
+            const rawVariants = Array.isArray(prodData.variants) ? prodData.variants : [];
+            const nextVariants = rawVariants.map((v) => {
+              if (!v || typeof v !== 'object') return v;
+              const rec = { ...(v as Record<string, unknown>) };
+              const vid = String(rec.id || '');
+              const addQty = variantQtyMap.get(vid) || 0;
+              if (addQty > 0) {
+                rec.stock_qty = Math.max(0, Number(rec.stock_qty || 0)) + addQty;
+              }
+              return rec;
+            });
+            const nextTotalStock = nextVariants.reduce(
+              (sum, v) =>
+                sum +
+                (v && typeof v === 'object' ? Number((v as Record<string, unknown>).stock_qty || 0) : 0),
+              0
+            );
+            writes.push({
+              ...(prodDoc.updateTime ? { currentDocument: { updateTime: prodDoc.updateTime } } : {}),
+              update: {
+                name: `${ctx.dbRootResource}/environments/${ctx.namespace}/products/${encodeURIComponent(pid)}`,
+                fields: toFsFields({
+                  ...prodData,
+                  variants: nextVariants,
+                  stock_qty: nextTotalStock,
+                  updated_at: now,
+                }),
+              },
+            });
+          }
+        } catch {
+          // Skip seed-only products not stored in Firestore
+        }
+      }
+    }
+
+    const orderDocName = `${ctx.dbRootResource}/environments/${ctx.namespace}/orders/${encodeURIComponent(cleanOrderId)}`;
+    writes.unshift({
+      ...(rawDoc.updateTime ? { currentDocument: { updateTime: rawDoc.updateTime } } : {}),
+      update: {
+        name: orderDocName,
+        fields: toFsFields(orderPatch),
+      },
+      updateMask: { fieldPaths: Object.keys(orderPatch) },
+    });
+
+    const notifId = `notif_cancel_${cleanOrderId}`;
+    writes.push({
+      update: {
+        name: `${ctx.dbRootResource}/environments/${ctx.namespace}/users/${encodeURIComponent(customerUserId)}/notifications/${notifId}`,
+        fields: toFsFields({
+          id: notifId,
+          user_id: customerUserId,
+          type: 'order_cancelled',
+          title: `Order ${String(data.order_number || cleanOrderId)} cancelled`,
+          message:
+            refundStatus === 'pending_refund'
+              ? `Your order ${String(data.order_number || cleanOrderId)} has been cancelled. Your prepaid refund has been queued for review.`
+              : `Your order ${String(data.order_number || cleanOrderId)} has been cancelled.`,
+          order_id: cleanOrderId,
+          order_number: String(data.order_number || cleanOrderId),
+          is_read: 0,
+          read: false,
+          read_at: null,
+          created_at: now,
+        }),
+      },
+    });
+
+    const commitRes = await fetch(`${ctx.docBaseUrl}:commit`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ writes }),
+    });
+    if (!commitRes.ok) {
+      const errText = await commitRes.text().catch(() => '');
+      if (
+        commitRes.status === 409 ||
+        commitRes.status === 412 ||
+        errText.includes('FAILED_PRECONDITION') ||
+        errText.includes('ABORTED')
+      ) {
+        return withSupportRef(
+          409,
+          {
+            status: 409,
+            code: 'CONCURRENCY_CONFLICT',
+            error: 'This order was updated concurrently. Please refresh and check its latest status.',
+          },
+          requestId
+        );
+      }
+      return withSupportRef(
+        503,
+        {
+          status: 503,
+          code: 'CANCEL_PERSIST_FAILED',
+          error: 'Could not save order cancellation. Please try again.',
+        },
+        requestId
+      );
+    }
+  } else {
+    // Customer-token fallback with strict updateMask and optimistic updateTime precondition
+    const maskParams = Object.keys(orderPatch)
+      .map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`)
+      .join('&');
+    const precond = rawDoc.updateTime
+      ? `&currentDocument.updateTime=${encodeURIComponent(rawDoc.updateTime)}`
+      : '';
+    const keySuffix = ctx.apiKey ? `&key=${encodeURIComponent(ctx.apiKey)}` : '';
+    const patchUrl = `${ctx.docBaseUrl}/environments/${ctx.namespace}/orders/${encodeURIComponent(cleanOrderId)}?${maskParams}${precond}${keySuffix}`;
+    const patchRes = await fetch(patchUrl, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ fields: toFsFields(orderPatch) }),
+    });
+    if (!patchRes.ok) {
+      const errText = await patchRes.text().catch(() => '');
+      if (
+        patchRes.status === 409 ||
+        patchRes.status === 412 ||
+        errText.includes('FAILED_PRECONDITION')
+      ) {
+        return withSupportRef(
+          409,
+          {
+            status: 409,
+            code: 'CONCURRENCY_CONFLICT',
+            error: 'This order was updated concurrently. Please refresh and check its latest status.',
+          },
+          requestId
+        );
+      }
+      return withSupportRef(
+        patchRes.status === 403 ? 403 : 503,
+        {
+          status: patchRes.status === 403 ? 403 : 503,
+          code: patchRes.status === 403 ? 'FORBIDDEN' : 'CANCEL_PERSIST_FAILED',
+          error:
+            patchRes.status === 403
+              ? 'Order cancellation was rejected by security rules.'
+              : 'Could not save order cancellation. Please try again.',
+        },
+        requestId
+      );
+    }
+  }
+
+  if (typeof data.razorpay_order_id === 'string' && data.razorpay_order_id) {
+    completedCheckoutsMemory.delete(data.razorpay_order_id);
+  }
+  const merged = { ...data, ...orderPatch };
+  const finalNorm = normalizeOrderRequestsAndStatus({
+    rawStatus: 'cancelled',
+    rawFulfillmentStatus: 'cancelled',
+    rawCancelRequest: cancelRecord,
+    rawReturnRequest: data.return_request ?? data.return_request_json,
+    rawPaymentStatus: paymentStatus,
+    rawRefundStatus: refundStatus,
+    rawCancelledAt: now,
+    rawCancelledBy: 'customer',
+    rawCancelReason: cleanReason || null,
+    razorpayPaymentId: data.razorpay_payment_id,
+    history: nextHistory,
+    paymentMethod,
+  });
+
+  return withSupportRef(
+    200,
+    {
+      ok: true,
+      alreadyCancelled: false,
+      order: buildReceiptFromData(merged, finalNorm, nextHistory),
+    },
+    requestId
+  );
 }
 
 export function clearRazorpayCheckoutCachesForTest() {

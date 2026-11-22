@@ -1,25 +1,35 @@
 export type CollectionCategory = string;
 
 export interface ProductColor {
+  id?: string;
   name: string;
   hex: string;
+  thumbnailUrl?: string | null;
+  position?: number;
+  active?: boolean;
 }
 
 export interface ProductImage {
+  id?: string;
   src: string;
   alt: string;
   isCover?: boolean;
+  colorId?: string | null;
+  position?: number;
 }
 
 export interface ProductVariant {
   id: string;
   sku: string;
   size: string;
+  colorId?: string | null;
   colorName: string;
   colorHex: string;
   pricePaise: number;
+  priceOverridePaise?: number | null;
   compareAtPaise: number | null;
   stockQty: number;
+  active?: boolean;
   position: number;
 }
 
@@ -58,6 +68,9 @@ export interface BagItem {
   fallbackTitle: string;
   fallbackVariant: string;
   fallbackImage: string;
+  fallbackColorName?: string;
+  fallbackSize?: string;
+  fallbackSku?: string;
 }
 
 export interface ValidatedBagItem {
@@ -73,6 +86,9 @@ export interface ValidatedBagItem {
   lineTotalPaise: number;
   title: string;
   variantLabel: string;
+  colorName?: string;
+  size?: string;
+  sku?: string;
   imageUrl: string;
 }
 
@@ -93,7 +109,15 @@ export type OrderFulfillmentStatus =
   | 'delivered'
   | 'cancelled'
   | 'return_requested'
-  | 'returned';
+  | 'returned'
+  | 'unknown';
+
+export type OrderRefundStatus =
+  | 'none'
+  | 'not_required'
+  | 'pending_refund'
+  | 'refund_initiated'
+  | 'refunded';
 
 export interface OrderStatusHistoryEntry {
   status: string;
@@ -133,6 +157,7 @@ export interface PlacedOrderReceipt {
   shippingAddress?: string;
   status: string;
   paymentStatus?: OrderPaymentStatus;
+  refundStatus?: OrderRefundStatus;
   fulfillmentStatus?: OrderFulfillmentStatus;
   statusHistory?: OrderStatusHistoryEntry[];
   subtotalPaise: number;
@@ -149,6 +174,9 @@ export interface PlacedOrderReceipt {
   idempotencyKey?: string | null;
   razorpayOrderId?: string | null;
   razorpayPaymentId?: string | null;
+  cancelledAt?: number | null;
+  cancelledBy?: 'customer' | 'owner' | 'system' | null;
+  cancelReason?: string | null;
   cancelRequest?: OrderReturnRequest | null;
   returnRequest?: OrderReturnRequest | null;
   hiddenByCustomer?: boolean;
@@ -162,6 +190,9 @@ export interface PlacedOrderReceipt {
     variantId: string;
     productTitle: string;
     variantLabel: string;
+    colorName?: string;
+    size?: string;
+    imageUrl?: string;
     sku: string;
     unitPricePaise: number;
     quantity: number;
@@ -287,6 +318,7 @@ export interface AdminProductImage {
   url: string;
   alt: string;
   isCover: boolean;
+  colorId?: string | null;
   position: number;
 }
 
@@ -315,6 +347,7 @@ export interface AdminOverviewMetrics {
   totalCategories: number;
   totalOrders: number;
   pendingOrders: number;
+  cancelledOrders?: number;
   totalRevenuePaise: number;
   unreadMessages: number;
   totalMessages: number;
@@ -345,6 +378,7 @@ export interface AdminOrder {
   shippingAddress: string;
   status: string;
   paymentStatus?: OrderPaymentStatus;
+  refundStatus?: OrderRefundStatus;
   fulfillmentStatus?: OrderFulfillmentStatus;
   paymentMethod?: 'razorpay' | 'cod';
   paymentCollectedAt?: number | null;
@@ -359,6 +393,9 @@ export interface AdminOrder {
   totalPaise: number;
   currency: string;
   statusHistory?: OrderStatusHistoryEntry[];
+  cancelledAt?: number | null;
+  cancelledBy?: 'customer' | 'owner' | 'system' | null;
+  cancelReason?: string | null;
   cancelRequest?: OrderReturnRequest | null;
   returnRequest?: OrderReturnRequest | null;
   hiddenByCustomer?: boolean;
@@ -375,6 +412,9 @@ export interface AdminOrder {
     variantId: string | null;
     productTitle: string;
     variantLabel: string;
+    colorName?: string;
+    size?: string;
+    imageUrl?: string;
     sku: string;
     unitPricePaise: number;
     quantity: number;

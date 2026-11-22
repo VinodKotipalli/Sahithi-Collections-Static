@@ -43,13 +43,17 @@ import {
   type UserRow,
 } from './store.ts';
 import {
+  isOrderPendingFulfillment,
   normalizeOrderRequestsAndStatus,
+  normalizePaymentAndRefundStatus,
+  normalizeRawOrderStatusValue,
   parseNotificationPrefs,
   parseOrderHistory,
   PRE_CUTOFF_DELIVERY_EDIT_STATES,
   PRE_SHIPPING_CANCEL_STATES,
   RETURN_ELIGIBLE_STATES,
   validateNonSensitivePaymentMethodInput,
+  validateOrderStatusTransition,
 } from './order-utils.ts';
 import {
   DEFAULT_SITE_SETTINGS,
@@ -59,6 +63,12 @@ import {
   mergeSiteSettings,
   mergeStorefrontContent,
 } from './storefront-defaults.ts';
+import {
+  formatVariantDisplayLabel,
+  isVariantColorActiveInMetadata,
+  resolveVariantSnapshotImageUrl,
+  validateColorVariantMatrix,
+} from '../src/utils/colorVariants.ts';
 
 const MEDIA_CHUNK_BYTES = 450_000;
 const FIREBASE_CERTS_URL =
@@ -1012,6 +1022,7 @@ interface FirestoreProductDoc {
     id: string;
     product_id: string;
     media_id: string | null;
+    color_id?: string | null;
     url: string;
     alt_text: string;
     is_cover: boolean;
@@ -1032,7 +1043,11 @@ interface FirestoreOrderDoc {
   shipping_address: string;
   status: string;
   payment_status?: string;
+  refund_status?: string;
   fulfillment_status?: string;
+  cancelled_at?: number | null;
+  cancelled_by?: string | null;
+  cancel_reason?: string | null;
   payment_method?: string;
   razorpay_order_id?: string | null;
   razorpay_payment_id?: string | null;
@@ -1070,7 +1085,11 @@ function normalizeRestOrderRow(o: FirestoreOrderDoc): OrderRow {
     shipping_address: o.shipping_address,
     status: o.status,
     payment_status: o.payment_status ?? (o.razorpay_payment_id ? 'paid' : 'unpaid'),
-    fulfillment_status: o.fulfillment_status ?? o.status ?? 'placed',
+    refund_status: o.refund_status ?? undefined,
+    fulfillment_status: o.fulfillment_status ?? o.status ?? 'unknown',
+    cancelled_at: typeof o.cancelled_at === 'number' ? Number(o.cancelled_at) : null,
+    cancelled_by: typeof o.cancelled_by === 'string' ? o.cancelled_by : null,
+    cancel_reason: typeof o.cancel_reason === 'string' ? o.cancel_reason : null,
     payment_method:
       o.payment_method ?? (o.razorpay_order_id || o.razorpay_payment_id ? 'razorpay' : 'cod'),
     razorpay_order_id: o.razorpay_order_id ?? null,
@@ -1141,12 +1160,16 @@ function fromFirestoreProduct(doc: FirestoreProductDoc): ProductWithParts {
       product_id: doc.id,
       sku: String(v.sku),
       size: String(v.size),
+      color_id: typeof v.color_id === 'string' && v.color_id.trim() ? v.color_id.trim() : null,
       color_name: String(v.color_name),
       color_hex: String(v.color_hex),
       price_paise: Number(v.price_paise),
+      price_override_paise:
+        typeof v.price_override_paise === 'number' ? v.price_override_paise : null,
       compare_at_paise:
         typeof v.compare_at_paise === 'number' ? v.compare_at_paise : null,
       stock_qty: Number(v.stock_qty),
+      active: v.active === undefined || v.active === null ? 1 : v.active ? 1 : 0,
       position: Number(v.position ?? idx),
     }))
     .sort((a, b) => a.position - b.position);
@@ -1156,6 +1179,7 @@ function fromFirestoreProduct(doc: FirestoreProductDoc): ProductWithParts {
       id: String(img.id),
       product_id: doc.id,
       media_id: img.media_id ?? null,
+      color_id: typeof img.color_id === 'string' && img.color_id.trim() ? img.color_id.trim() : null,
       url: String(img.url),
       alt_text: String(img.alt_text || ''),
       is_cover: img.is_cover ? 1 : 0,
@@ -2396,38 +2420,52 @@ export class FirestoreRestStore implements BoutiqueStore {
       (p) => p.status !== 'archived' && p.stock_qty === 0
     ).length;
 
-    const totalRevenuePaise = orders
-      .filter((o) => {
-        if (o.status === 'cancelled' || o.payment_status === 'refunded') return false;
-        if (o.payment_status === 'paid') return true;
-        const isCod =
-          o.payment_method === 'cod' || (!o.razorpay_order_id && !o.razorpay_payment_id);
-        return !isCod && ['paid', 'fulfilled'].includes(o.status);
-      })
-      .reduce((sum, o) => sum + Number(o.total_paise || 0), 0);
-    const pendingOrders = orders.filter(
-      (o) => !['delivered', 'cancelled', 'returned'].includes(o.fulfillment_status || o.status || 'placed')
-    ).length;
-    const openReturnRequests = orders.reduce((acc, o) => {
-      let hasPending = false;
-      if (o.return_request_json) {
-        try {
-          const req = JSON.parse(o.return_request_json) as { status?: string };
-          if (req?.status === 'pending') hasPending = true;
-        } catch {
-          // ignore
-        }
+    let totalRevenuePaise = 0;
+    let pendingOrders = 0;
+    let cancelledOrders = 0;
+    let openReturnRequests = 0;
+
+    for (const o of orders) {
+      const history = parseOrderHistory(o.status_history_json);
+      const norm = normalizeOrderRequestsAndStatus({
+        rawStatus: o.status,
+        rawFulfillmentStatus: o.fulfillment_status,
+        rawCancelRequest: o.cancel_request_json,
+        rawReturnRequest: o.return_request_json,
+        rawPaymentStatus: o.payment_status,
+        rawRefundStatus: o.refund_status,
+        rawCancelledAt: o.cancelled_at,
+        rawCancelledBy: o.cancelled_by,
+        rawCancelReason: o.cancel_reason,
+        razorpayPaymentId: o.razorpay_payment_id,
+        history,
+        paymentMethod: o.payment_method,
+      });
+
+      if (norm.status === 'cancelled') {
+        cancelledOrders += 1;
+      } else if (isOrderPendingFulfillment(norm.status)) {
+        pendingOrders += 1;
       }
-      if (!hasPending && o.cancel_request_json) {
-        try {
-          const cancelReq = JSON.parse(o.cancel_request_json) as { status?: string };
-          if (cancelReq?.status === 'pending') hasPending = true;
-        } catch {
-          // ignore
-        }
+
+      const isCod =
+        o.payment_method === 'cod' || (!o.razorpay_order_id && !o.razorpay_payment_id);
+      if (
+        norm.status !== 'cancelled' &&
+        norm.refundStatus !== 'refunded' &&
+        (norm.paymentStatus === 'paid' || (!isCod && ['paid', 'fulfilled'].includes(o.status)))
+      ) {
+        totalRevenuePaise += Number(o.total_paise || 0);
       }
-      return hasPending ? acc + 1 : acc;
-    }, 0);
+
+      if (
+        norm.returnRequest?.status === 'pending' ||
+        (norm.status !== 'cancelled' && norm.cancelRequest?.status === 'pending')
+      ) {
+        openReturnRequests += 1;
+      }
+    }
+
     const totalCustomers = userDocs.filter(
       (u) => !u.data?.deleted_at && (Boolean(u.data?.email_verified) || Boolean(u.data?.phone_verified))
     ).length;
@@ -2451,6 +2489,7 @@ export class FirestoreRestStore implements BoutiqueStore {
         totalCategories: categories.length,
         totalOrders: orders.length,
         pendingOrders,
+        cancelledOrders,
         totalRevenuePaise,
         unreadMessages: messages.filter((m) => m.status === 'unread').length,
         totalMessages: messages.length,
@@ -2565,7 +2604,13 @@ export class FirestoreRestStore implements BoutiqueStore {
   async createProduct(input: {
     product: ProductRow;
     variants: ProductVariantRow[];
-    images: Array<{ mediaId: string | null; url: string; alt: string; isCover: boolean }>;
+    images: Array<{
+      mediaId: string | null;
+      colorId?: string | null;
+      url: string;
+      alt: string;
+      isCover: boolean;
+    }>;
     actorUserId: string;
     auditAction: string;
     auditSummary: string;
@@ -2603,6 +2648,7 @@ export class FirestoreRestStore implements BoutiqueStore {
         id: crypto.randomUUID(),
         product_id: input.product.id,
         media_id: img.mediaId,
+        color_id: img.colorId ?? null,
         url: img.url,
         alt_text: img.alt,
         is_cover: Boolean(img.isCover),
@@ -2680,7 +2726,13 @@ export class FirestoreRestStore implements BoutiqueStore {
     publishedAtIfNull: number | null;
     now: number;
     variants: ProductVariantRow[];
-    images: Array<{ mediaId: string | null; url: string; alt: string; isCover: boolean }>;
+    images: Array<{
+      mediaId: string | null;
+      colorId?: string | null;
+      url: string;
+      alt: string;
+      isCover: boolean;
+    }>;
     actorUserId: string;
     auditAction: string;
     auditSummary: string;
@@ -2738,6 +2790,7 @@ export class FirestoreRestStore implements BoutiqueStore {
         id: crypto.randomUUID(),
         product_id: input.productId,
         media_id: img.mediaId,
+        color_id: img.colorId ?? null,
         url: img.url,
         alt_text: img.alt,
         is_cover: Boolean(img.isCover),
@@ -2811,11 +2864,14 @@ export class FirestoreRestStore implements BoutiqueStore {
       product_id: newId,
       sku: `${newBaseSku}-V${idx + 1}`,
       size: v.size,
+      color_id: v.color_id ?? null,
       color_name: v.color_name,
       color_hex: v.color_hex,
       price_paise: v.price_paise,
+      price_override_paise: v.price_override_paise ?? null,
       compare_at_paise: v.compare_at_paise,
       stock_qty: v.stock_qty,
+      active: v.active === undefined || v.active === null ? 1 : v.active ? 1 : 0,
       position: idx,
     }));
 
@@ -2887,8 +2943,56 @@ export class FirestoreRestStore implements BoutiqueStore {
     if (Number(current.version) !== input.expectedVersion) {
       return { ok: false as const, code: 'VERSION_CONFLICT' as const };
     }
-    if (input.actionName === 'publish' && (current.images || []).length === 0) {
-      return { ok: false as const, code: 'NO_IMAGES' as const };
+    if (input.targetStatus === 'published') {
+      if ((current.images || []).length === 0) {
+        return { ok: false as const, code: 'NO_IMAGES' as const };
+      }
+      let parsedColors: Array<{
+        id?: string;
+        name: string;
+        hex?: string;
+        thumbnailUrl?: string | null;
+        position?: number;
+        active?: boolean;
+      }> = [];
+      try {
+        const raw = JSON.parse(current.colors_json || '[]');
+        if (Array.isArray(raw)) parsedColors = raw;
+      } catch {
+        parsedColors = [];
+      }
+      const matrixCheck = validateColorVariantMatrix({
+        status: 'published',
+        colors: parsedColors,
+        images: (current.images || []).map((img) => ({
+          id: img.id,
+          url: img.url,
+          alt: img.alt_text,
+          isCover: Boolean(img.is_cover),
+          colorId: img.color_id ?? null,
+          position: img.position,
+        })),
+        variants: (current.variants || []).map((v) => ({
+          id: v.id,
+          sku: v.sku,
+          size: v.size,
+          colorId: v.color_id ?? null,
+          colorName: v.color_name,
+          colorHex: v.color_hex,
+          pricePaise: v.price_paise,
+          priceOverridePaise: v.price_override_paise ?? null,
+          compareAtPaise: v.compare_at_paise,
+          stockQty: v.stock_qty,
+          active: v.active === undefined || v.active === null ? true : Boolean(v.active),
+        })),
+      });
+      if (!matrixCheck.ok) {
+        return {
+          ok: false as const,
+          code: 'INCOMPLETE_COLOR_VARIANTS' as const,
+          message: matrixCheck.error,
+        };
+      }
     }
 
     const now = Date.now();
@@ -3305,6 +3409,7 @@ export class FirestoreRestStore implements BoutiqueStore {
       }
       const variant =
         prodWrap.variants.find((v) => v.id === reqItem.variantId || v.sku === reqItem.variantId) ||
+        prodWrap.variants.find((v) => (v.active === undefined || v.active === null ? true : Boolean(v.active))) ||
         prodWrap.variants[0];
       if (!variant) {
         throw new StoreHttpError(
@@ -3313,25 +3418,42 @@ export class FirestoreRestStore implements BoutiqueStore {
           `Selected size/color for "${prodWrap.product.title}" is no longer available.`
         );
       }
+      const variantActive =
+        variant.active === undefined || variant.active === null ? true : Boolean(variant.active);
+      const colorActive = isVariantColorActiveInMetadata(prodWrap.product.colors_json, variant);
+      if (!variantActive || !colorActive) {
+        throw new StoreHttpError(
+          409,
+          'VARIANT_UNAVAILABLE',
+          `Selected colour/size (${variant.color_name} · ${variant.size}) for "${prodWrap.product.title}" is no longer available.`
+        );
+      }
       if (reqItem.expectedPricePaise !== null && reqItem.expectedPricePaise !== variant.price_paise) {
         throw new StoreHttpError(
           409,
           'PRICE_CHANGED',
-          `Price for "${prodWrap.product.title}" (${variant.size} / ${variant.color_name}) has been updated. Review your bag before placing the order.`
+          `Price for "${prodWrap.product.title}" (${variant.color_name} · ${variant.size}) has been updated. Review your bag before placing the order.`
         );
       }
       if (variant.stock_qty < reqItem.quantity) {
         throw new StoreHttpError(
           409,
           'INSUFFICIENT_STOCK',
-          `Only ${variant.stock_qty} piece(s) left for "${prodWrap.product.title}" (${variant.size} / ${variant.color_name}).`
+          `Only ${variant.stock_qty} piece(s) left for "${prodWrap.product.title}" (${variant.color_name} · ${variant.size}).`
         );
       }
 
       const nextVariants = prodWrap.variants.map((v) =>
         v.id === variant.id ? { ...v, stock_qty: v.stock_qty - reqItem.quantity } : v
       );
-      const nextTotalStock = nextVariants.reduce((sum, v) => sum + v.stock_qty, 0);
+      const nextTotalStock = nextVariants.reduce(
+        (sum, v) =>
+          sum +
+          ((v.active === undefined || v.active === null ? true : Boolean(v.active))
+            ? v.stock_qty
+            : 0),
+        0
+      );
       pendingStockUpdates.set(prodWrap.product.id, {
         ...prodWrap,
         product: { ...prodWrap.product, stock_qty: nextTotalStock, updated_at: now },
@@ -3341,6 +3463,11 @@ export class FirestoreRestStore implements BoutiqueStore {
       const lineTotal = variant.price_paise * reqItem.quantity;
       subtotalPaise += lineTotal;
       productIds.add(prodWrap.product.id);
+      const imageUrl = resolveVariantSnapshotImageUrl(
+        prodWrap.product.colors_json,
+        prodWrap.images || [],
+        variant
+      );
 
       orderItems.push({
         id: crypto.randomUUID(),
@@ -3348,7 +3475,10 @@ export class FirestoreRestStore implements BoutiqueStore {
         product_id: prodWrap.product.id,
         variant_id: variant.id,
         product_title: prodWrap.product.title,
-        variant_label: `${variant.size} / ${variant.color_name}`,
+        variant_label: formatVariantDisplayLabel(variant.color_name, variant.size),
+        color_name: variant.color_name,
+        size: variant.size,
+        image_url: imageUrl,
         sku: variant.sku,
         unit_price_paise: variant.price_paise,
         quantity: reqItem.quantity,
@@ -3516,6 +3646,39 @@ export class FirestoreRestStore implements BoutiqueStore {
     return Boolean(updated);
   }
 
+  private async restoreRestOrderStock(items: OrderItemRow[], now: number): Promise<void> {
+    const qtyByProductAndVariant = new Map<string, Map<string | null, number>>();
+    for (const item of items) {
+      const qty = Math.max(0, Number(item.quantity || 0));
+      if (qty <= 0) continue;
+      const inner = qtyByProductAndVariant.get(item.product_id) || new Map<string | null, number>();
+      inner.set(item.variant_id || null, (inner.get(item.variant_id || null) || 0) + qty);
+      qtyByProductAndVariant.set(item.product_id, inner);
+    }
+    for (const [pid, varMap] of qtyByProductAndVariant.entries()) {
+      const pDoc = await this.getDoc(`products/${pid}`).catch(() => null);
+      if (!pDoc) continue;
+      const prodData = pDoc.data as unknown as FirestoreProductDoc;
+      const clonedVariants = (prodData.variants || []).map((v) => ({ ...v }));
+      for (const [vid, qty] of varMap.entries()) {
+        const vIdx = vid ? clonedVariants.findIndex((v) => v.id === vid) : 0;
+        if (vIdx >= 0) {
+          clonedVariants[vIdx].stock_qty = Number(clonedVariants[vIdx].stock_qty || 0) + qty;
+        }
+      }
+      const nextStock = clonedVariants.reduce(
+        (sum, v) =>
+          sum + ((v.active === undefined || v.active === null ? true : Boolean(v.active)) ? Number(v.stock_qty || 0) : 0),
+        0
+      );
+      await this.patchDoc(`products/${pid}`, {
+        variants: clonedVariants,
+        stock_qty: nextStock,
+        updated_at: now,
+      }).catch(() => {});
+    }
+  }
+
   async updateOrderStatusWithHistory(
     orderId: string,
     nextStatus: string,
@@ -3523,43 +3686,113 @@ export class FirestoreRestStore implements BoutiqueStore {
       actor?: 'owner' | 'system' | 'customer';
       note?: string;
       notifyCustomer?: boolean;
+      expectedUpdatedAt?: number | null;
+      paymentStatus?: string;
+      refundStatus?: string;
     }
   ): Promise<OrderWithItems | null> {
     const existing = await this.getDoc(`orders/${orderId}`);
     if (!existing) return null;
     const docData = existing.data as unknown as FirestoreOrderDoc;
-    const now = Date.now();
 
-    let history: OrderStatusHistoryEntry[] = [];
-    try {
-      const parsed = JSON.parse(docData.status_history_json || '[]') as unknown;
-      if (Array.isArray(parsed)) history = parsed as OrderStatusHistoryEntry[];
-    } catch {
-      history = [];
+    if (
+      typeof options?.expectedUpdatedAt === 'number' &&
+      Number.isFinite(options.expectedUpdatedAt) &&
+      Number(docData.updated_at || docData.created_at || 0) !== Number(options.expectedUpdatedAt)
+    ) {
+      throw new StoreHttpError(
+        409,
+        'CONCURRENCY_CONFLICT',
+        'This order was updated elsewhere. Refresh to view the latest status before saving.'
+      );
     }
 
-    const changed = docData.status !== nextStatus || docData.fulfillment_status !== nextStatus;
-    if (changed || options?.note) {
+    const history = parseOrderHistory(docData.status_history_json);
+    const norm = normalizeOrderRequestsAndStatus({
+      rawStatus: docData.status,
+      rawFulfillmentStatus: docData.fulfillment_status,
+      rawCancelRequest: docData.cancel_request_json,
+      rawReturnRequest: docData.return_request_json,
+      rawPaymentStatus: docData.payment_status,
+      rawRefundStatus: docData.refund_status,
+      rawCancelledAt: docData.cancelled_at,
+      rawCancelledBy: docData.cancelled_by,
+      rawCancelReason: docData.cancel_reason,
+      razorpayPaymentId: docData.razorpay_payment_id,
+      history,
+      paymentMethod: docData.payment_method,
+    });
+
+    const transition = validateOrderStatusTransition(norm.status, nextStatus);
+    if (!transition.ok) {
+      throw new StoreHttpError(
+        transition.code === 'VALIDATION_ERROR' ? 400 : 409,
+        transition.code,
+        transition.error
+      );
+    }
+
+    const normalizedNext = normalizeRawOrderStatusValue(nextStatus);
+    const now = Date.now();
+    const payNorm = normalizePaymentAndRefundStatus({
+      rawPaymentStatus: options?.paymentStatus ?? docData.payment_status,
+      rawRefundStatus: options?.refundStatus ?? docData.refund_status,
+      paymentMethod: docData.payment_method,
+      orderStatus: normalizedNext,
+      razorpayPaymentId: docData.razorpay_payment_id,
+    });
+
+    const changed =
+      norm.status !== normalizedNext ||
+      docData.status !== normalizedNext ||
+      docData.fulfillment_status !== normalizedNext;
+    const refundChanged =
+      Boolean(options?.refundStatus) && payNorm.refundStatus !== norm.refundStatus;
+
+    if (changed || refundChanged || options?.note) {
       history.push({
-        status: nextStatus,
+        status: changed ? normalizedNext : `refund_${payNorm.refundStatus}`,
         note: options?.note?.trim() || undefined,
         actor: options?.actor || 'owner',
         at: now,
       });
     }
 
-    const patch = {
-      status: nextStatus,
-      fulfillment_status: nextStatus,
+    const shouldRestoreStock = normalizedNext === 'cancelled' && !docData.stock_restored_at;
+    const patch: Record<string, unknown> = {
+      status: normalizedNext,
+      fulfillment_status: normalizedNext,
+      payment_status: payNorm.paymentStatus,
+      refund_status: payNorm.refundStatus,
+      cancelled_at:
+        normalizedNext === 'cancelled'
+          ? docData.cancelled_at ?? norm.cancelledAt ?? now
+          : docData.cancelled_at ?? null,
+      cancelled_by:
+        normalizedNext === 'cancelled'
+          ? docData.cancelled_by ?? norm.cancelledBy ?? options?.actor ?? 'owner'
+          : docData.cancelled_by ?? null,
+      cancel_reason:
+        normalizedNext === 'cancelled'
+          ? docData.cancel_reason ?? norm.cancelReason ?? (options?.note?.trim().slice(0, 500) || null)
+          : docData.cancel_reason ?? null,
+      stock_restored_at: shouldRestoreStock ? now : docData.stock_restored_at ?? null,
       status_history_json: JSON.stringify(history),
       updated_at: now,
     };
-    await this.patchDoc(`orders/${orderId}`, patch);
+
+    await this.patchDoc(`orders/${orderId}`, patch, {
+      updateTime: existing.updateTime,
+    });
+
+    if (shouldRestoreStock) {
+      await this.restoreRestOrderStock(docData.items || [], now);
+    }
 
     if (options?.notifyCustomer !== false && changed && docData.customer_user_id) {
-      const label = nextStatus.replace(/_/g, ' ');
+      const label = normalizedNext.replace(/_/g, ' ');
       await this.createCustomerNotification({
-        id: `notif_status_${orderId}_${nextStatus}_${now}`,
+        id: `notif_status_${orderId}_${normalizedNext}_${now}`,
         userId: docData.customer_user_id,
         type: 'order_status',
         title: `Order ${docData.order_number} is now ${label}`,
@@ -3571,8 +3804,132 @@ export class FirestoreRestStore implements BoutiqueStore {
       }).catch(() => {});
     }
 
-    const updatedDoc: FirestoreOrderDoc = { ...docData, ...patch };
+    const updatedDoc: FirestoreOrderDoc = { ...docData, ...(patch as Partial<FirestoreOrderDoc>) };
     return { order: normalizeRestOrderRow(updatedDoc), items: updatedDoc.items || [] };
+  }
+
+  async cancelCustomerOrder(input: {
+    orderId: string;
+    userId: string;
+    reason?: string;
+    expectedUpdatedAt?: number | null;
+  }): Promise<{ orderWithItems: OrderWithItems; alreadyCancelled: boolean } | null> {
+    const cleanReason = typeof input.reason === 'string' ? input.reason.trim().slice(0, 500) : '';
+    const existing = await this.getDoc(`orders/${input.orderId}`);
+    if (!existing) return null;
+    const docData = existing.data as unknown as FirestoreOrderDoc;
+
+    if (docData.customer_user_id !== input.userId) {
+      throw new StoreHttpError(
+        403,
+        'FORBIDDEN',
+        'You can only cancel orders belonging to your own account.'
+      );
+    }
+
+    const history = parseOrderHistory(docData.status_history_json);
+    const norm = normalizeOrderRequestsAndStatus({
+      rawStatus: docData.status,
+      rawFulfillmentStatus: docData.fulfillment_status,
+      rawCancelRequest: docData.cancel_request_json,
+      rawReturnRequest: docData.return_request_json,
+      rawPaymentStatus: docData.payment_status,
+      rawRefundStatus: docData.refund_status,
+      rawCancelledAt: docData.cancelled_at,
+      rawCancelledBy: docData.cancelled_by,
+      rawCancelReason: docData.cancel_reason,
+      razorpayPaymentId: docData.razorpay_payment_id,
+      history,
+      paymentMethod: docData.payment_method,
+    });
+
+    if (norm.status === 'cancelled') {
+      return {
+        orderWithItems: { order: normalizeRestOrderRow(docData), items: docData.items || [] },
+        alreadyCancelled: true,
+      };
+    }
+
+    if (
+      typeof input.expectedUpdatedAt === 'number' &&
+      Number.isFinite(input.expectedUpdatedAt) &&
+      Number(docData.updated_at || docData.created_at || 0) !== Number(input.expectedUpdatedAt)
+    ) {
+      throw new StoreHttpError(
+        409,
+        'CONCURRENCY_CONFLICT',
+        'This order was updated just before your request. Please refresh and check its latest status.'
+      );
+    }
+
+    if (!PRE_SHIPPING_CANCEL_STATES.has(norm.status)) {
+      throw new StoreHttpError(
+        409,
+        'CANCELLATION_CUTOFF_PASSED',
+        `Cancellation is unavailable once an order is ${norm.status}.`
+      );
+    }
+
+    const now = Date.now();
+    const refundStatus = norm.paymentStatus === 'paid' ? 'pending_refund' : 'not_required';
+    const cancelRequestRecord: OrderReturnRequestRecord = {
+      id: norm.cancelRequest?.id || `req_${crypto.randomUUID().slice(0, 12)}`,
+      type: 'cancel',
+      reason: cleanReason || norm.cancelRequest?.reason || 'Cancelled by customer',
+      status: 'approved',
+      requestedAt: norm.cancelRequest?.requestedAt || now,
+      updatedAt: now,
+      resolvedAt: now,
+      resolutionNote: 'Cancelled directly by customer before shipment',
+    };
+
+    history.push({
+      status: 'cancelled',
+      note: cleanReason || 'Cancelled by customer before shipment',
+      actor: 'customer',
+      at: now,
+    });
+
+    const patch: Record<string, unknown> = {
+      status: 'cancelled',
+      fulfillment_status: 'cancelled',
+      refund_status: refundStatus,
+      cancelled_at: now,
+      cancelled_by: 'customer',
+      cancel_reason: cleanReason || null,
+      cancel_request: cancelRequestRecord,
+      cancel_request_json: JSON.stringify(cancelRequestRecord),
+      status_history_json: JSON.stringify(history),
+      updated_at: now,
+    };
+
+    await this.patchDoc(`orders/${input.orderId}`, patch, {
+      updateTime: existing.updateTime,
+    });
+
+    if (!docData.stock_restored_at) {
+      await this.restoreRestOrderStock(docData.items || [], now).catch(() => {});
+    }
+
+    if (docData.customer_user_id) {
+      await this.createCustomerNotification({
+        id: `notif_cancelled_${input.orderId}`,
+        userId: docData.customer_user_id,
+        type: 'order_status',
+        title: `Order ${docData.order_number} cancelled`,
+        message: cleanReason
+          ? `Your order ${docData.order_number} has been cancelled (${cleanReason}).`
+          : `Your order ${docData.order_number} has been cancelled.`,
+        orderId: input.orderId,
+        orderNumber: docData.order_number,
+      }).catch(() => {});
+    }
+
+    const updatedDoc: FirestoreOrderDoc = { ...docData, ...(patch as Partial<FirestoreOrderDoc>) };
+    return {
+      orderWithItems: { order: normalizeRestOrderRow(updatedDoc), items: updatedDoc.items || [] },
+      alreadyCancelled: false,
+    };
   }
 
   async collectOrderPayment(input: {
@@ -3651,6 +4008,15 @@ export class FirestoreRestStore implements BoutiqueStore {
     type: 'cancel' | 'return';
     reason: string;
   }): Promise<OrderWithItems | null> {
+    if (input.type === 'cancel') {
+      const result = await this.cancelCustomerOrder({
+        orderId: input.orderId,
+        userId: input.userId,
+        reason: input.reason,
+      });
+      return result ? result.orderWithItems : null;
+    }
+
     const cleanReason = input.reason.trim().slice(0, 500);
     if (cleanReason.length < 3) {
       throw new StoreHttpError(
@@ -3673,52 +4039,38 @@ export class FirestoreRestStore implements BoutiqueStore {
       rawFulfillmentStatus: docData.fulfillment_status,
       rawCancelRequest: docData.cancel_request_json,
       rawReturnRequest: docData.return_request_json,
+      rawPaymentStatus: docData.payment_status,
+      rawRefundStatus: docData.refund_status,
+      rawCancelledAt: docData.cancelled_at,
+      rawCancelledBy: docData.cancelled_by,
+      rawCancelReason: docData.cancel_reason,
+      razorpayPaymentId: docData.razorpay_payment_id,
       history,
       paymentMethod: docData.payment_method,
     });
 
-    if (input.type === 'cancel') {
-      if (!PRE_SHIPPING_CANCEL_STATES.has(norm.fulfillmentStatus)) {
-        throw new StoreHttpError(
-          409,
-          'CANCELLATION_CUTOFF_PASSED',
-          `Cancellation is unavailable once an order is ${norm.fulfillmentStatus}.`
-        );
+    if (!RETURN_ELIGIBLE_STATES.has(norm.fulfillmentStatus)) {
+      throw new StoreHttpError(
+        409,
+        'RETURN_NOT_ELIGIBLE',
+        'Return requests can only be submitted after your order is delivered.'
+      );
+    }
+    if (norm.returnRequest?.status === 'pending') {
+      if (norm.returnRequest.reason === cleanReason) {
+        return { order: normalizeRestOrderRow(docData), items: docData.items || [] };
       }
-      if (norm.cancelRequest?.status === 'pending') {
-        if (norm.cancelRequest.reason === cleanReason) {
-          return { order: normalizeRestOrderRow(docData), items: docData.items || [] };
-        }
-        throw new StoreHttpError(
-          409,
-          'REQUEST_ALREADY_PENDING',
-          'A cancellation request is already pending for this order. You can edit or withdraw it below.'
-        );
-      }
-    } else {
-      if (!RETURN_ELIGIBLE_STATES.has(norm.fulfillmentStatus)) {
-        throw new StoreHttpError(
-          409,
-          'RETURN_NOT_ELIGIBLE',
-          'Return requests can only be submitted after your order is delivered.'
-        );
-      }
-      if (norm.returnRequest?.status === 'pending') {
-        if (norm.returnRequest.reason === cleanReason) {
-          return { order: normalizeRestOrderRow(docData), items: docData.items || [] };
-        }
-        throw new StoreHttpError(
-          409,
-          'REQUEST_ALREADY_PENDING',
-          'A return request is already pending for this order. You can edit or withdraw it below.'
-        );
-      }
+      throw new StoreHttpError(
+        409,
+        'REQUEST_ALREADY_PENDING',
+        'A return request is already pending for this order. You can edit or withdraw it below.'
+      );
     }
 
     const now = Date.now();
     const requestRecord: OrderReturnRequestRecord = {
       id: `req_${crypto.randomUUID().slice(0, 12)}`,
-      type: input.type,
+      type: 'return',
       reason: cleanReason,
       status: 'pending',
       requestedAt: now,
@@ -3727,7 +4079,7 @@ export class FirestoreRestStore implements BoutiqueStore {
     };
 
     history.push({
-      status: input.type === 'cancel' ? 'cancellation_requested' : 'return_requested',
+      status: 'return_requested',
       note: cleanReason,
       actor: 'customer',
       at: now,
@@ -3736,21 +4088,14 @@ export class FirestoreRestStore implements BoutiqueStore {
     const patch: Record<string, unknown> = {
       status_history_json: JSON.stringify(history),
       updated_at: now,
-      ...(input.type === 'cancel'
-        ? {
-            cancel_request: requestRecord,
-            cancel_request_json: JSON.stringify(requestRecord),
-          }
-        : {
-            return_request: requestRecord,
-            return_request_json: JSON.stringify(requestRecord),
-          }),
+      return_request: requestRecord,
+      return_request_json: JSON.stringify(requestRecord),
     };
     await this.patchDoc(`orders/${input.orderId}`, patch, {
       updateTime: existing.updateTime,
     });
 
-    const updatedDoc: FirestoreOrderDoc = { ...docData, ...patch };
+    const updatedDoc: FirestoreOrderDoc = { ...docData, ...(patch as Partial<FirestoreOrderDoc>) };
     return { order: normalizeRestOrderRow(updatedDoc), items: updatedDoc.items || [] };
   }
 
@@ -4004,9 +4349,21 @@ export class FirestoreRestStore implements BoutiqueStore {
       at: now,
     });
 
+    const payNorm = normalizePaymentAndRefundStatus({
+      rawPaymentStatus: docData.payment_status,
+      rawRefundStatus: docData.refund_status,
+      paymentMethod: docData.payment_method,
+      orderStatus: nextStatus,
+      razorpayPaymentId: docData.razorpay_payment_id,
+    });
+
     const patch: Record<string, unknown> = {
       status: nextStatus,
       fulfillment_status: nextFulfillment,
+      refund_status: payNorm.refundStatus,
+      cancelled_at: nextStatus === 'cancelled' ? docData.cancelled_at ?? now : docData.cancelled_at ?? null,
+      cancelled_by: nextStatus === 'cancelled' ? docData.cancelled_by ?? 'owner' : docData.cancelled_by ?? null,
+      cancel_reason: nextStatus === 'cancelled' ? docData.cancel_reason ?? updatedReq.reason ?? null : docData.cancel_reason ?? null,
       cancel_request_json:
         updatedReq.type === 'cancel'
           ? JSON.stringify(updatedReq)

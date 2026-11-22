@@ -16,16 +16,34 @@ import { useAuth } from '../../context/AuthContext';
 import type { AdminAuditEntry, AdminOrder } from '../../types/boutique';
 import { formatPaiseINR, formatTimestamp } from '../../utils/format';
 
+export type AdminOrderStatusFilter =
+  | 'all'
+  | 'pending'
+  | 'confirmed'
+  | 'packed'
+  | 'shipped'
+  | 'delivered'
+  | 'cancelled'
+  | 'returned'
+  | 'unknown';
+
 interface AdminOrdersPanelProps {
   orders: AdminOrder[];
   loading: boolean;
   page: number;
   totalPages: number;
+  statusFilter?: AdminOrderStatusFilter;
+  statusCounts?: Record<string, number>;
+  realtimeError?: string | null;
+  onReconnectRealtime?: () => void;
+  onStatusFilterChange?: (filter: AdminOrderStatusFilter) => void;
   onPageChange: (page: number) => void;
   onUpdateOrderStatus: (
     orderId: string,
     status: string,
-    note?: string
+    note?: string,
+    refundStatus?: string,
+    expectedUpdatedAt?: number
   ) => Promise<{ ok: boolean; error?: string }>;
   onCollectOrderPayment?: (
     orderId: string,
@@ -54,11 +72,33 @@ const ORDER_STATUSES = [
   'returned',
 ] as const;
 
+const FILTER_TABS: Array<{ id: AdminOrderStatusFilter; label: string }> = [
+  { id: 'all', label: 'All' },
+  { id: 'pending', label: 'Pending' },
+  { id: 'confirmed', label: 'Confirmed' },
+  { id: 'packed', label: 'Packed' },
+  { id: 'shipped', label: 'Shipped' },
+  { id: 'delivered', label: 'Delivered' },
+  { id: 'cancelled', label: 'Cancelled' },
+  { id: 'returned', label: 'Returned' },
+];
+
+const REFUND_STATUS_OPTIONS = [
+  { value: 'pending_refund', label: 'Refund Pending' },
+  { value: 'refund_initiated', label: 'Refund Initiated' },
+  { value: 'refunded', label: 'Refunded (Confirmed)' },
+] as const;
+
 export function AdminOrdersPanel({
   orders,
   loading,
   page,
   totalPages,
+  statusFilter = 'all',
+  statusCounts,
+  realtimeError,
+  onReconnectRealtime,
+  onStatusFilterChange,
   onPageChange,
   onUpdateOrderStatus,
   onCollectOrderPayment,
@@ -167,6 +207,71 @@ export function AdminOrdersPanel({
         )}
       </section>
 
+      {realtimeError && (
+        <div
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-950"
+        >
+          <span className="flex items-center gap-2 font-medium">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" aria-hidden="true" />
+            <span>{realtimeError}</span>
+          </span>
+          {onReconnectRealtime && (
+            <button
+              type="button"
+              onClick={onReconnectRealtime}
+              className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-amber-400 bg-white px-3 text-xs font-semibold text-amber-900 hover:bg-amber-100"
+            >
+              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Reconnect</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Status Filter Tabs & Counts */}
+      {onStatusFilterChange && (
+        <nav
+          aria-label="Filter orders by status"
+          className="flex flex-wrap items-center gap-2 rounded-2xl border border-[#49243E]/12 bg-white p-3"
+        >
+          {[
+            ...FILTER_TABS,
+            ...((statusCounts?.unknown || 0) > 0
+              ? [{ id: 'unknown' as const, label: 'Needs Review' }]
+              : []),
+          ].map((tab) => {
+            const active = statusFilter === tab.id;
+            const count = statusCounts?.[tab.id];
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => onStatusFilterChange(tab.id)}
+                className={`inline-flex min-h-[38px] items-center gap-1.5 rounded-xl px-3.5 text-xs font-medium transition-colors ${
+                  active
+                    ? 'bg-[#49243E] text-[#FFF9F5]'
+                    : 'border border-[#49243E]/15 bg-[#FFF9F5] text-[#49243E] hover:bg-[#F3D5DF]/40'
+                }`}
+              >
+                <span>{tab.label}</span>
+                {typeof count === 'number' && (
+                  <span
+                    className={`rounded-md px-1.5 py-0.5 text-[11px] font-semibold tabular-nums ${
+                      active
+                        ? 'bg-white/20 text-[#FFF9F5]'
+                        : 'bg-white text-[#49243E]/80'
+                    }`}
+                  >
+                    {count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </nav>
+      )}
+
       {loading ? (
         <div className="space-y-3 rounded-3xl border border-[#49243E]/12 bg-white p-6">
           {Array.from({ length: 3 }).map((_, idx) => (
@@ -179,10 +284,14 @@ export function AdminOrdersPanel({
             <PackageCheck className="h-5 w-5" aria-hidden="true" />
           </div>
           <h3 className="mt-4 font-serif text-2xl font-semibold text-[#49243E]">
-            No customer orders recorded yet
+            {statusFilter === 'all'
+              ? 'No customer orders recorded yet'
+              : `No ${statusFilter.replace(/_/g, ' ')} orders`}
           </h3>
           <p className="mt-1.5 max-w-md text-sm text-[#242124]/70">
-            When shoppers place orders from the Boutique Bag, real order totals, snapshots, and variant deductions will appear here.
+            {statusFilter === 'all'
+              ? 'When shoppers place orders from the Boutique Bag, real order totals, snapshots, and variant deductions will appear here.'
+              : 'Orders matching this status filter will appear here automatically.'}
           </p>
         </section>
       ) : (
@@ -194,19 +303,38 @@ export function AdminOrdersPanel({
             {orders.map((order) => {
               const isCod = order.paymentMethod === 'cod';
               const payment = order.paymentStatus || (order.razorpayPaymentId ? 'paid' : 'unpaid');
-              const fulfillment = order.fulfillmentStatus || order.status || 'placed';
+              const fulfillment = order.status || order.fulfillmentStatus || 'unknown';
+              const refundStatus = order.refundStatus || 'none';
+              const isTerminal = fulfillment === 'cancelled' || fulfillment === 'returned';
+              const isCancelled = fulfillment === 'cancelled';
               const isUnpaidCod = isCod && payment !== 'paid';
               const canCollectPayment =
                 isUnpaidCod &&
-                fulfillment !== 'cancelled' &&
-                fulfillment !== 'returned' &&
+                !isTerminal &&
+                fulfillment !== 'unknown' &&
                 typeof onCollectOrderPayment === 'function';
               const paymentDisplay =
                 payment === 'paid'
                   ? 'Paid'
                   : isCod
-                    ? 'Payment due on delivery'
+                    ? isCancelled
+                      ? 'Unpaid (COD)'
+                      : 'Payment due on delivery'
                     : payment;
+              const orderStatusLabel =
+                fulfillment === 'unknown'
+                  ? 'Unknown (Needs Review)'
+                  : fulfillment.replace(/_/g, ' ');
+              const refundLabel =
+                refundStatus === 'pending_refund'
+                  ? 'Refund Pending'
+                  : refundStatus === 'refund_initiated'
+                    ? 'Refund Initiated'
+                    : refundStatus === 'refunded'
+                      ? 'Refunded'
+                      : refundStatus === 'not_required' && isCancelled
+                        ? 'No Refund Required'
+                        : null;
 
               return (
                 <div
@@ -223,6 +351,33 @@ export function AdminOrdersPanel({
                         <span className="rounded-md border border-[#49243E]/20 bg-white px-2 py-0.5 text-[11px] font-medium text-[#49243E]">
                           {isCod ? 'Cash on Delivery' : 'Online · Razorpay'}
                         </span>
+                        <span
+                          className={`rounded-md border px-2 py-0.5 text-[11px] font-semibold capitalize ${
+                            isCancelled
+                              ? 'border-[#9B2C3E]/35 bg-[#F3D5DF]/50 text-[#9B2C3E]'
+                              : fulfillment === 'unknown'
+                                ? 'border-amber-300 bg-amber-50 text-amber-900'
+                                : fulfillment === 'delivered'
+                                  ? 'border-emerald-300 bg-emerald-50 text-emerald-900'
+                                  : 'border-[#49243E]/20 bg-white text-[#49243E]'
+                          }`}
+                        >
+                          Order: {orderStatusLabel}
+                        </span>
+                        {refundLabel && (
+                          <span
+                            className={`rounded-md border px-2 py-0.5 text-[11px] font-semibold ${
+                              refundStatus === 'refunded'
+                                ? 'border-emerald-300 bg-emerald-50 text-emerald-900'
+                                : refundStatus === 'pending_refund' ||
+                                    refundStatus === 'refund_initiated'
+                                  ? 'border-amber-300 bg-amber-50 text-amber-900'
+                                  : 'border-[#49243E]/15 bg-white text-[#49243E]/75'
+                            }`}
+                          >
+                            {refundLabel}
+                          </span>
+                        )}
                         {order.hiddenByCustomer && (
                           <span className="rounded-md border border-[#B76E79]/40 bg-[#F3D5DF]/40 px-2 py-0.5 text-[11px] font-medium text-[#49243E]">
                             Hidden by customer
@@ -233,9 +388,17 @@ export function AdminOrdersPanel({
                         {order.customerName}
                       </h3>
                       <p className="mt-0.5 text-xs font-semibold uppercase tracking-wider text-[#49243E] tabular-nums">
-                        Payment: {paymentDisplay} · Fulfillment: {fulfillment.replace(/_/g, ' ')}
+                        Order Status: {orderStatusLabel} · Payment: {paymentDisplay}
                       </p>
-                      {order.cancelRequest?.status === 'pending' && (
+                      {isCancelled && (
+                        <p className="mt-1 text-xs font-medium text-[#9B2C3E] tabular-nums">
+                          Cancelled
+                          {order.cancelledAt ? ` on ${formatTimestamp(order.cancelledAt)}` : ''}
+                          {order.cancelledBy ? ` by ${order.cancelledBy}` : ''}
+                          {order.cancelReason ? ` — ${order.cancelReason}` : ''}
+                        </p>
+                      )}
+                      {!isCancelled && order.cancelRequest?.status === 'pending' && (
                         <p className="mt-1 text-xs font-semibold text-[#9B2C3E]">
                           Cancellation requested · Pending review
                         </p>
@@ -247,7 +410,7 @@ export function AdminOrdersPanel({
                       )}
                       {order.needsAdminReview && (
                         <p className="mt-1 rounded-lg border border-[#B76E79]/40 bg-[#F3D5DF]/30 px-2.5 py-1 text-[11px] font-medium text-[#49243E]">
-                          Legacy Status Review: {order.legacyCollisionNote || 'Recovered pre-update cancellation state.'}
+                          Status Review Needed: {order.legacyCollisionNote || 'Verify order status before taking fulfillment action.'}
                         </p>
                       )}
                       <p className="mt-1 text-xs tabular-nums text-[#242124]/65">
@@ -338,54 +501,126 @@ export function AdminOrdersPanel({
                           onChange={(e) =>
                             setStatusNotes((prev) => ({ ...prev, [order.id]: e.target.value }))
                           }
-                          placeholder="Optional customer note"
+                          placeholder={isTerminal ? 'Optional refund/audit note' : 'Optional customer note'}
                           className="h-11 w-44 rounded-xl border border-[#49243E]/18 bg-white px-3 text-xs text-[#242124] focus:border-[#49243E] focus:outline-none"
                         />
-                        <select
-                          aria-label={`Fulfillment status for ${order.orderNumber}`}
-                          disabled={updatingId === order.id}
-                          value={fulfillment}
-                          onChange={async (e) => {
-                            const nextStatus = e.target.value;
-                            setUpdatingId(order.id);
-                            setOrderErrors((prev) => {
-                              if (!prev[order.id]) return prev;
-                              const next = { ...prev };
-                              delete next[order.id];
-                              return next;
-                            });
-                            try {
-                              const result = await onUpdateOrderStatus(
-                                order.id,
-                                nextStatus,
-                                statusNotes[order.id]?.trim() || undefined
-                              );
-                              if (!result.ok) {
-                                setOrderErrors((prev) => ({
-                                  ...prev,
-                                  [order.id]:
-                                    result.error ||
-                                    'Could not update order status. Please try again.',
-                                }));
-                              } else {
-                                setStatusNotes((prev) => {
-                                  const next = { ...prev };
-                                  delete next[order.id];
-                                  return next;
-                                });
+                        {isTerminal ? (
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span
+                              aria-label={`Order status locked as ${fulfillment}`}
+                              className="inline-flex h-11 items-center rounded-xl border border-[#9B2C3E]/30 bg-[#F3D5DF]/40 px-3 text-xs font-semibold capitalize text-[#9B2C3E]"
+                            >
+                              {fulfillment.replace(/_/g, ' ')} (Locked)
+                            </span>
+                            {payment === 'paid' && (
+                              <select
+                                aria-label={`Refund status for ${order.orderNumber}`}
+                                disabled={updatingId === order.id}
+                                value={
+                                  refundStatus === 'refund_initiated' || refundStatus === 'refunded'
+                                    ? refundStatus
+                                    : 'pending_refund'
+                                }
+                                onChange={async (e) => {
+                                  const nextRefund = e.target.value;
+                                  setUpdatingId(order.id);
+                                  setOrderErrors((prev) => {
+                                    if (!prev[order.id]) return prev;
+                                    const next = { ...prev };
+                                    delete next[order.id];
+                                    return next;
+                                  });
+                                  try {
+                                    const result = await onUpdateOrderStatus(
+                                      order.id,
+                                      fulfillment,
+                                      statusNotes[order.id]?.trim() || undefined,
+                                      nextRefund,
+                                      order.updatedAt
+                                    );
+                                    if (!result.ok) {
+                                      setOrderErrors((prev) => ({
+                                        ...prev,
+                                        [order.id]:
+                                          result.error ||
+                                          'Could not update refund status. Please try again.',
+                                      }));
+                                    } else {
+                                      setStatusNotes((prev) => {
+                                        const next = { ...prev };
+                                        delete next[order.id];
+                                        return next;
+                                      });
+                                    }
+                                  } finally {
+                                    setUpdatingId(null);
+                                  }
+                                }}
+                                className="h-11 rounded-xl border border-amber-400 bg-white px-3 text-xs font-medium text-[#49243E] focus:border-[#49243E] focus:outline-none disabled:opacity-60"
+                              >
+                                {REFUND_STATUS_OPTIONS.map((opt) => (
+                                  <option key={opt.value} value={opt.value}>
+                                    {opt.label}
+                                  </option>
+                                ))}
+                              </select>
+                            )}
+                          </div>
+                        ) : (
+                          <select
+                            aria-label={`Fulfillment status for ${order.orderNumber}`}
+                            disabled={updatingId === order.id}
+                            value={fulfillment === 'unknown' ? '' : fulfillment}
+                            onChange={async (e) => {
+                              const nextStatus = e.target.value;
+                              if (!nextStatus) return;
+                              setUpdatingId(order.id);
+                              setOrderErrors((prev) => {
+                                if (!prev[order.id]) return prev;
+                                const next = { ...prev };
+                                delete next[order.id];
+                                return next;
+                              });
+                              try {
+                                const result = await onUpdateOrderStatus(
+                                  order.id,
+                                  nextStatus,
+                                  statusNotes[order.id]?.trim() || undefined,
+                                  undefined,
+                                  order.updatedAt
+                                );
+                                if (!result.ok) {
+                                  setOrderErrors((prev) => ({
+                                    ...prev,
+                                    [order.id]:
+                                      result.error ||
+                                      'Could not update order status. Please try again.',
+                                  }));
+                                } else {
+                                  setStatusNotes((prev) => {
+                                    const next = { ...prev };
+                                    delete next[order.id];
+                                    return next;
+                                  });
+                                }
+                              } finally {
+                                setUpdatingId(null);
                               }
-                            } finally {
-                              setUpdatingId(null);
-                            }
-                          }}
-                          className="h-11 rounded-xl border border-[#49243E]/20 bg-white px-3 text-xs font-medium capitalize text-[#49243E] focus:border-[#49243E] focus:outline-none disabled:opacity-60"
-                        >
-                          {ORDER_STATUSES.map((s) => (
-                            <option key={s} value={s}>
-                              {s.replace(/_/g, ' ')}
-                            </option>
-                          ))}
-                        </select>
+                            }}
+                            className="h-11 rounded-xl border border-[#49243E]/20 bg-white px-3 text-xs font-medium capitalize text-[#49243E] focus:border-[#49243E] focus:outline-none disabled:opacity-60"
+                          >
+                            {fulfillment === 'unknown' && (
+                              <option value="" disabled>
+                                Select status…
+                              </option>
+                            )}
+                            {ORDER_STATUSES.map((s) => (
+                              <option key={s} value={s}>
+                                {s.replace(/_/g, ' ')}
+                              </option>
+                            ))}
+                          </select>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -398,15 +633,29 @@ export function AdminOrdersPanel({
 
                   <ul className="divide-y divide-[#49243E]/8">
                     {order.items.map((item) => (
-                      <li key={item.id} className="flex items-center justify-between py-2 text-xs">
-                        <div>
-                          <span className="font-semibold text-[#49243E]">{item.productTitle}</span>
-                          <span className="text-[#242124]/65">
-                            {' '}
-                            · {item.variantLabel} · SKU {item.sku} &times; {item.quantity}
-                          </span>
+                      <li key={item.id} className="flex items-center justify-between gap-3 py-2.5 text-xs">
+                        <div className="flex min-w-0 items-center gap-3">
+                          {item.imageUrl && (
+                            <img
+                              src={item.imageUrl}
+                              alt={`${item.productTitle}${item.colorName ? ` — ${item.colorName}` : ''}`}
+                              loading="lazy"
+                              className="h-12 w-9 shrink-0 rounded-lg border border-[#49243E]/10 bg-[#F8F1ED] object-cover object-top"
+                            />
+                          )}
+                          <div className="min-w-0">
+                            <span className="block truncate font-semibold text-[#49243E]">
+                              {item.productTitle}
+                            </span>
+                            <span className="text-[#242124]/70">
+                              {item.colorName || item.size
+                                ? [item.colorName, item.size].filter(Boolean).join(' · ')
+                                : item.variantLabel}{' '}
+                              · SKU {item.sku} &times; {item.quantity}
+                            </span>
+                          </div>
                         </div>
-                        <span className="font-semibold tabular-nums text-[#242124]">
+                        <span className="shrink-0 font-semibold tabular-nums text-[#242124]">
                           {formatPaiseINR(item.lineTotalPaise)}
                         </span>
                       </li>

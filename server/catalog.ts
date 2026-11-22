@@ -42,14 +42,24 @@ import {
   type UserRow,
 } from './store.ts';
 import {
+  isOrderAwaitingDispatch,
   normalizeOrderRequestsAndStatus,
+  normalizeRawOrderStatusValue,
   parseOrderHistory,
+  VALID_FULFILLMENT_STATES,
 } from './order-utils.ts';
 import { FirestoreRestStore } from './firebase-rest.ts';
 import {
   mergeSiteSettings,
   mergeStorefrontContent,
 } from './storefront-defaults.ts';
+import {
+  formatVariantDisplayLabel,
+  isVariantColorActiveInMetadata,
+  makeStableColorId,
+  resolveVariantSnapshotImageUrl,
+  validateColorVariantMatrix,
+} from '../src/utils/colorVariants.ts';
 
 export const ALLOWED_CATEGORIES = [
   'Kurtis',
@@ -81,8 +91,12 @@ export interface AuthedCatalogRequest extends Request {
 }
 
 export interface ProductColorDTO {
+  id?: string;
   name: string;
   hex: string;
+  thumbnailUrl?: string | null;
+  position?: number;
+  active?: boolean;
 }
 
 export interface ProductImageDTO {
@@ -90,6 +104,7 @@ export interface ProductImageDTO {
   url: string;
   alt: string;
   isCover: boolean;
+  colorId?: string | null;
   position: number;
 }
 
@@ -97,11 +112,14 @@ export interface ProductVariantDTO {
   id: string;
   sku: string;
   size: string;
+  colorId?: string | null;
   colorName: string;
   colorHex: string;
   pricePaise: number;
+  priceOverridePaise?: number | null;
   compareAtPaise: number | null;
   stockQty: number;
+  active?: boolean;
   position: number;
 }
 
@@ -121,7 +139,14 @@ export interface PublicProductDTO {
   stockQty: number;
   lowStockThreshold: number;
   inStock: boolean;
-  images: Array<{ src: string; alt: string; isCover: boolean }>;
+  images: Array<{
+    id?: string;
+    src: string;
+    alt: string;
+    isCover: boolean;
+    colorId?: string | null;
+    position?: number;
+  }>;
   colors: ProductColorDTO[];
   sizes: string[];
   variants: ProductVariantDTO[];
@@ -242,16 +267,28 @@ function parseJsonSafe<T>(raw: string, fallback: T): T {
 
 function serializePublicProduct(record: ProductWithParts): PublicProductDTO {
   const { product: row, variants, images } = record;
-  const totalStock =
-    variants.length > 0 ? variants.reduce((sum, v) => sum + v.stock_qty, 0) : row.stock_qty;
-  const effectivePricePaise =
-    variants.length > 0 ? Math.min(...variants.map((v) => v.price_paise)) : row.price_paise;
-  const minVariant =
-    variants.find((v) => v.price_paise === effectivePricePaise) || variants[0] || null;
-  const effectiveComparePaise = minVariant ? minVariant.compare_at_paise : row.compare_at_paise;
-
   const colors = parseJsonSafe<ProductColorDTO[]>(row.colors_json, []);
   const sizes = parseJsonSafe<string[]>(row.sizes_json, []);
+
+  const activeVariants = variants.filter(
+    (v) =>
+      (v.active === undefined || v.active === null ? true : Boolean(v.active)) &&
+      isVariantColorActiveInMetadata(colors, v)
+  );
+  const effectivePool = activeVariants.length > 0 ? activeVariants : variants;
+
+  const totalStock =
+    variants.length > 0
+      ? activeVariants.reduce((sum, v) => sum + v.stock_qty, 0)
+      : row.stock_qty;
+  const effectivePricePaise =
+    effectivePool.length > 0
+      ? Math.min(...effectivePool.map((v) => v.price_paise))
+      : row.price_paise;
+  const minVariant =
+    effectivePool.find((v) => v.price_paise === effectivePricePaise) || effectivePool[0] || null;
+  const effectiveComparePaise = minVariant ? minVariant.compare_at_paise : row.compare_at_paise;
+
   const dateSource = row.published_at || row.created_at;
   const dateAdded = new Date(dateSource).toISOString().slice(0, 10);
 
@@ -273,9 +310,12 @@ function serializePublicProduct(record: ProductWithParts): PublicProductDTO {
     lowStockThreshold: row.low_stock_threshold,
     inStock: totalStock > 0,
     images: images.map((img) => ({
+      id: img.id,
       src: img.url,
       alt: img.alt_text || row.title,
       isCover: Boolean(img.is_cover),
+      colorId: img.color_id ?? null,
+      position: img.position,
     })),
     colors,
     sizes,
@@ -283,11 +323,14 @@ function serializePublicProduct(record: ProductWithParts): PublicProductDTO {
       id: v.id,
       sku: v.sku,
       size: v.size,
+      colorId: v.color_id ?? null,
       colorName: v.color_name,
       colorHex: v.color_hex,
       pricePaise: v.price_paise,
+      priceOverridePaise: v.price_override_paise ?? null,
       compareAtPaise: v.compare_at_paise,
       stockQty: v.stock_qty,
+      active: v.active === undefined || v.active === null ? true : Boolean(v.active),
       position: v.position,
     })),
     featured: Boolean(row.featured),
@@ -320,6 +363,7 @@ function serializeAdminProduct(record: AdminProductRecord): AdminProductDTO {
       url: img.url,
       alt: img.alt_text,
       isCover: Boolean(img.is_cover),
+      colorId: img.color_id ?? null,
       position: img.position,
     })),
   };
@@ -363,17 +407,22 @@ function serializeCategory(cat: CategoryRow) {
 
 function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
   const statusHistory = parseOrderHistory(o.status_history_json);
+  const paymentMethod: 'razorpay' | 'cod' =
+    (o.payment_method as 'razorpay' | 'cod') || (o.razorpay_order_id ? 'razorpay' : 'cod');
   const norm = normalizeOrderRequestsAndStatus({
     rawStatus: o.status,
     rawFulfillmentStatus: o.fulfillment_status,
     rawCancelRequest: o.cancel_request_json,
     rawReturnRequest: o.return_request_json,
+    rawPaymentStatus: o.payment_status,
+    rawRefundStatus: o.refund_status,
+    rawCancelledAt: o.cancelled_at,
+    rawCancelledBy: o.cancelled_by,
+    rawCancelReason: o.cancel_reason,
+    razorpayPaymentId: o.razorpay_payment_id,
     history: statusHistory,
-    paymentMethod: o.payment_method,
+    paymentMethod,
   });
-  const paymentMethod: 'razorpay' | 'cod' =
-    (o.payment_method as 'razorpay' | 'cod') || (o.razorpay_order_id ? 'razorpay' : 'cod');
-  const paymentStatus = o.payment_status || (o.razorpay_payment_id ? 'paid' : 'unpaid');
 
   return {
     id: o.id,
@@ -384,7 +433,8 @@ function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
     customerPhone: o.customer_phone,
     shippingAddress: o.shipping_address,
     status: norm.status,
-    paymentStatus,
+    paymentStatus: norm.paymentStatus,
+    refundStatus: norm.refundStatus,
     fulfillmentStatus: norm.fulfillmentStatus,
     paymentMethod,
     razorpayOrderId: o.razorpay_order_id ?? null,
@@ -403,6 +453,9 @@ function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
     statusHistory,
     cancelRequest: norm.cancelRequest,
     returnRequest: norm.returnRequest,
+    cancelledAt: norm.cancelledAt,
+    cancelledBy: norm.cancelledBy,
+    cancelReason: norm.cancelReason,
     hiddenByCustomer: Boolean(o.hidden_by_customer),
     hiddenAt: o.hidden_at ?? null,
     deliveryDetailsEditedAt: o.delivery_details_edited_at ?? null,
@@ -417,6 +470,9 @@ function serializeOrderWithItems({ order: o, items }: OrderWithItems) {
       variantId: it.variant_id,
       productTitle: it.product_title,
       variantLabel: it.variant_label,
+      colorName: it.color_name || '',
+      size: it.size || '',
+      imageUrl: it.image_url || '',
       sku: it.sku,
       unitPricePaise: it.unit_price_paise,
       quantity: it.quantity,
@@ -572,7 +628,13 @@ interface ParsedProductPayload {
   colors: ProductColorDTO[];
   sizes: string[];
   variants: ProductVariantDTO[];
-  images: Array<{ url: string; alt: string; isCover: boolean; mediaId: string | null }>;
+  images: Array<{
+    url: string;
+    alt: string;
+    isCover: boolean;
+    mediaId: string | null;
+    colorId: string | null;
+  }>;
 }
 
 async function validateAndNormalizeProductInput(
@@ -687,8 +749,54 @@ async function validateAndNormalizeProductInput(
   const requestedStatus = body.status === 'published' ? 'published' : 'draft';
 
   const rawImages = Array.isArray(body.images) ? body.images : [];
-  if (rawImages.length > 12) {
-    return { ok: false, error: 'A maximum of 12 product images is allowed.' };
+  if (rawImages.length > 20) {
+    return { ok: false, error: 'A maximum of 20 product images is allowed.' };
+  }
+
+  // Parse explicit colour options first (if provided) so images & variants can reference stable colorIds
+  const explicitColorsMap = new Map<string, ProductColorDTO>();
+  const explicitColorsById = new Map<string, ProductColorDTO>();
+  const usedColorIds = new Set<string>();
+  if (Array.isArray(body.colors) && body.colors.length > 0) {
+    for (let i = 0; i < body.colors.length; i += 1) {
+      const rc = body.colors[i];
+      if (!rc || typeof rc !== 'object') continue;
+      const cObj = rc as Record<string, unknown>;
+      const name = typeof cObj.name === 'string' ? cObj.name.trim().slice(0, 60) : '';
+      if (!name) {
+        const msg = `Colour #${i + 1} must have a colour name (e.g. "Teal & Pink").`;
+        return { ok: false, error: msg, fieldErrors: { colors: msg } };
+      }
+      const lower = name.toLowerCase();
+      if (explicitColorsMap.has(lower)) {
+        const msg = `Duplicate colour name "${name}". Each colour option must be unique.`;
+        return { ok: false, error: msg, fieldErrors: { colors: msg } };
+      }
+      const hex =
+        typeof cObj.hex === 'string' && SAFE_HEX_REGEX.test(cObj.hex.trim())
+          ? cObj.hex.trim()
+          : '#49243E';
+      const rawId =
+        typeof cObj.id === 'string' && /^[a-zA-Z0-9_-]{2,80}$/.test(cObj.id.trim())
+          ? cObj.id.trim()
+          : makeStableColorId(name, i, usedColorIds);
+      usedColorIds.add(rawId);
+      const rawThumb = typeof cObj.thumbnailUrl === 'string' ? cObj.thumbnailUrl.trim() : '';
+      if (rawThumb && !SAFE_MEDIA_URL_REGEX.test(rawThumb)) {
+        const msg = `Thumbnail for colour "${name}" must be uploaded through the atelier media uploader.`;
+        return { ok: false, error: msg, fieldErrors: { images: msg } };
+      }
+      const dto: ProductColorDTO = {
+        id: rawId,
+        name,
+        hex,
+        thumbnailUrl: rawThumb || null,
+        position: typeof cObj.position === 'number' && Number.isFinite(cObj.position) ? cObj.position : i,
+        active: cObj.active === undefined ? true : Boolean(cObj.active),
+      };
+      explicitColorsMap.set(lower, dto);
+      explicitColorsById.set(rawId, dto);
+    }
   }
 
   const normalizedImages: Array<{
@@ -696,6 +804,7 @@ async function validateAndNormalizeProductInput(
     alt: string;
     isCover: boolean;
     mediaId: string | null;
+    colorId: string | null;
   }> = [];
   for (let i = 0; i < rawImages.length; i++) {
     const item = rawImages[i];
@@ -729,12 +838,17 @@ async function validateAndNormalizeProductInput(
       mediaId = mediaRow.id;
     }
 
+    const rawColorId =
+      typeof obj.colorId === 'string' && obj.colorId.trim()
+        ? obj.colorId.trim().slice(0, 80)
+        : null;
     const alt = typeof obj.alt === 'string' ? obj.alt.trim().slice(0, 200) : '';
     normalizedImages.push({
       url: rawUrl,
       alt: alt || title,
       isCover: Boolean(obj.isCover),
       mediaId,
+      colorId: rawColorId,
     });
   }
 
@@ -766,8 +880,8 @@ async function validateAndNormalizeProductInput(
   const seenVariantCombos = new Set<string>();
 
   if (rawVariants.length > 0) {
-    if (rawVariants.length > 60) {
-      const msg = 'A product may have at most 60 size/color variants.';
+    if (rawVariants.length > 100) {
+      const msg = 'A product may have at most 100 size/color variants.';
       return { ok: false, error: msg, fieldErrors: { variants: msg } };
     }
 
@@ -779,9 +893,23 @@ async function validateAndNormalizeProductInput(
       }
       const vObj = rv as Record<string, unknown>;
       const size = typeof vObj.size === 'string' ? vObj.size.trim().slice(0, 32) : '';
+      const rawColorId =
+        typeof vObj.colorId === 'string' && vObj.colorId.trim()
+          ? vObj.colorId.trim().slice(0, 80)
+          : null;
+      const matchedExplicitColor =
+        (rawColorId ? explicitColorsById.get(rawColorId) : undefined) ||
+        (typeof vObj.colorName === 'string'
+          ? explicitColorsMap.get(vObj.colorName.trim().toLowerCase())
+          : undefined);
       const colorName =
-        typeof vObj.colorName === 'string' ? vObj.colorName.trim().slice(0, 48) : '';
-      const colorHex = typeof vObj.colorHex === 'string' ? vObj.colorHex.trim() : '#49243E';
+        (typeof vObj.colorName === 'string' ? vObj.colorName.trim().slice(0, 60) : '') ||
+        matchedExplicitColor?.name ||
+        '';
+      const colorHex =
+        typeof vObj.colorHex === 'string' && vObj.colorHex.trim()
+          ? vObj.colorHex.trim()
+          : matchedExplicitColor?.hex || '#49243E';
       if (!size || !colorName) {
         const msg = 'Each variant must specify both a size and a color name.';
         return { ok: false, error: msg, fieldErrors: { variants: msg } };
@@ -825,9 +953,21 @@ async function validateAndNormalizeProductInput(
         return { ok: false, error: msg, fieldErrors: { variants: msg } };
       }
 
-      let vPricePaise = basePricePaise;
-      if (vObj.pricePaise !== undefined) {
-        const parsed = parsePaiseField(vObj.pricePaise, `Price for ${size} / ${colorName}`);
+      let vPriceOverridePaise: number | null = null;
+      if (vObj.priceOverridePaise !== undefined && vObj.priceOverridePaise !== null && vObj.priceOverridePaise !== '') {
+        const parsedOverride = parsePaiseField(
+          vObj.priceOverridePaise,
+          `Price override for ${colorName} / ${size}`
+        );
+        if (!parsedOverride.ok) {
+          return { ok: false, error: parsedOverride.error, fieldErrors: { variants: parsedOverride.error } };
+        }
+        vPriceOverridePaise = parsedOverride.paise;
+      }
+
+      let vPricePaise = vPriceOverridePaise ?? basePricePaise;
+      if (vPriceOverridePaise === null && vObj.pricePaise !== undefined) {
+        const parsed = parsePaiseField(vObj.pricePaise, `Price for ${colorName} / ${size}`);
         if (!parsed.ok) return { ok: false, error: parsed.error, fieldErrors: { variants: parsed.error } };
         vPricePaise = parsed.paise;
       }
@@ -839,11 +979,11 @@ async function validateAndNormalizeProductInput(
         } else {
           const parsed = parsePaiseField(
             vObj.compareAtPaise,
-            `Compare-at price for ${size} / ${colorName}`
+            `Compare-at price for ${colorName} / ${size}`
           );
           if (!parsed.ok) return { ok: false, error: parsed.error, fieldErrors: { variants: parsed.error } };
           if (parsed.paise <= vPricePaise) {
-            const msg = `Compare-at price for ${size} / ${colorName} must exceed its selling price.`;
+            const msg = `Compare-at price for ${colorName} / ${size} must exceed its selling price.`;
             return {
               ok: false,
               error: msg,
@@ -863,12 +1003,18 @@ async function validateAndNormalizeProductInput(
         stockRaw < 0 ||
         stockRaw > 100_000
       ) {
-        const msg = `Stock quantity for ${size} / ${colorName} must be an integer between 0 and 100,000.`;
+        const msg = `Stock quantity for ${colorName} / ${size} must be an integer between 0 and 100,000.`;
         return {
           ok: false,
           error: msg,
           fieldErrors: { variants: msg },
         };
+      }
+
+      let resolvedColorId = matchedExplicitColor?.id || rawColorId;
+      if (!resolvedColorId) {
+        resolvedColorId = makeStableColorId(colorName, explicitColorsMap.size, usedColorIds);
+        usedColorIds.add(resolvedColorId);
       }
 
       normalizedVariants.push({
@@ -878,11 +1024,14 @@ async function validateAndNormalizeProductInput(
             : crypto.randomUUID(),
         sku: vSku,
         size,
+        colorId: resolvedColorId,
         colorName,
         colorHex,
         pricePaise: vPricePaise,
+        priceOverridePaise: vPriceOverridePaise,
         compareAtPaise: vComparePaise,
         stockQty: stockRaw,
+        active: vObj.active === undefined ? true : Boolean(vObj.active),
         position: i,
       });
     }
@@ -894,20 +1043,10 @@ async function validateAndNormalizeProductInput(
       : ['Free Size'];
     const sizesList = inputSizes.length > 0 ? Array.from(new Set(inputSizes)) : ['Free Size'];
 
-    const inputColors: ProductColorDTO[] = Array.isArray(body.colors)
-      ? body.colors
-          .filter((c): c is ProductColorDTO => Boolean(c && typeof c === 'object'))
-          .map((c) => ({
-            name: typeof c.name === 'string' ? c.name.trim().slice(0, 48) : 'Signature',
-            hex:
-              typeof c.hex === 'string' && SAFE_HEX_REGEX.test(c.hex.trim())
-                ? c.hex.trim()
-                : '#49243E',
-          }))
-          .filter((c) => c.name.length > 0)
-      : [{ name: 'Signature', hex: '#49243E' }];
-    const colorsList =
-      inputColors.length > 0 ? inputColors : [{ name: 'Signature', hex: '#49243E' }];
+    const colorsList: ProductColorDTO[] =
+      explicitColorsMap.size > 0
+        ? Array.from(explicitColorsMap.values())
+        : [{ id: makeStableColorId('Signature', 0), name: 'Signature', hex: '#49243E', position: 0, active: true }];
 
     const rawStockVal =
       typeof body.stockQty === 'number'
@@ -931,11 +1070,14 @@ async function validateAndNormalizeProductInput(
           id: crypto.randomUUID(),
           sku: vSku,
           size: sz,
+          colorId: col.id ?? makeStableColorId(col.name, idx),
           colorName: col.name,
           colorHex: col.hex,
           pricePaise: basePricePaise,
+          priceOverridePaise: null,
           compareAtPaise: baseCompareAtPaise,
           stockQty: idx === 0 ? singleStock : 0,
+          active: col.active === undefined ? true : Boolean(col.active),
           position: idx,
         });
         idx += 1;
@@ -943,17 +1085,72 @@ async function validateAndNormalizeProductInput(
     }
   }
 
-  const derivedColorsMap = new Map<string, ProductColorDTO>();
+  // Merge explicit colour metadata with any colour discovered from variants
+  const finalColorsMap = new Map<string, ProductColorDTO>();
+  Array.from(explicitColorsMap.values())
+    .sort((a, b) => Number(a.position ?? 0) - Number(b.position ?? 0))
+    .forEach((c, idx) => {
+      const colorImgs = normalizedImages.filter((img) => img.colorId === c.id);
+      const thumb =
+        c.thumbnailUrl ||
+        colorImgs.find((img) => img.isCover)?.url ||
+        colorImgs[0]?.url ||
+        null;
+      finalColorsMap.set(c.name.toLowerCase(), {
+        ...c,
+        thumbnailUrl: thumb,
+        position: idx,
+        active: c.active === undefined ? true : Boolean(c.active),
+      });
+    });
+
   const derivedSizesSet = new Set<string>();
   for (const v of normalizedVariants) {
-    if (!derivedColorsMap.has(v.colorName)) {
-      derivedColorsMap.set(v.colorName, { name: v.colorName, hex: v.colorHex });
+    const key = v.colorName.toLowerCase();
+    if (!finalColorsMap.has(key)) {
+      const cid = v.colorId || makeStableColorId(v.colorName, finalColorsMap.size, usedColorIds);
+      usedColorIds.add(cid);
+      const colorImgs = normalizedImages.filter((img) => img.colorId === cid);
+      finalColorsMap.set(key, {
+        id: cid,
+        name: v.colorName,
+        hex: v.colorHex,
+        thumbnailUrl: colorImgs.find((img) => img.isCover)?.url || colorImgs[0]?.url || null,
+        position: finalColorsMap.size,
+        active: true,
+      });
     }
     derivedSizesSet.add(v.size);
   }
 
-  const lowestPricePaise = Math.min(...normalizedVariants.map((v) => v.pricePaise));
-  const lowestVariant = normalizedVariants.find((v) => v.pricePaise === lowestPricePaise);
+  const finalColors = Array.from(finalColorsMap.values()).map((c, idx) => ({
+    ...c,
+    position: idx,
+  }));
+
+  // Validate full colour-variant matrix (including publishing completeness rules)
+  const matrixValidation = validateColorVariantMatrix({
+    status: requestedStatus,
+    colors: finalColors,
+    images: normalizedImages,
+    variants: normalizedVariants,
+  });
+  if (!matrixValidation.ok) {
+    return {
+      ok: false,
+      error: matrixValidation.error || 'Please complete all active colour variants before saving.',
+      fieldErrors: matrixValidation.fieldErrors,
+    };
+  }
+
+  const activeVariantsPool = normalizedVariants.filter(
+    (v) =>
+      (v.active === undefined ? true : Boolean(v.active)) &&
+      isVariantColorActiveInMetadata(finalColors, v)
+  );
+  const pricePool = activeVariantsPool.length > 0 ? activeVariantsPool : normalizedVariants;
+  const lowestPricePaise = Math.min(...pricePool.map((v) => v.pricePaise));
+  const lowestVariant = pricePool.find((v) => v.pricePaise === lowestPricePaise);
 
   return {
     ok: true,
@@ -970,7 +1167,7 @@ async function validateAndNormalizeProductInput(
       lowStockThreshold,
       featured,
       status: requestedStatus,
-      colors: Array.from(derivedColorsMap.values()),
+      colors: finalColors,
       sizes: Array.from(derivedSizesSet),
       variants: normalizedVariants,
       images: normalizedImages,
@@ -1311,6 +1508,9 @@ export function registerCatalogAndAdminRoutes(params: {
           lineTotalPaise: number;
           title: string;
           variantLabel: string;
+          colorName: string;
+          size: string;
+          sku: string;
           imageUrl: string;
         }> = [];
 
@@ -1348,7 +1548,10 @@ export function registerCatalogAndAdminRoutes(params: {
               title:
                 typeof item.fallbackTitle === 'string' ? item.fallbackTitle : 'Unavailable style',
               variantLabel: typeof item.fallbackVariant === 'string' ? item.fallbackVariant : '',
-              imageUrl: '',
+              colorName: typeof item.fallbackColorName === 'string' ? item.fallbackColorName : '',
+              size: typeof item.fallbackSize === 'string' ? item.fallbackSize : '',
+              sku: typeof item.fallbackSku === 'string' ? item.fallbackSku : '',
+              imageUrl: typeof item.fallbackImage === 'string' ? item.fallbackImage : '',
             });
             continue;
           }
@@ -1356,24 +1559,43 @@ export function registerCatalogAndAdminRoutes(params: {
           const { product, variants, images } = entry;
           const coverImg = images[0];
           const variant = variantId
-            ? variants.find((v) => v.id === variantId || v.sku === variantId) || variants[0]
-            : variants[0];
+            ? variants.find((v) => v.id === variantId || v.sku === variantId) || null
+            : variants.find(
+                (v) =>
+                  (v.active === undefined || v.active === null ? true : Boolean(v.active)) &&
+                  isVariantColorActiveInMetadata(product.colors_json, v)
+              ) || variants[0] || null;
 
-          if (!variant) {
+          const variantActive =
+            variant &&
+            (variant.active === undefined || variant.active === null ? true : Boolean(variant.active)) &&
+            isVariantColorActiveInMetadata(product.colors_json, variant);
+
+          if (!variant || !variantActive) {
+            const snapshotImg = variant
+              ? resolveVariantSnapshotImageUrl(product.colors_json, images, variant)
+              : coverImg?.url || '';
             validatedItems.push({
               productId: product.id,
               variantId,
               requestedQty,
               availableQty: 0,
               available: false,
-              statusReason: 'Selected size or color option is no longer available.',
+              statusReason: 'Selected colour or size option is no longer available.',
               priceChanged: false,
               previousPricePaise: seenPricePaise,
-              currentPricePaise: product.price_paise,
+              currentPricePaise: variant?.price_paise ?? product.price_paise,
               lineTotalPaise: 0,
               title: product.title,
-              variantLabel: '',
-              imageUrl: coverImg?.url || '',
+              variantLabel: variant
+                ? formatVariantDisplayLabel(variant.color_name, variant.size)
+                : typeof item.fallbackVariant === 'string'
+                  ? item.fallbackVariant
+                  : '',
+              colorName: variant?.color_name || '',
+              size: variant?.size || '',
+              sku: variant?.sku || '',
+              imageUrl: snapshotImg,
             });
             continue;
           }
@@ -1385,6 +1607,7 @@ export function registerCatalogAndAdminRoutes(params: {
           const priceChanged = seenPricePaise !== null && seenPricePaise !== variant.price_paise;
           const lineTotal = variant.price_paise * effectiveQty;
           subtotalPaise += lineTotal;
+          const variantThumb = resolveVariantSnapshotImageUrl(product.colors_json, images, variant);
 
           validatedItems.push({
             productId: product.id,
@@ -1402,8 +1625,11 @@ export function registerCatalogAndAdminRoutes(params: {
             currentPricePaise: variant.price_paise,
             lineTotalPaise: lineTotal,
             title: product.title,
-            variantLabel: `${variant.size} · ${variant.color_name}`,
-            imageUrl: coverImg?.url || '',
+            variantLabel: formatVariantDisplayLabel(variant.color_name, variant.size),
+            colorName: variant.color_name,
+            size: variant.size,
+            sku: variant.sku,
+            imageUrl: variantThumb || coverImg?.url || '',
           });
         }
 
@@ -1710,6 +1936,53 @@ export function registerCatalogAndAdminRoutes(params: {
   );
 
   app.post(
+    '/api/account/orders/:id/cancel',
+    requireCustomerAuth,
+    async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
+      try {
+        const orderId = String(req.params.id || '').trim();
+        if (!orderId) {
+          return sendJsonError(req, res, 400, 'VALIDATION_ERROR', 'Order ID is required.');
+        }
+        const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+        if (reason.length > 500) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Cancellation reason must be 500 characters or fewer.'
+          );
+        }
+        const expectedUpdatedAt =
+          typeof req.body?.expectedUpdatedAt === 'number' &&
+          Number.isFinite(req.body.expectedUpdatedAt)
+            ? req.body.expectedUpdatedAt
+            : null;
+        const result = await store.cancelCustomerOrder({
+          orderId,
+          userId: req.authUser!.id,
+          reason: reason || undefined,
+          expectedUpdatedAt,
+        });
+        if (!result) {
+          return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
+        }
+        return res.json({
+          ok: true,
+          alreadyCancelled: result.alreadyCancelled,
+          order: serializeOrderWithItems(result.orderWithItems),
+        });
+      } catch (err) {
+        if (err instanceof StoreHttpError) {
+          return sendJsonError(req, res, err.httpStatus, err.code, err.message);
+        }
+        return next(err);
+      }
+    }
+  );
+
+  app.post(
     '/api/account/orders/:id/request',
     requireCustomerAuth,
     async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
@@ -1726,13 +1999,22 @@ export function registerCatalogAndAdminRoutes(params: {
             'Request type must be "cancel" or "return".'
           );
         }
-        if (reason.length < 3 || reason.length > 500) {
+        if (reqType === 'return' && (reason.length < 3 || reason.length > 500)) {
           return sendJsonError(
             req,
             res,
             400,
             'VALIDATION_ERROR',
             'Please provide a reason between 3 and 500 characters.'
+          );
+        }
+        if (reqType === 'cancel' && reason.length > 500) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Cancellation reason must be 500 characters or fewer.'
           );
         }
         const updated = await store.submitOrderRequest({
@@ -1746,6 +2028,9 @@ export function registerCatalogAndAdminRoutes(params: {
         }
         return res.json({ order: serializeOrderWithItems(updated) });
       } catch (err) {
+        if (err instanceof StoreHttpError) {
+          return sendJsonError(req, res, err.httpStatus, err.code, err.message);
+        }
         return next(err);
       }
     }
@@ -2536,18 +2821,29 @@ export function registerCatalogAndAdminRoutes(params: {
         const now = Date.now();
         const id = `sc-${crypto.randomBytes(4).toString('hex')}`;
         const slug = await store.makeUniqueSlug(d.title);
-        const totalStock = d.variants.reduce((sum, v) => sum + v.stockQty, 0);
+        const totalStock = d.variants.reduce(
+          (sum, v) =>
+            sum +
+            ((v.active === undefined ? true : Boolean(v.active)) &&
+            isVariantColorActiveInMetadata(d.colors, v)
+              ? v.stockQty
+              : 0),
+          0
+        );
 
         const variants: ProductVariantRow[] = d.variants.map((v) => ({
           id: v.id,
           product_id: id,
           sku: v.sku,
           size: v.size,
+          color_id: v.colorId ?? null,
           color_name: v.colorName,
           color_hex: v.colorHex,
           price_paise: v.pricePaise,
+          price_override_paise: v.priceOverridePaise ?? null,
           compare_at_paise: v.compareAtPaise,
           stock_qty: v.stockQty,
+          active: v.active === undefined ? 1 : v.active ? 1 : 0,
           position: v.position,
         }));
 
@@ -2664,6 +2960,16 @@ export function registerCatalogAndAdminRoutes(params: {
                 'Add at least one photo before publishing this product to the storefront.'
               );
             }
+            if (transitionResult.code === 'INCOMPLETE_COLOR_VARIANTS') {
+              return sendJsonError(
+                req,
+                res,
+                400,
+                'VALIDATION_ERROR',
+                transitionResult.message ||
+                  'Complete photos and active variants for every active colour before publishing.'
+              );
+            }
             return sendJsonError(
               req,
               res,
@@ -2706,7 +3012,15 @@ export function registerCatalogAndAdminRoutes(params: {
           req.body.slug.trim() !== existing.slug
             ? await store.makeUniqueSlug(req.body.slug.trim(), existing.id)
             : existing.slug;
-        const totalStock = d.variants.reduce((sum, v) => sum + v.stockQty, 0);
+        const totalStock = d.variants.reduce(
+          (sum, v) =>
+            sum +
+            ((v.active === undefined ? true : Boolean(v.active)) &&
+            isVariantColorActiveInMetadata(d.colors, v)
+              ? v.stockQty
+              : 0),
+          0
+        );
         const nextStatus: ProductStatus =
           req.body?.status === 'published' || req.body?.status === 'draft'
             ? req.body.status
@@ -2778,11 +3092,14 @@ export function registerCatalogAndAdminRoutes(params: {
             product_id: existing.id,
             sku: v.sku,
             size: v.size,
+            color_id: v.colorId ?? null,
             color_name: v.colorName,
             color_hex: v.colorHex,
             price_paise: v.pricePaise,
+            price_override_paise: v.priceOverridePaise ?? null,
             compare_at_paise: v.compareAtPaise,
             stock_qty: v.stockQty,
+            active: v.active === undefined ? 1 : v.active ? 1 : 0,
             position: v.position,
           })),
           images: d.images,
@@ -2889,6 +3206,16 @@ export function registerCatalogAndAdminRoutes(params: {
               400,
               'VALIDATION_ERROR',
               'Add at least one photo before publishing this product to the storefront.'
+            );
+          }
+          if (result.code === 'INCOMPLETE_COLOR_VARIANTS') {
+            return sendJsonError(
+              req,
+              res,
+              400,
+              'VALIDATION_ERROR',
+              result.message ||
+                'Complete photos and active variants for every active colour before publishing.'
             );
           }
           return sendJsonError(
@@ -3079,17 +3406,62 @@ export function registerCatalogAndAdminRoutes(params: {
       try {
         const page = Math.max(1, Number.parseInt(String(req.query.page || '1'), 10) || 1);
         const pageSize = Math.min(
-          50,
+          100,
           Math.max(1, Number.parseInt(String(req.query.pageSize || '15'), 10) || 15)
         );
+        const rawStatusFilter =
+          typeof req.query.status === 'string' ? req.query.status.trim().toLowerCase() : 'all';
+        const statusFilter =
+          rawStatusFilter && rawStatusFilter !== 'all'
+            ? normalizeRawOrderStatusValue(rawStatusFilter)
+            : 'all';
 
-        const result = await store.listAdminOrders(page, pageSize);
+        const allResult = await store.listAdminOrders(1, 5000);
+        const allSerialized = allResult.items.map((o) => serializeOrderWithItems(o));
+
+        const statusCounts: Record<string, number> = {
+          all: allSerialized.length,
+          pending: 0,
+          placed: 0,
+          confirmed: 0,
+          packed: 0,
+          shipped: 0,
+          delivered: 0,
+          cancelled: 0,
+          returned: 0,
+          unknown: 0,
+        };
+        for (const item of allSerialized) {
+          const st = item.status;
+          if (st in statusCounts) {
+            statusCounts[st] += 1;
+          } else {
+            statusCounts.unknown += 1;
+          }
+          if (st !== 'pending' && isOrderAwaitingDispatch(st)) {
+            statusCounts.pending += 1;
+          }
+        }
+
+        const filtered =
+          statusFilter === 'all'
+            ? allSerialized
+            : statusFilter === 'pending'
+              ? allSerialized.filter((o) => isOrderAwaitingDispatch(o.status))
+              : allSerialized.filter((o) => o.status === statusFilter);
+
+        const total = filtered.length;
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        const safePage = Math.min(page, totalPages);
+        const offset = (safePage - 1) * pageSize;
+
         return res.json({
-          items: result.items.map((o) => serializeOrderWithItems(o)),
-          total: result.total,
-          page: result.page,
-          pageSize: result.pageSize,
-          totalPages: result.totalPages,
+          items: filtered.slice(offset, offset + pageSize),
+          total,
+          page: safePage,
+          pageSize,
+          totalPages,
+          statusCounts,
         });
       } catch (err) {
         return next(err);
@@ -3103,20 +3475,33 @@ export function registerCatalogAndAdminRoutes(params: {
     async (req: AuthedCatalogRequest, res: Response, next: NextFunction) => {
       try {
         const id = String(req.params.id || '');
-        const nextStatus = typeof req.body?.status === 'string' ? req.body.status.trim() : '';
+        const rawStatus = typeof req.body?.status === 'string' ? req.body.status.trim() : '';
+        const nextStatus = normalizeRawOrderStatusValue(rawStatus);
         const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
-        const allowed = new Set([
-          'pending',
-          'placed',
-          'confirmed',
-          'packed',
-          'shipped',
-          'delivered',
-          'cancelled',
-          'return_requested',
-          'returned',
+        const expectedUpdatedAt =
+          typeof req.body?.expectedUpdatedAt === 'number' &&
+          Number.isFinite(req.body.expectedUpdatedAt)
+            ? req.body.expectedUpdatedAt
+            : null;
+        const rawRefundStatus =
+          typeof req.body?.refundStatus === 'string' ? req.body.refundStatus.trim().toLowerCase() : '';
+        const validRefundStatuses = new Set([
+          'none',
+          'not_required',
+          'pending_refund',
+          'refund_initiated',
+          'refunded',
         ]);
-        if (!allowed.has(nextStatus)) {
+        if (rawRefundStatus && !validRefundStatuses.has(rawRefundStatus)) {
+          return sendJsonError(
+            req,
+            res,
+            400,
+            'VALIDATION_ERROR',
+            'Invalid refund status.'
+          );
+        }
+        if (!VALID_FULFILLMENT_STATES.has(nextStatus)) {
           return sendJsonError(
             req,
             res,
@@ -3130,17 +3515,23 @@ export function registerCatalogAndAdminRoutes(params: {
           actor: 'owner',
           note: note || undefined,
           notifyCustomer: true,
+          expectedUpdatedAt,
+          refundStatus: rawRefundStatus || undefined,
         });
         if (!updated) {
           return sendJsonError(req, res, 404, 'ORDER_NOT_FOUND', 'Order not found.');
         }
 
+        const serialized = serializeOrderWithItems(updated);
         return res.json({
           id,
-          status: updated.order.status,
-          order: serializeOrderWithItems(updated),
+          status: serialized.status,
+          order: serialized,
         });
       } catch (err) {
+        if (err instanceof StoreHttpError) {
+          return sendJsonError(req, res, err.httpStatus, err.code, err.message);
+        }
         return next(err);
       }
     }

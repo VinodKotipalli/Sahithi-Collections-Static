@@ -51,6 +51,12 @@ export function useShoppingBag() {
         ...next[idx],
         quantity: Math.min(50, next[idx].quantity + qtyToAdd),
         seenPricePaise: incoming.seenPricePaise,
+        fallbackTitle: incoming.fallbackTitle || next[idx].fallbackTitle,
+        fallbackVariant: incoming.fallbackVariant || next[idx].fallbackVariant,
+        fallbackColorName: incoming.fallbackColorName || next[idx].fallbackColorName,
+        fallbackSize: incoming.fallbackSize || next[idx].fallbackSize,
+        fallbackSku: incoming.fallbackSku || next[idx].fallbackSku,
+        fallbackImage: incoming.fallbackImage || next[idx].fallbackImage,
       };
       return next;
     });

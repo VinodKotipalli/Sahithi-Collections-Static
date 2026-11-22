@@ -38,6 +38,8 @@ interface ParsedLocation {
   queryMode: string;
   nextPath: string;
   productSlug: string;
+  colorParam: string;
+  variantParam: string;
   accountSection: AccountSectionId;
 }
 
@@ -50,6 +52,8 @@ function readLocation(): ParsedLocation {
       queryMode: '',
       nextPath: '/account',
       productSlug: '',
+      colorParam: '',
+      variantParam: '',
       accountSection: 'profile',
     };
   }
@@ -71,7 +75,19 @@ function readLocation(): ParsedLocation {
     ? decodeURIComponent(pathname.slice('/products/'.length)).replace(/\/+$/, '')
     : '';
   const productSlug = pathProductSlug || (params.get('product') || '').trim();
-  return { route, adminSubPath, token, queryMode, nextPath, productSlug, accountSection };
+  const colorParam = (params.get('color') || params.get('colour') || '').trim();
+  const variantParam = (params.get('variant') || '').trim();
+  return {
+    route,
+    adminSubPath,
+    token,
+    queryMode,
+    nextPath,
+    productSlug,
+    colorParam,
+    variantParam,
+    accountSection,
+  };
 }
 
 export function useBoutiqueRouter() {
@@ -114,6 +130,24 @@ export function useBoutiqueRouter() {
     []
   );
 
+  const updateQueryParams = useCallback(
+    (updates: Record<string, string | null | undefined>) => {
+      if (typeof window === 'undefined') return;
+      const url = new URL(window.location.href);
+      for (const [key, value] of Object.entries(updates)) {
+        if (value === null || value === undefined || value === '') {
+          url.searchParams.delete(key);
+        } else {
+          url.searchParams.set(key, value);
+        }
+      }
+      const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+      window.history.replaceState(null, '', nextUrl);
+      setLocationState(readLocation());
+    },
+    []
+  );
+
   const navigateToSection = useCallback(
     (hashHref: string) => {
       const id = hashHref.replace(/^#/, '');
@@ -138,8 +172,11 @@ export function useBoutiqueRouter() {
     queryMode: locationState.queryMode,
     nextPath: locationState.nextPath,
     productSlug: locationState.productSlug,
+    colorParam: locationState.colorParam,
+    variantParam: locationState.variantParam,
     accountSection: locationState.accountSection,
     navigate,
+    updateQueryParams,
     navigateToSection,
   };
 }

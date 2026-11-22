@@ -110,11 +110,14 @@ export interface ProductVariantRow {
   product_id: string;
   sku: string;
   size: string;
+  color_id?: string | null;
   color_name: string;
   color_hex: string;
   price_paise: number;
+  price_override_paise?: number | null;
   compare_at_paise: number | null;
   stock_qty: number;
+  active?: number;
   position: number;
 }
 
@@ -122,6 +125,7 @@ export interface ProductImageRow {
   id: string;
   product_id: string;
   media_id: string | null;
+  color_id?: string | null;
   url: string;
   alt_text: string;
   is_cover: number;
@@ -162,6 +166,7 @@ export interface OrderRow {
   shipping_address: string;
   status: string;
   payment_status?: string;
+  refund_status?: string;
   fulfillment_status?: string;
   payment_method?: string;
   razorpay_order_id?: string | null;
@@ -173,6 +178,9 @@ export interface OrderRow {
   status_history_json?: string;
   cancel_request_json?: string | null;
   return_request_json?: string | null;
+  cancelled_at?: number | null;
+  cancelled_by?: string | null;
+  cancel_reason?: string | null;
   hidden_by_customer?: number;
   hidden_at?: number | null;
   stock_restored_at?: number | null;
@@ -194,6 +202,9 @@ export interface OrderItemRow {
   variant_id: string | null;
   product_title: string;
   variant_label: string;
+  color_name?: string;
+  size?: string;
+  image_url?: string;
   sku: string;
   unit_price_paise: number;
   quantity: number;
@@ -404,11 +415,14 @@ export function initAuthDatabase(
       product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
       sku TEXT NOT NULL UNIQUE,
       size TEXT NOT NULL,
+      color_id TEXT,
       color_name TEXT NOT NULL,
       color_hex TEXT NOT NULL,
       price_paise INTEGER NOT NULL CHECK (price_paise >= 100),
+      price_override_paise INTEGER,
       compare_at_paise INTEGER,
       stock_qty INTEGER NOT NULL DEFAULT 0 CHECK (stock_qty >= 0),
+      active INTEGER NOT NULL DEFAULT 1,
       position INTEGER NOT NULL DEFAULT 0
     );
 
@@ -416,6 +430,7 @@ export function initAuthDatabase(
       id TEXT PRIMARY KEY,
       product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
       media_id TEXT REFERENCES product_media(id) ON DELETE SET NULL,
+      color_id TEXT,
       url TEXT NOT NULL,
       alt_text TEXT NOT NULL DEFAULT '',
       is_cover INTEGER NOT NULL DEFAULT 0,
@@ -472,6 +487,9 @@ export function initAuthDatabase(
       variant_id TEXT REFERENCES product_variants(id) ON DELETE SET NULL,
       product_title TEXT NOT NULL,
       variant_label TEXT NOT NULL,
+      color_name TEXT NOT NULL DEFAULT '',
+      size TEXT NOT NULL DEFAULT '',
+      image_url TEXT NOT NULL DEFAULT '',
       sku TEXT NOT NULL,
       unit_price_paise INTEGER NOT NULL CHECK (unit_price_paise >= 0),
       quantity INTEGER NOT NULL CHECK (quantity > 0),
@@ -665,6 +683,10 @@ export function initAuthDatabase(
   ensureOrderCol('idempotency_key', `idempotency_key TEXT`);
   ensureOrderCol('payment_collected_at', `payment_collected_at INTEGER`);
   ensureOrderCol('payment_collected_by', `payment_collected_by TEXT`);
+  ensureOrderCol('refund_status', `refund_status TEXT NOT NULL DEFAULT 'none'`);
+  ensureOrderCol('cancelled_at', `cancelled_at INTEGER`);
+  ensureOrderCol('cancelled_by', `cancelled_by TEXT`);
+  ensureOrderCol('cancel_reason', `cancel_reason TEXT`);
   ensureOrderCol('updated_at', `updated_at INTEGER`);
 
   const productCols = (
@@ -681,6 +703,37 @@ export function initAuthDatabase(
   ensureProductCol('source_image_filename', `source_image_filename TEXT`);
   ensureProductCol('pending_fields_json', `pending_fields_json TEXT`);
   ensureProductCol('catalog_batch', `catalog_batch TEXT`);
+
+  const variantCols = (
+    db.prepare(`PRAGMA table_info(product_variants)`).all() as Array<{ name: string }>
+  ).map((c) => c.name);
+  const ensureVariantCol = (name: string, ddl: string) => {
+    if (!variantCols.includes(name)) {
+      db.exec(`ALTER TABLE product_variants ADD COLUMN ${ddl};`);
+    }
+  };
+  ensureVariantCol('color_id', `color_id TEXT`);
+  ensureVariantCol('price_override_paise', `price_override_paise INTEGER`);
+  ensureVariantCol('active', `active INTEGER NOT NULL DEFAULT 1`);
+
+  const imageCols = (
+    db.prepare(`PRAGMA table_info(product_images)`).all() as Array<{ name: string }>
+  ).map((c) => c.name);
+  if (!imageCols.includes('color_id')) {
+    db.exec(`ALTER TABLE product_images ADD COLUMN color_id TEXT;`);
+  }
+
+  const orderItemCols = (
+    db.prepare(`PRAGMA table_info(order_items)`).all() as Array<{ name: string }>
+  ).map((c) => c.name);
+  const ensureOrderItemCol = (name: string, ddl: string) => {
+    if (!orderItemCols.includes(name)) {
+      db.exec(`ALTER TABLE order_items ADD COLUMN ${ddl};`);
+    }
+  };
+  ensureOrderItemCol('color_name', `color_name TEXT NOT NULL DEFAULT ''`);
+  ensureOrderItemCol('size', `size TEXT NOT NULL DEFAULT ''`);
+  ensureOrderItemCol('image_url', `image_url TEXT NOT NULL DEFAULT ''`);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_orders_customer_user_id ON orders(customer_user_id, created_at DESC);

@@ -38,6 +38,7 @@ import { useAuth, type AuthUser } from '../../context/AuthContext';
 import { useStorefront } from '../../context/StorefrontContext';
 import { usePrefersReducedMotion } from '../../hooks/usePrefersReducedMotion';
 import { handleClientlessApiRequest } from '../../services/firebaseClientApi';
+import { subscribeAdminOrdersRealtime } from '../../services/firestoreRealtime';
 import type {
   AdminAuditEntry,
   AdminOrder,
@@ -272,6 +273,24 @@ export function AdminPortal({
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [ordersPage, setOrdersPage] = useState(1);
   const [ordersTotalPages, setOrdersTotalPages] = useState(1);
+  const [ordersStatusFilter, setOrdersStatusFilter] = useState<
+    'all' | 'pending' | 'confirmed' | 'packed' | 'shipped' | 'delivered' | 'cancelled' | 'returned' | 'unknown'
+  >('all');
+  const [ordersStatusCounts, setOrdersStatusCounts] = useState<Record<string, number>>({
+    all: 0,
+    pending: 0,
+    placed: 0,
+    confirmed: 0,
+    packed: 0,
+    shipped: 0,
+    delivered: 0,
+    cancelled: 0,
+    returned: 0,
+    unknown: 0,
+  });
+  const [realtimeOrdersError, setRealtimeOrdersError] = useState<string | null>(null);
+  const [realtimeReconnectTick, setRealtimeReconnectTick] = useState(0);
+  const allRealtimeOrdersRef = useRef<AdminOrder[] | null>(null);
 
   const [auditLogs, setAuditLogs] = useState<AdminAuditEntry[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
@@ -535,27 +554,115 @@ export function AdminPortal({
     }
   }, [apiRequest, catalogPage, statusFilter, categoryFilter, stockFilter, sortBy, searchQuery, showToast]);
 
+  const applyRealtimeOrdersView = useCallback(
+    (
+      allItems: AdminOrder[],
+      filter: typeof ordersStatusFilter,
+      pageNum: number
+    ) => {
+      const counts: Record<string, number> = {
+        all: allItems.length,
+        pending: 0,
+        placed: 0,
+        confirmed: 0,
+        packed: 0,
+        shipped: 0,
+        delivered: 0,
+        cancelled: 0,
+        returned: 0,
+        unknown: 0,
+      };
+      const awaitingDispatch = new Set(['pending', 'placed', 'confirmed', 'packed']);
+      for (const item of allItems) {
+        const st = item.status || item.fulfillmentStatus || 'unknown';
+        if (st in counts) {
+          counts[st] += 1;
+        } else {
+          counts.unknown += 1;
+        }
+        if (st !== 'pending' && awaitingDispatch.has(st)) {
+          counts.pending += 1;
+        }
+      }
+      const filtered =
+        filter === 'all'
+          ? allItems
+          : filter === 'pending'
+            ? allItems.filter((o) =>
+                awaitingDispatch.has(o.status || o.fulfillmentStatus || 'unknown')
+              )
+            : allItems.filter((o) => (o.status || o.fulfillmentStatus || 'unknown') === filter);
+      const pageSize = 12;
+      const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+      const safePage = Math.min(Math.max(1, pageNum), totalPages);
+      const offset = (safePage - 1) * pageSize;
+
+      setOrdersStatusCounts(counts);
+      setOrders(filtered.slice(offset, offset + pageSize));
+      setOrdersTotalPages(totalPages);
+      setOrdersLoading(false);
+
+      // Keep overview KPI counts & recent orders live across open admin sessions
+      setOverviewData((prev) => {
+        if (!prev) return prev;
+        let totalRevenuePaise = 0;
+        let openReturnRequests = 0;
+        for (const item of allItems) {
+          const st = item.status || item.fulfillmentStatus || 'unknown';
+          if (st !== 'cancelled' && st !== 'returned' && item.paymentStatus === 'paid') {
+            totalRevenuePaise += Number(item.totalPaise || 0);
+          }
+          if (item.cancelRequest?.status === 'pending' || item.returnRequest?.status === 'pending') {
+            openReturnRequests += 1;
+          }
+        }
+        return {
+          ...prev,
+          metrics: {
+            ...prev.metrics,
+            totalOrders: allItems.length,
+            pendingOrders: counts.pending,
+            cancelledOrders: counts.cancelled,
+            totalRevenuePaise,
+            openReturnRequests,
+          },
+          recentOrders: allItems.slice(0, 6),
+        };
+      });
+    },
+    []
+  );
+
   const loadOrders = useCallback(
     async (options?: { silent?: boolean }) => {
       if (!options?.silent) {
         setOrdersLoading(true);
       }
+      const qs = new URLSearchParams({
+        page: String(ordersPage),
+        pageSize: '12',
+        status: ordersStatusFilter,
+      });
       const res = await apiRequest<{
         items: AdminOrder[];
         page: number;
         totalPages: number;
-      }>(`/api/admin/orders?page=${ordersPage}&pageSize=12`);
+        statusCounts?: Record<string, number>;
+      }>(`/api/admin/orders?${qs.toString()}`);
       if (!options?.silent) {
         setOrdersLoading(false);
       }
       if (res.ok) {
         setOrders(res.data.items);
         setOrdersTotalPages(res.data.totalPages);
+        if (res.data.statusCounts) {
+          setOrdersStatusCounts(res.data.statusCounts);
+        }
       } else if (!options?.silent) {
         showToast('err', res.error);
       }
     },
-    [apiRequest, ordersPage, showToast]
+    [apiRequest, ordersPage, ordersStatusFilter, showToast]
   );
 
   const loadAudit = useCallback(async () => {
@@ -636,6 +743,39 @@ export function AdminPortal({
       channel?.close();
     };
   }, [gate, activeTab, loadOverview, loadOrders]);
+
+  // Real-time Firestore listener so customer cancellations & status updates sync across all open admin sessions immediately
+  useEffect(() => {
+    if (gate !== 'authorized' || !isFirebaseManaged) return;
+    setRealtimeOrdersError(null);
+    const unsubscribe = subscribeAdminOrdersRealtime({
+      onOrders: (allItems) => {
+        setRealtimeOrdersError(null);
+        allRealtimeOrdersRef.current = allItems;
+        applyRealtimeOrdersView(allItems, ordersStatusFilter, ordersPage);
+      },
+      onError: (message) => {
+        setRealtimeOrdersError(message);
+      },
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, [
+    gate,
+    isFirebaseManaged,
+    ordersStatusFilter,
+    ordersPage,
+    realtimeReconnectTick,
+    applyRealtimeOrdersView,
+  ]);
+
+  // Re-slice realtime cache immediately when filter or page changes
+  useEffect(() => {
+    if (allRealtimeOrdersRef.current) {
+      applyRealtimeOrdersView(allRealtimeOrdersRef.current, ordersStatusFilter, ordersPage);
+    }
+  }, [ordersStatusFilter, ordersPage, applyRealtimeOrdersView]);
 
   const refreshCatalogAndMetrics = useCallback(async () => {
     await Promise.all([loadOverview(), loadProducts()]);
@@ -1016,20 +1156,43 @@ export function AdminPortal({
   const handleUpdateOrderStatus = async (
     orderId: string,
     status: string,
-    note?: string
+    note?: string,
+    refundStatus?: string,
+    expectedUpdatedAt?: number
   ): Promise<{ ok: boolean; error?: string }> => {
+    const knownOrder =
+      orders.find((o) => o.id === orderId) ||
+      allRealtimeOrdersRef.current?.find((o) => o.id === orderId);
+    const lockTimestamp =
+      typeof expectedUpdatedAt === 'number'
+        ? expectedUpdatedAt
+        : typeof knownOrder?.updatedAt === 'number'
+          ? knownOrder.updatedAt
+          : undefined;
+    const payload: Record<string, unknown> = { status };
+    if (note) payload.note = note;
+    if (refundStatus) payload.refundStatus = refundStatus;
+    if (typeof lockTimestamp === 'number') payload.expectedUpdatedAt = lockTimestamp;
+
     const res = await apiRequest<{ id: string; status: string }>(
       `/api/admin/orders/${encodeURIComponent(orderId)}/status`,
       {
         method: 'PATCH',
-        body: JSON.stringify(note ? { status, note } : { status }),
+        body: JSON.stringify(payload),
       }
     );
     if (!res.ok) {
       showToast('err', res.error);
+      // Always re-sync authoritative state on conflict/rejection
+      await Promise.all([loadOrders({ silent: true }), loadOverview({ silent: true })]);
       return { ok: false, error: res.error };
     }
-    showToast('ok', `Order marked as ${status}.`);
+    showToast(
+      'ok',
+      refundStatus
+        ? `Order updated (${status.replace(/_/g, ' ')} · refund: ${refundStatus.replace(/_/g, ' ')}).`
+        : `Order marked as ${status.replace(/_/g, ' ')}.`
+    );
     emitOrdersSync();
     await Promise.all([loadOrders({ silent: true }), loadOverview({ silent: true })]);
     return { ok: true };
@@ -2235,6 +2398,18 @@ export function AdminPortal({
               loading={ordersLoading}
               page={ordersPage}
               totalPages={ordersTotalPages}
+              statusFilter={ordersStatusFilter}
+              statusCounts={ordersStatusCounts}
+              realtimeError={realtimeOrdersError}
+              onReconnectRealtime={() => {
+                setRealtimeOrdersError(null);
+                setRealtimeReconnectTick((t) => t + 1);
+                void Promise.all([loadOrders({ silent: true }), loadOverview({ silent: true })]);
+              }}
+              onStatusFilterChange={(nextFilter) => {
+                setOrdersStatusFilter(nextFilter);
+                setOrdersPage(1);
+              }}
               onPageChange={setOrdersPage}
               onUpdateOrderStatus={handleUpdateOrderStatus}
               onCollectOrderPayment={handleCollectOrderPayment}

@@ -58,6 +58,7 @@ import type {
   SavedPaymentMethodsSummary,
 } from '../../types/boutique';
 import { formatINR, formatPaiseINR, formatTimestamp } from '../../utils/format';
+import { subscribeCustomerOrdersRealtime } from '../../services/firestoreRealtime';
 import { BoutiqueImage } from '../BoutiqueImage';
 
 const DEFAULT_NOTIFICATION_PREFS: NotificationPreferences = {
@@ -190,6 +191,9 @@ export function AccountDashboard({
   const [orders, setOrders] = useState<PlacedOrderReceipt[]>([]);
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [ordersError, setOrdersError] = useState<string | null>(null);
+  const [cancelOrderId, setCancelOrderId] = useState<string | null>(null);
+  const [cancelReason, setCancelReason] = useState('');
+  const [cancelBusyOrderId, setCancelBusyOrderId] = useState<string | null>(null);
   const [requestOrderId, setRequestOrderId] = useState<string | null>(null);
   const [requestType, setRequestType] = useState<'cancel' | 'return'>('return');
   const [requestMode, setRequestMode] = useState<'create' | 'edit'>('create');
@@ -477,6 +481,20 @@ export function AccountDashboard({
     };
   }, [user, activeSection, loadOrders, loadNotifications, loadAddresses, loadPaymentMethods]);
 
+  // Real-time Firestore listener for customer orders when Firebase Auth is active
+  useEffect(() => {
+    if (!user || capabilities.authMode !== 'firebase_managed') return;
+    const unsubscribe = subscribeCustomerOrdersRealtime(user.id, {
+      onOrders: (liveOrders) => {
+        setOrders(liveOrders);
+        setOrdersLoading(false);
+      },
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, [user, capabilities.authMode]);
+
   if (!user) {
     return null;
   }
@@ -602,6 +620,64 @@ export function AccountDashboard({
     setNewPassword('');
     setConfirmNewPassword('');
     setPassFeedback({ type: 'ok', text: res.data.message });
+  };
+
+  const handleConfirmCancelOrder = async (e: FormEvent, order: PlacedOrderReceipt) => {
+    e.preventDefault();
+    if (cancelBusyOrderId) return;
+    setRequestFeedback(null);
+    const trimmedReason = cancelReason.trim();
+    if (trimmedReason.length > 500) {
+      setRequestFeedback({
+        orderId: order.id,
+        type: 'err',
+        text: 'Cancellation reason must be 500 characters or fewer.',
+      });
+      return;
+    }
+    setCancelBusyOrderId(order.id);
+    const res = await apiRequest<{ order: PlacedOrderReceipt; alreadyCancelled?: boolean }>(
+      `/api/account/orders/${encodeURIComponent(order.id)}/cancel`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...(trimmedReason ? { reason: trimmedReason } : {}),
+          ...(typeof order.updatedAt === 'number' ? { expectedUpdatedAt: order.updatedAt } : {}),
+        }),
+      }
+    );
+    setCancelBusyOrderId(null);
+    if (!res.ok) {
+      setRequestFeedback({ orderId: order.id, type: 'err', text: res.error });
+      void loadOrders({ silent: true });
+      return;
+    }
+    const updatedOrder = res.data?.order;
+    if (!updatedOrder || (updatedOrder.status !== 'cancelled' && updatedOrder.fulfillmentStatus !== 'cancelled')) {
+      setRequestFeedback({
+        orderId: order.id,
+        type: 'err',
+        text: 'We could not confirm that your cancellation was saved. Please refresh and check your order status.',
+      });
+      void loadOrders({ silent: true });
+      return;
+    }
+    setOrders((prev) => prev.map((o) => (o.id === order.id ? updatedOrder : o)));
+    setCancelOrderId(null);
+    setCancelReason('');
+    emitBoutiqueSync('orders');
+    void loadNotifications({ silent: true });
+    const refundNote =
+      updatedOrder.paymentStatus === 'paid' && updatedOrder.refundStatus === 'pending_refund'
+        ? ' Your prepaid payment is marked for refund review.'
+        : '';
+    setRequestFeedback({
+      orderId: order.id,
+      type: 'ok',
+      text: res.data.alreadyCancelled
+        ? 'This order was already cancelled.'
+        : `Order ${updatedOrder.orderNumber} has been cancelled.${refundNote}`,
+    });
   };
 
   const handleSubmitOrderRequest = async (e: FormEvent, orderId: string) => {
@@ -1617,9 +1693,11 @@ export function AccountDashboard({
                 <div className="space-y-4">
                   {orders.map((order) => {
                     const isCod = order.paymentMethod === 'cod';
-                    const fulfillment = order.fulfillmentStatus || order.status || 'placed';
+                    const fulfillment = order.status || order.fulfillmentStatus || 'unknown';
                     const payment =
                       order.paymentStatus || (order.razorpayPaymentId ? 'paid' : isCod ? 'unpaid' : 'pending');
+                    const refundStatus = order.refundStatus || 'none';
+                    const isCancelled = fulfillment === 'cancelled';
                     const isUnpaidCod = isCod && payment !== 'paid';
                     const cancelReq = order.cancelRequest || null;
                     const returnReq = order.returnRequest || null;
@@ -1627,14 +1705,36 @@ export function AccountDashboard({
                       ['pending', 'placed', 'confirmed'].includes(fulfillment) &&
                       cancelReq?.status !== 'pending' &&
                       cancelReq?.status !== 'approved';
-                    const canRequestCancel =
-                      ['placed', 'pending', 'confirmed', 'packed'].includes(fulfillment) &&
-                      cancelReq?.status !== 'pending' &&
-                      cancelReq?.status !== 'approved';
+                    const canCancelDirectly = ['placed', 'pending', 'confirmed', 'packed'].includes(
+                      fulfillment
+                    );
                     const canRequestReturn =
                       fulfillment === 'delivered' &&
                       returnReq?.status !== 'pending' &&
                       returnReq?.status !== 'approved';
+
+                    const orderStatusLabel =
+                      fulfillment === 'unknown'
+                        ? 'Unknown (Needs Review)'
+                        : fulfillment.replace(/_/g, ' ');
+                    const paymentStatusLabel =
+                      payment === 'paid'
+                        ? 'Paid'
+                        : isCod
+                          ? isCancelled
+                            ? 'Unpaid (COD)'
+                            : 'Payment due on delivery'
+                          : payment.replace(/_/g, ' ');
+                    const refundStatusLabel =
+                      refundStatus === 'pending_refund'
+                        ? 'Refund Pending'
+                        : refundStatus === 'refund_initiated'
+                          ? 'Refund Initiated'
+                          : refundStatus === 'refunded'
+                            ? 'Refunded'
+                            : refundStatus === 'not_required' && isCancelled
+                              ? 'No Refund Required'
+                              : null;
 
                     const renderRequestCard = (req: OrderReturnRequest) => {
                       const titlePrefix = req.type === 'cancel' ? 'Cancellation' : 'Return';
@@ -1700,17 +1800,46 @@ export function AccountDashboard({
                               <span className="rounded-md border border-[#49243E]/18 bg-[#FFF9F5] px-2 py-0.5 text-[11px] font-medium text-[#49243E]">
                                 {isCod ? 'Cash on Delivery' : 'Online · Razorpay'}
                               </span>
+                              <span
+                                className={`rounded-md border px-2 py-0.5 text-[11px] font-semibold capitalize ${
+                                  isCancelled
+                                    ? 'border-[#9B2C3E]/30 bg-[#F3D5DF]/45 text-[#9B2C3E]'
+                                    : fulfillment === 'unknown'
+                                      ? 'border-amber-300 bg-amber-50 text-amber-900'
+                                      : fulfillment === 'delivered'
+                                        ? 'border-emerald-300 bg-emerald-50 text-emerald-900'
+                                        : 'border-[#49243E]/20 bg-[#FFF9F5] text-[#49243E]'
+                                }`}
+                              >
+                                Order: {orderStatusLabel}
+                              </span>
+                              {refundStatusLabel && (
+                                <span
+                                  className={`rounded-md border px-2 py-0.5 text-[11px] font-medium ${
+                                    refundStatus === 'refunded'
+                                      ? 'border-emerald-300 bg-emerald-50 text-emerald-900'
+                                      : refundStatus === 'pending_refund' ||
+                                          refundStatus === 'refund_initiated'
+                                        ? 'border-amber-300 bg-amber-50 text-amber-900'
+                                        : 'border-[#49243E]/15 bg-[#FFF9F5] text-[#49243E]/80'
+                                  }`}
+                                >
+                                  {refundStatusLabel}
+                                </span>
+                              )}
                             </div>
-                            <p className="mt-1 text-xs font-semibold uppercase tracking-wider text-[#49243E]">
-                              Payment:{' '}
-                              {payment === 'paid'
-                                ? 'Paid'
-                                : isCod
-                                  ? 'Payment due on delivery'
-                                  : payment}{' '}
-                              · Fulfillment: {fulfillment.replace(/_/g, ' ')}
+                            <p className="mt-1.5 text-xs font-semibold uppercase tracking-wider text-[#49243E]">
+                              Payment: {paymentStatusLabel} · Order Status: {orderStatusLabel}
                             </p>
-                            {cancelReq?.status === 'pending' && (
+                            {isCancelled && (
+                              <p className="mt-1 text-xs font-medium text-[#9B2C3E] tabular-nums">
+                                Cancelled
+                                {order.cancelledAt ? ` on ${formatTimestamp(order.cancelledAt)}` : ''}
+                                {order.cancelledBy ? ` by ${order.cancelledBy}` : ''}
+                                {order.cancelReason ? ` — ${order.cancelReason}` : ''}
+                              </p>
+                            )}
+                            {!isCancelled && cancelReq?.status === 'pending' && (
                               <p className="mt-1 text-xs font-semibold text-[#B76E79]">
                                 Cancellation requested · Pending review
                               </p>
@@ -1725,7 +1854,13 @@ export function AccountDashboard({
                           </div>
                           <div className="text-right tabular-nums">
                             <span className="block text-[11px] uppercase tracking-wider text-[#242124]/60">
-                              {isUnpaidCod ? 'Amount Due on Delivery' : 'Total Paid'}
+                              {isCancelled
+                                ? payment === 'paid'
+                                  ? 'Cancelled · Prepaid'
+                                  : 'Cancelled Order'
+                                : isUnpaidCod
+                                  ? 'Amount Due on Delivery'
+                                  : 'Total Paid'}
                             </span>
                             <span className="font-serif text-2xl font-semibold text-[#49243E]">
                               {formatPaiseINR(order.totalPaise)}
@@ -1737,16 +1872,33 @@ export function AccountDashboard({
                           {order.items.map((item, idx) => (
                             <li
                               key={`${item.sku}-${idx}`}
-                              className="flex items-center justify-between gap-3 py-2 text-xs"
+                              className="flex items-center justify-between gap-3 py-2.5 text-xs"
                             >
-                              <div className="min-w-0">
-                                <span className="font-semibold text-[#49243E]">
-                                  {item.productTitle}
-                                </span>
-                                <span className="text-[#242124]/65">
-                                  {' '}
-                                  · {item.variantLabel} &times; {item.quantity}
-                                </span>
+                              <div className="flex min-w-0 items-center gap-3">
+                                {item.imageUrl && (
+                                  <img
+                                    src={item.imageUrl}
+                                    alt={`${item.productTitle}${item.colorName ? ` — ${item.colorName}` : ''}`}
+                                    loading="lazy"
+                                    className="h-12 w-9 shrink-0 rounded-lg border border-[#49243E]/10 bg-[#F8F1ED] object-cover object-top"
+                                  />
+                                )}
+                                <div className="min-w-0">
+                                  <span className="block truncate font-semibold text-[#49243E]">
+                                    {item.productTitle}
+                                  </span>
+                                  <span className="text-[#242124]/70">
+                                    {item.colorName || item.size
+                                      ? [item.colorName, item.size].filter(Boolean).join(' · ')
+                                      : item.variantLabel}{' '}
+                                    &times; {item.quantity}
+                                  </span>
+                                  {item.sku && (
+                                    <span className="block text-[11px] text-[#49243E]/50 tabular-nums">
+                                      SKU: {item.sku}
+                                    </span>
+                                  )}
+                                </div>
                               </div>
                               <span className="shrink-0 font-semibold tabular-nums text-[#242124]">
                                 {formatPaiseINR(item.lineTotalPaise)}
@@ -1873,7 +2025,7 @@ export function AccountDashboard({
                           </div>
                         )}
 
-                        {cancelReq && renderRequestCard(cancelReq)}
+                        {!isCancelled && cancelReq && renderRequestCard(cancelReq)}
                         {returnReq && renderRequestCard(returnReq)}
 
                         {requestFeedback?.orderId === order.id && (
@@ -1887,7 +2039,58 @@ export function AccountDashboard({
                           </p>
                         )}
 
-                        {requestOrderId === order.id ? (
+                        {cancelOrderId === order.id ? (
+                          <form
+                            onSubmit={(e) => void handleConfirmCancelOrder(e, order)}
+                            className="space-y-3 rounded-2xl border border-[#9B2C3E]/30 bg-[#FFF9F5] p-4"
+                          >
+                            <div>
+                              <p className="text-xs font-semibold text-[#9B2C3E]">
+                                Cancel Order {order.orderNumber}
+                              </p>
+                              <p className="mt-1 text-xs text-[#242124]/75">
+                                {payment === 'paid'
+                                  ? 'Cancelling this order immediately stops fulfillment and flags your prepaid payment for refund review.'
+                                  : 'Cancelling this order immediately stops fulfillment and releases your reserved items. No COD payment will be collected.'}
+                              </p>
+                            </div>
+                            <textarea
+                              rows={2}
+                              maxLength={500}
+                              value={cancelReason}
+                              onChange={(e) => setCancelReason(e.target.value)}
+                              placeholder="Optional reason for cancelling (e.g., ordered wrong size or changed mind)…"
+                              className="w-full rounded-xl border border-[#49243E]/18 bg-white p-3 text-xs focus:border-[#49243E] focus:outline-none"
+                            />
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="submit"
+                                disabled={cancelBusyOrderId === order.id}
+                                className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl bg-[#9B2C3E] px-4 text-xs font-medium text-white hover:bg-[#7F2231] disabled:opacity-60"
+                              >
+                                {cancelBusyOrderId === order.id && (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                                )}
+                                <span>
+                                  {cancelBusyOrderId === order.id
+                                    ? 'Cancelling…'
+                                    : 'Confirm Cancellation'}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                disabled={cancelBusyOrderId === order.id}
+                                onClick={() => {
+                                  setCancelOrderId(null);
+                                  setCancelReason('');
+                                }}
+                                className="inline-flex min-h-[40px] items-center rounded-xl border border-[#49243E]/20 bg-white px-4 text-xs font-medium text-[#49243E] disabled:opacity-60"
+                              >
+                                Keep Order
+                              </button>
+                            </div>
+                          </form>
+                        ) : requestOrderId === order.id ? (
                           <form
                             onSubmit={(e) => void handleSubmitOrderRequest(e, order.id)}
                             className="space-y-3 rounded-2xl border border-[#49243E]/15 bg-[#FFF9F5] p-4"
@@ -1949,24 +2152,26 @@ export function AccountDashboard({
                                   <span>Edit Delivery</span>
                                 </button>
                               )}
-                              {canRequestCancel && (
+                              {canCancelDirectly && (
                                 <button
                                   type="button"
+                                  disabled={cancelBusyOrderId === order.id}
                                   onClick={() => {
-                                    setRequestType('cancel');
-                                    setRequestMode('create');
-                                    setRequestOrderId(order.id);
-                                    setRequestReason('');
+                                    setRequestOrderId(null);
+                                    setCancelOrderId(order.id);
+                                    setCancelReason('');
+                                    setRequestFeedback(null);
                                   }}
-                                  className="inline-flex min-h-[40px] items-center rounded-xl border border-[#49243E]/20 bg-[#FFF9F5] px-4 text-xs font-medium text-[#49243E] hover:bg-[#F3D5DF]/40"
+                                  className="inline-flex min-h-[40px] items-center rounded-xl border border-[#9B2C3E]/30 bg-[#FFF9F5] px-4 text-xs font-medium text-[#9B2C3E] hover:bg-[#F3D5DF]/45 disabled:opacity-60"
                                 >
-                                  Request Cancellation
+                                  Cancel Order
                                 </button>
                               )}
                               {canRequestReturn && (
                                 <button
                                   type="button"
                                   onClick={() => {
+                                    setCancelOrderId(null);
                                     setRequestType('return');
                                     setRequestMode('create');
                                     setRequestOrderId(order.id);

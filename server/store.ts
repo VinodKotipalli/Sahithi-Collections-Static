@@ -84,6 +84,7 @@ export interface AdminOverviewData {
     totalCategories: number;
     totalOrders: number;
     pendingOrders: number;
+    cancelledOrders?: number;
     totalRevenuePaise: number;
     unreadMessages: number;
     totalMessages: number;
@@ -300,7 +301,13 @@ export interface BoutiqueStore {
   createProduct(input: {
     product: ProductRow;
     variants: ProductVariantRow[];
-    images: Array<{ mediaId: string | null; url: string; alt: string; isCover: boolean }>;
+    images: Array<{
+      mediaId: string | null;
+      colorId?: string | null;
+      url: string;
+      alt: string;
+      isCover: boolean;
+    }>;
     actorUserId: string;
     auditAction: string;
     auditSummary: string;
@@ -332,7 +339,13 @@ export interface BoutiqueStore {
     publishedAtIfNull: number | null;
     now: number;
     variants: ProductVariantRow[];
-    images: Array<{ mediaId: string | null; url: string; alt: string; isCover: boolean }>;
+    images: Array<{
+      mediaId: string | null;
+      colorId?: string | null;
+      url: string;
+      alt: string;
+      isCover: boolean;
+    }>;
     actorUserId: string;
     auditAction: string;
     auditSummary: string;
@@ -351,7 +364,11 @@ export interface BoutiqueStore {
     actorUserId: string;
   }): Promise<
     | { ok: true; product: AdminProductRecord }
-    | { ok: false; code: 'PRODUCT_NOT_FOUND' | 'VERSION_CONFLICT' | 'NO_IMAGES' }
+    | {
+        ok: false;
+        code: 'PRODUCT_NOT_FOUND' | 'VERSION_CONFLICT' | 'NO_IMAGES' | 'INCOMPLETE_COLOR_VARIANTS';
+        message?: string;
+      }
   >;
   deleteOrArchiveProduct(
     productId: string,
@@ -391,8 +408,17 @@ export interface BoutiqueStore {
       actor?: 'owner' | 'system' | 'customer';
       note?: string;
       notifyCustomer?: boolean;
+      expectedUpdatedAt?: number | null;
+      paymentStatus?: string;
+      refundStatus?: string;
     }
   ): Promise<OrderWithItems | null>;
+  cancelCustomerOrder(input: {
+    orderId: string;
+    userId: string;
+    reason?: string;
+    expectedUpdatedAt?: number | null;
+  }): Promise<{ orderWithItems: OrderWithItems; alreadyCancelled: boolean } | null>;
   submitOrderReturnRequest(input: {
     orderId: string;
     userId: string;
