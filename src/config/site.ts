@@ -73,7 +73,7 @@ export const SITE_CONFIG = {
    * Replace empty strings with your live boutique details before publishing.
    */
   contact: {
-    whatsappNumber: '918520899337',
+    whatsappNumber: '919701628779',
     instagramHandle: '',
     email: 'saivinodkotipalli2003@gmail.com',
     storeAddress: '',
