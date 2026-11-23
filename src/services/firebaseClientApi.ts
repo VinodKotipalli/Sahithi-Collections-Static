@@ -25,6 +25,11 @@ import {
   type NotificationPreferencesData,
 } from '../../server/order-utils.ts';
 import { PRODUCTS, SEED_SKU_BY_ID } from '../config/products';
+import {
+  compressUploadDataUrl,
+  DocumentTooLargeError,
+  fitInlineImagesToBudget,
+} from '../utils/imageCompression';
 import type { AuthCapabilities, AuthUser, ApiResult } from '../context/AuthContext';
 import type {
   LoyaltyConfig,
@@ -6740,8 +6745,12 @@ export async function handleClientlessApiRequest<T>(
                 typeof btoa === 'function'
                   ? btoa(binary)
                   : Buffer.from(bytes).toString('base64');
-              const mime = fileObj.type || 'image/jpeg';
-              const dataUrl = `data:${mime};base64,${base64}`;
+              const originalMime = fileObj.type || 'image/jpeg';
+              // Inline images live inside Firestore docs (1 MiB cap), so shrink them first.
+              const dataUrl = await compressUploadDataUrl(
+                `data:${originalMime};base64,${base64}`
+              );
+              const mime = dataUrl.slice(5, dataUrl.indexOf(';')) || originalMime;
               filesOut.push({
                 id: `media_${Date.now().toString(36)}_${randomHex(3)}`,
                 url: dataUrl,
@@ -6993,8 +7002,16 @@ export async function handleClientlessApiRequest<T>(
           };
         }
         if (upperMethod === 'PUT' || upperMethod === 'POST' || upperMethod === 'PATCH') {
-          const merged = mergeStorefrontContent(body.content ?? body);
           const now = Date.now();
+          let merged = mergeStorefrontContent(body.content ?? body);
+          try {
+            merged = await fitInlineImagesToBudget(merged);
+          } catch (err) {
+            if (err instanceof DocumentTooLargeError) {
+              return { ok: false, status: 400, code: 'CONTENT_TOO_LARGE', error: err.message };
+            }
+            throw err;
+          }
           await firestoreSetDoc(
             'site_documents',
             'content',
@@ -7044,7 +7061,15 @@ export async function handleClientlessApiRequest<T>(
           };
         }
         if (upperMethod === 'PUT' || upperMethod === 'POST' || upperMethod === 'PATCH') {
-          const merged = mergeSiteSettings(body.settings ?? body);
+          let merged = mergeSiteSettings(body.settings ?? body);
+          try {
+            merged = await fitInlineImagesToBudget(merged, 600_000);
+          } catch (err) {
+            if (err instanceof DocumentTooLargeError) {
+              return { ok: false, status: 400, code: 'SETTINGS_TOO_LARGE', error: err.message };
+            }
+            throw err;
+          }
           const now = Date.now();
           const meta = await getClientCatalogVisibilityMeta(idToken);
           await firestoreSetDoc(
