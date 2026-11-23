@@ -6,8 +6,8 @@ import {
   normalizePaymentAndRefundStatus,
   normalizeRawOrderStatusValue,
   type OrderRefundStatus,
-  type OrderReturnRequest,
-  type OrderStatusHistoryEntry,
+  type OrderRequestRecordData as OrderReturnRequest,
+  type OrderHistoryEntryData as OrderStatusHistoryEntry,
 } from './order-utils.ts';
 
 function parseJsonSafe<T>(raw: string, fallback: T): T {
@@ -147,7 +147,7 @@ export function inspectOrderForCancellationRepair(
     rawPaymentStatus: record.paymentStatus,
     rawRefundStatus: record.refundStatus,
     paymentMethod: record.paymentMethod,
-    fulfillmentStatus: 'cancelled',
+    orderStatus: 'cancelled',
   });
 
   const lastCancelHistory = cancelHistoryEntries[cancelHistoryEntries.length - 1];

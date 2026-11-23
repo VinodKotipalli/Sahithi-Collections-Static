@@ -198,18 +198,23 @@ export function normalizePaymentAndRefundStatus(params: {
   }
 
   let refundStatus: OrderRefundStatus;
+  const isCancelledOrReturned =
+    normalizedOrderStatus === 'cancelled' || normalizedOrderStatus === 'returned';
+
   if (
     rawRef === 'refunded' ||
     rawRef === 'refund_initiated' ||
-    rawRef === 'pending_refund' ||
-    rawRef === 'not_required' ||
-    rawRef === 'none'
+    rawRef === 'pending_refund'
   ) {
     refundStatus = rawRef;
+  } else if (rawRef === 'not_required' && !(isCancelledOrReturned && paymentStatus === 'paid')) {
+    refundStatus = 'not_required';
   } else if (rawPay === 'refunded') {
     refundStatus = 'refunded';
-  } else if (normalizedOrderStatus === 'cancelled' || normalizedOrderStatus === 'returned') {
+  } else if (isCancelledOrReturned) {
     refundStatus = paymentStatus === 'paid' ? 'pending_refund' : 'not_required';
+  } else if (rawRef === 'none') {
+    refundStatus = 'none';
   } else {
     refundStatus = 'none';
   }
@@ -344,12 +349,13 @@ export function parseOrderHistory(raw: unknown): OrderHistoryEntryData[] {
 export function recoverLegacyFulfillmentStatus(params: {
   rawStatus?: string | null;
   rawFulfillmentStatus?: string | null;
-  history: OrderHistoryEntryData[];
+  history?: OrderHistoryEntryData[];
   paymentMethod?: string | null;
   hasReturnOnly?: boolean;
   cancelRequest?: OrderRequestRecordData | null;
   cancelledAt?: number | null;
 }): { status: string; unknownOrCorrupted: boolean } {
+  const safeHistory = Array.isArray(params.history) ? params.history : [];
   const f = normalizeRawOrderStatusValue(params.rawFulfillmentStatus);
   const s = normalizeRawOrderStatusValue(params.rawStatus);
 
@@ -372,8 +378,8 @@ export function recoverLegacyFulfillmentStatus(params: {
 
   // Legacy doc had status/fulfillment_status corrupted to 'return_requested' — recover from history
   if (f === 'return_requested' || s === 'return_requested') {
-    for (let i = params.history.length - 1; i >= 0; i -= 1) {
-      const entryStatus = normalizeRawOrderStatusValue(params.history[i]?.status);
+    for (let i = safeHistory.length - 1; i >= 0; i -= 1) {
+      const entryStatus = normalizeRawOrderStatusValue(safeHistory[i]?.status);
       if (VALID_FULFILLMENT_STATES.has(entryStatus)) {
         return { status: entryStatus, unknownOrCorrupted: false };
       }
@@ -391,8 +397,8 @@ export function recoverLegacyFulfillmentStatus(params: {
   }
 
   // Check history if raw status was empty or unrecognized
-  for (let i = params.history.length - 1; i >= 0; i -= 1) {
-    const entryStatus = normalizeRawOrderStatusValue(params.history[i]?.status);
+  for (let i = safeHistory.length - 1; i >= 0; i -= 1) {
+    const entryStatus = normalizeRawOrderStatusValue(safeHistory[i]?.status);
     if (VALID_FULFILLMENT_STATES.has(entryStatus)) {
       return { status: entryStatus, unknownOrCorrupted: false };
     }
@@ -416,7 +422,7 @@ export function normalizeOrderRequestsAndStatus(params: {
   rawCancelledBy?: unknown;
   rawCancelReason?: unknown;
   razorpayPaymentId?: unknown;
-  history: OrderHistoryEntryData[];
+  history?: OrderHistoryEntryData[];
   paymentMethod?: string | null;
 }): {
   status: string;
@@ -431,6 +437,7 @@ export function normalizeOrderRequestsAndStatus(params: {
   needsAdminReview: boolean;
   legacyCollisionNote: string | null;
 } {
+  const safeHistory = Array.isArray(params.history) ? params.history : [];
   let cancelRequest = sanitizeOrderRequestRecord(params.rawCancelRequest, 'cancel');
   let returnRequest = sanitizeOrderRequestRecord(params.rawReturnRequest, 'return');
 
@@ -454,7 +461,7 @@ export function normalizeOrderRequestsAndStatus(params: {
   const recovered = recoverLegacyFulfillmentStatus({
     rawStatus: rawS,
     rawFulfillmentStatus: rawF,
-    history: params.history,
+    history: safeHistory,
     paymentMethod: params.paymentMethod,
     hasReturnOnly: Boolean(returnRequest && !cancelRequest),
     cancelRequest,
@@ -477,7 +484,7 @@ export function normalizeOrderRequestsAndStatus(params: {
       : null;
 
   if (authoritativeStatus === 'cancelled') {
-    const cancelEntry = [...params.history]
+    const cancelEntry = [...safeHistory]
       .reverse()
       .find((h) => {
         const hs = normalizeRawOrderStatusValue(h?.status);

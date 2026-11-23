@@ -62,7 +62,7 @@ import {
   mergeStorefrontContent,
 } from './storefront-defaults.ts';
 import {
-  isOrderPendingFulfillment,
+  isOrderAwaitingDispatch,
   normalizeOrderRequestsAndStatus,
   normalizePaymentAndRefundStatus,
   normalizeRawOrderStatusValue,
@@ -601,7 +601,7 @@ export class SqliteBoutiqueStore implements BoutiqueStore {
 
       if (norm.status === 'cancelled') {
         cancelledOrders += 1;
-      } else if (isOrderPendingFulfillment(norm.status)) {
+      } else if (isOrderAwaitingDispatch(norm.status)) {
         pendingOrders += 1;
       }
 

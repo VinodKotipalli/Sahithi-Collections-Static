@@ -539,6 +539,7 @@ test('Delayed Razorpay verify-payment, webhook, and order-status callbacks NEVER
     const now = Date.now();
     const rzpOrderId = 'order_delayed_cb_1';
     const rzpPaymentId = 'pay_delayed_cb_1';
+    const deterministicOrderId = `ord_rzp_${rzpOrderId}`;
 
     // Insert an already-cancelled Razorpay order (e.g., customer cancelled before webhook arrived)
     appInstance.db!.prepare(
@@ -548,11 +549,10 @@ test('Delayed Razorpay verify-payment, webhook, and order-status callbacks NEVER
         status, payment_status, fulfillment_status, refund_status, payment_method,
         razorpay_order_id, cancelled_at, cancelled_by, cancel_reason,
         status_history_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 'INR', 'cancelled', 'pending', 'cancelled', 'not_required', 'razorpay', ?, ?, 'customer', 'Cancelled prior to payment settlement', ?, ?, ?)`
+      ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, 0, ?, 'INR', 'cancelled', 'pending', 'cancelled', 'not_required', 'razorpay', ?, ?, 'customer', 'Cancelled prior to payment settlement', ?, ?, ?)`
     ).run(
-      'ord_cancelled_rzp_1',
+      deterministicOrderId,
       'SC-RZP-CANC-1',
-      'user_rzp_1',
       'Meera',
       'meera@example.com',
       '9876543210',
@@ -569,39 +569,42 @@ test('Delayed Razorpay verify-payment, webhook, and order-status callbacks NEVER
       now - 5000
     );
 
-    // Mock Razorpay REST API returning a captured payment for that order
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      const url = typeof input === 'string' ? input : input.toString();
-      if (url.includes(`/v1/payments/${rzpPaymentId}`)) {
-        return new Response(
-          JSON.stringify({
-            id: rzpPaymentId,
-            order_id: rzpOrderId,
-            status: 'captured',
-            amount: 250000,
-            currency: 'INR',
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      if (url.includes(`/v1/orders/${rzpOrderId}/payments`)) {
-        return new Response(
-          JSON.stringify({
-            items: [
-              {
-                id: rzpPaymentId,
-                order_id: rzpOrderId,
-                status: 'captured',
-                amount: 250000,
-                currency: 'INR',
-              },
-            ],
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      return new Response(JSON.stringify({ error: `Unexpected ${url}` }), { status: 404 });
-    }) as typeof fetch;
+    const mockRazorpayFactory = () => ({
+      orders: {
+        create: async () => ({ id: rzpOrderId, amount: 250000, currency: 'INR', status: 'paid' }),
+        fetch: async () => ({ id: rzpOrderId, amount: 250000, currency: 'INR', status: 'paid' }),
+        fetchPayments: async () => ({
+          items: [
+            {
+              id: rzpPaymentId,
+              order_id: rzpOrderId,
+              status: 'captured',
+              captured: true,
+              amount: 250000,
+              currency: 'INR',
+            },
+          ],
+        }),
+      },
+      payments: {
+        fetch: async () => ({
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          captured: true,
+          amount: 250000,
+          currency: 'INR',
+        }),
+        capture: async () => ({
+          id: rzpPaymentId,
+          order_id: rzpOrderId,
+          status: 'captured',
+          captured: true,
+          amount: 250000,
+          currency: 'INR',
+        }),
+      },
+    });
 
     // 1. Delayed verify-payment callback
     const sig = crypto
@@ -609,14 +612,15 @@ test('Delayed Razorpay verify-payment, webhook, and order-status callbacks NEVER
       .update(`${rzpOrderId}|${rzpPaymentId}`)
       .digest('hex');
 
-    const verifyRes = await handleVerifyPaymentRequest(
-      {
+    const verifyRes = await handleVerifyPaymentRequest({
+      body: {
         razorpay_order_id: rzpOrderId,
         razorpay_payment_id: rzpPaymentId,
         razorpay_signature: sig,
       },
-      { store }
-    );
+      store,
+      razorpayClientFactory: mockRazorpayFactory,
+    });
     assert.equal(verifyRes.status, 200);
     const verifyOrder = (verifyRes.body as { order?: { status: string; paymentStatus: string; refundStatus: string } }).order;
     assert.equal(verifyOrder?.status, 'cancelled', 'verify-payment must NOT reactivate cancelled order');
@@ -632,6 +636,7 @@ test('Delayed Razorpay verify-payment, webhook, and order-status callbacks NEVER
             id: rzpPaymentId,
             order_id: rzpOrderId,
             status: 'captured',
+            captured: true,
             amount: 250000,
             currency: 'INR',
           },
@@ -643,14 +648,21 @@ test('Delayed Razorpay verify-payment, webhook, and order-status callbacks NEVER
       .update(webhookPayload)
       .digest('hex');
 
-    const whRes = await handleRazorpayWebhookRequest(webhookPayload, whSig, { store });
+    const whRes = await handleRazorpayWebhookRequest({
+      rawBody: webhookPayload,
+      signatureHeader: whSig,
+      store,
+      razorpayClientFactory: mockRazorpayFactory,
+    });
     assert.equal(whRes.status, 200);
 
     // 3. Delayed order-status polling check
-    const statusRes = await handleOrderStatusRequest(
-      { razorpayOrderId: rzpOrderId, paymentId: rzpPaymentId },
-      { store }
-    );
+    const statusRes = await handleOrderStatusRequest({
+      razorpayOrderId: rzpOrderId,
+      razorpayPaymentId: rzpPaymentId,
+      store,
+      razorpayClientFactory: mockRazorpayFactory,
+    });
     assert.equal(statusRes.status, 200);
     const polledOrder = (statusRes.body as { order?: { status: string; paymentStatus: string; refundStatus: string } }).order;
     assert.equal(polledOrder?.status, 'cancelled', 'order-status polling must NOT reactivate cancelled order');
@@ -660,7 +672,7 @@ test('Delayed Razorpay verify-payment, webhook, and order-status callbacks NEVER
     // Confirm database row itself remained cancelled with refund_status === 'pending_refund'
     const dbRow = appInstance.db!
       .prepare(`SELECT status, fulfillment_status, payment_status, refund_status FROM orders WHERE id = ?`)
-      .get('ord_cancelled_rzp_1') as {
+      .get(deterministicOrderId) as {
       status: string;
       fulfillment_status: string;
       payment_status: string;
@@ -687,7 +699,7 @@ test('Missing/unknown order statuses never silently default to pending, and fail
   const norm = normalizeOrderRequestsAndStatus({
     rawStatus: '',
     rawFulfillmentStatus: '',
-    statusHistory: [],
+    history: [],
   });
   assert.equal(norm.fulfillmentStatus, 'unknown');
   assert.equal(norm.needsAdminReview, true);
@@ -828,14 +840,13 @@ test('Cancelled order repair script: dry-run vs apply, backup creation, verified
       shipping_address, subtotal_paise, discount_paise, gift_card_paise, total_paise, currency,
       status, payment_status, fulfillment_status, refund_status, payment_method,
       cancelled_at, cancelled_by, cancel_request_json, status_history_json, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 100000, 0, 0, 100000, 'INR', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, NULL, ?, ?, ?, ?, 100000, 0, 0, 100000, 'INR', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   // 1. Order with verified cancellation evidence (approved cancel request + history) stuck in 'pending'
   insertOrder.run(
     'ord_repair_1',
     'SC-REP-1',
-    'u1',
     'Asha',
     'asha@example.com',
     '9999999991',
@@ -860,7 +871,6 @@ test('Cancelled order repair script: dry-run vs apply, backup creation, verified
   insertOrder.run(
     'ord_repair_2',
     'SC-REP-2',
-    'u2',
     'Bhanu',
     'bhanu@example.com',
     '9999999992',
@@ -882,7 +892,6 @@ test('Cancelled order repair script: dry-run vs apply, backup creation, verified
   insertOrder.run(
     'ord_genuine_pending',
     'SC-PEND-1',
-    'u3',
     'Chitra',
     'chitra@example.com',
     '9999999993',
@@ -904,7 +913,6 @@ test('Cancelled order repair script: dry-run vs apply, backup creation, verified
   insertOrder.run(
     'ord_failed_pay',
     'SC-FAILPAY-1',
-    'u4',
     'Deepa',
     'deepa@example.com',
     '9999999994',
@@ -926,7 +934,6 @@ test('Cancelled order repair script: dry-run vs apply, backup creation, verified
   insertOrder.run(
     'ord_already_clean',
     'SC-CLEAN-1',
-    'u5',
     'Esha',
     'esha@example.com',
     '9999999995',

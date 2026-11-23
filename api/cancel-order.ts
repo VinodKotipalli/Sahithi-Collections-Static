@@ -109,14 +109,14 @@ export function createCancelOrderHandler(options?: {
       req.headers.authorization,
       options?.verifyIdToken
     );
-    if (!authResult.ok) {
+    if (!authResult.ok || !authResult.uid) {
       sendJson(
         res,
-        authResult.status,
+        authResult.ok ? 401 : authResult.status,
         {
-          status: authResult.status,
-          code: authResult.code,
-          error: authResult.error,
+          status: authResult.ok ? 401 : authResult.status,
+          code: authResult.ok ? 'AUTH_REQUIRED' : authResult.code,
+          error: authResult.ok ? 'Authentication required.' : authResult.error,
         },
         requestId
       );
@@ -149,8 +149,8 @@ export function createCancelOrderHandler(options?: {
     const reason = typeof body.reason === 'string' ? body.reason.trim() : undefined;
     const expectedUpdatedAt =
       typeof body.expectedUpdatedAt === 'number' && Number.isFinite(body.expectedUpdatedAt)
-        ? body.expectedUpdatedAt
-        : null;
+        ? Number(body.expectedUpdatedAt)
+        : undefined;
 
     const result = await handleCancelOrderRequest({
       orderId,

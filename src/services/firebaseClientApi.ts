@@ -1159,7 +1159,18 @@ async function verifyRazorpayOrderStatusFromServer(
   razorpayOrderId: string,
   razorpayPaymentId: string | null,
   idToken?: string
-): Promise<{ confirmed: boolean; paymentId?: string } | null> {
+): Promise<{
+  confirmed: boolean;
+  cancelled?: boolean;
+  paymentId?: string;
+  order?: {
+    status?: string;
+    fulfillmentStatus?: string;
+    paymentStatus?: string;
+    refundStatus?: string;
+    razorpayPaymentId?: string;
+  };
+} | null> {
   if (!razorpayOrderId || typeof fetch !== 'function') return null;
   try {
     const headers: Record<string, string> = {
@@ -1179,13 +1190,30 @@ async function verifyRazorpayOrderStatusFromServer(
     if (!res.ok) return null;
     const payload = (await res.json().catch(() => ({}))) as {
       confirmed?: boolean;
-      order?: { paymentStatus?: string; razorpayPaymentId?: string };
+      cancelled?: boolean;
+      order?: {
+        status?: string;
+        fulfillmentStatus?: string;
+        paymentStatus?: string;
+        refundStatus?: string;
+        razorpayPaymentId?: string;
+      };
       payment_id?: string;
     };
+    if (payload.cancelled || String(payload.order?.status || '').toLowerCase() === 'cancelled') {
+      return {
+        confirmed: false,
+        cancelled: true,
+        paymentId: payload.order?.razorpayPaymentId || payload.payment_id || razorpayPaymentId || undefined,
+        order: payload.order,
+      };
+    }
     if (payload.confirmed && payload.order?.paymentStatus === 'paid') {
       return {
         confirmed: true,
+        cancelled: false,
         paymentId: payload.order.razorpayPaymentId || payload.payment_id || razorpayPaymentId || undefined,
+        order: payload.order,
       };
     }
     return { confirmed: false };

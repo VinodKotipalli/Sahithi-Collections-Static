@@ -43,7 +43,7 @@ import {
   type UserRow,
 } from './store.ts';
 import {
-  isOrderPendingFulfillment,
+  isOrderAwaitingDispatch,
   normalizeOrderRequestsAndStatus,
   normalizePaymentAndRefundStatus,
   normalizeRawOrderStatusValue,
@@ -2444,7 +2444,7 @@ export class FirestoreRestStore implements BoutiqueStore {
 
       if (norm.status === 'cancelled') {
         cancelledOrders += 1;
-      } else if (isOrderPendingFulfillment(norm.status)) {
+      } else if (isOrderAwaitingDispatch(norm.status)) {
         pendingOrders += 1;
       }
 
