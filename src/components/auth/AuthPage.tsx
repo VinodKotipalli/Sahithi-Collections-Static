@@ -1,12 +1,15 @@
-import { ArrowLeft } from 'lucide-react';
+import { useState } from 'react';
+import { ArrowLeft, Mail, Phone } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { BOUTIQUE_MEDIA } from '../../config/media';
 import { SITE_CONFIG } from '../../config/site';
 import { usePrefersReducedMotion } from '../../hooks/usePrefersReducedMotion';
 import { BoutiqueImage } from '../BoutiqueImage';
 import { HeroRibbonFallback } from '../HeroRibbonFallback';
-import type { AuthUser } from '../../context/AuthContext';
+import { useAuth, type AuthUser } from '../../context/AuthContext';
 import { EmailAuthForms, type EmailFlowMode } from './EmailAuthForms';
+import { PhoneOtpForm } from './PhoneOtpForm';
+import type { FirebaseWebAuthSessionSnapshot } from '../../services/firebaseWebAuth';
 
 interface AuthPageProps {
   initialRoute: '/login' | '/signup' | '/forgot-password' | '/reset-password' | '/verify-email';
@@ -24,6 +27,8 @@ export function AuthPage({
   onAuthenticated,
 }: AuthPageProps) {
   const prefersReducedMotion = usePrefersReducedMotion();
+  const { establishPhoneSession } = useAuth();
+  const [authMethod, setAuthMethod] = useState<'email' | 'phone'>('phone');
 
   const emailMode: EmailFlowMode =
     initialRoute === '/signup'
@@ -35,6 +40,9 @@ export function AuthPage({
           : initialRoute === '/verify-email'
             ? 'verify-email'
             : 'login';
+
+  /** Whether the current page shows the email/phone tab switcher */
+  const showMethodTabs = emailMode === 'login' || emailMode === 'signup';
 
   const headingText =
     emailMode === 'reset'
@@ -56,7 +64,24 @@ export function AuthPage({
           ? 'Create your boutique profile and verify your email address.'
           : emailMode === 'forgot'
             ? 'Enter your email address to receive a single-use reset link.'
-            : 'Sign in with your verified email address and password.';
+            : showMethodTabs && authMethod === 'phone'
+              ? 'Sign in quickly with a one-time SMS verification code.'
+              : 'Sign in with your verified email address and password.';
+
+  const handlePhoneVerified = async (
+    snapshot: FirebaseWebAuthSessionSnapshot,
+    options?: { fullName?: string }
+  ): Promise<{ ok: boolean; error?: string; code?: string }> => {
+    const res = await establishPhoneSession({
+      idToken: snapshot.idToken,
+      refreshToken: snapshot.refreshToken,
+      ...(options?.fullName ? { fullName: options.fullName } : {}),
+    });
+    if (res.ok) {
+      onAuthenticated(res.data.user);
+    }
+    return { ok: res.ok, error: res.ok ? undefined : res.error };
+  };
 
   const handleChangeEmailMode = (nextMode: 'login' | 'signup' | 'forgot') => {
     const targetPath =
@@ -167,24 +192,75 @@ export function AuthPage({
             </h1>
             <p className="mt-2 text-sm leading-relaxed text-[#242124]/75">{subtitleText}</p>
 
+            {/* Email / Phone tab switcher — shown only on login & signup */}
+            {showMethodTabs && (
+              <div className="mt-5 flex rounded-xl border border-[#49243E]/12 bg-[#FFF9F5]/80 p-1">
+                <button
+                  type="button"
+                  onClick={() => setAuthMethod('phone')}
+                  className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
+                    authMethod === 'phone'
+                      ? 'bg-[#49243E] text-[#FFF9F5] shadow-sm'
+                      : 'text-[#49243E]/70 hover:text-[#49243E]'
+                  }`}
+                >
+                  <Phone className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>Mobile OTP</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAuthMethod('email')}
+                  className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
+                    authMethod === 'email'
+                      ? 'bg-[#49243E] text-[#FFF9F5] shadow-sm'
+                      : 'text-[#49243E]/70 hover:text-[#49243E]'
+                  }`}
+                >
+                  <Mail className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>Email</span>
+                </button>
+              </div>
+            )}
+
             <div className="mt-6">
               <AnimatePresence mode="wait">
-                <motion.div
-                  key={`email-${emailMode}`}
-                  initial={prefersReducedMotion ? { opacity: 1 } : { opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={prefersReducedMotion ? { opacity: 1 } : { opacity: 0, y: -6 }}
-                  transition={{ duration: prefersReducedMotion ? 0.01 : 0.18 }}
-                >
-                  <EmailAuthForms
-                    mode={emailMode}
-                    token={queryToken}
-                    initialNotice={initialNotice}
-                    onChangeMode={handleChangeEmailMode}
-                    onAuthenticated={onAuthenticated}
-                    onBackToCollections={() => onNavigate('/')}
-                  />
-                </motion.div>
+                {showMethodTabs && authMethod === 'phone' ? (
+                  <motion.div
+                    key="phone-otp"
+                    initial={prefersReducedMotion ? { opacity: 1 } : { opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={prefersReducedMotion ? { opacity: 1 } : { opacity: 0, y: -6 }}
+                    transition={{ duration: prefersReducedMotion ? 0.01 : 0.18 }}
+                  >
+                    <PhoneOtpForm
+                      mode="signin"
+                      showFullNameField={emailMode === 'signup'}
+                      onVerified={handlePhoneVerified}
+                      submitLabel={
+                        emailMode === 'signup'
+                          ? 'Create Account with OTP'
+                          : 'Sign In with OTP'
+                      }
+                    />
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    key={`email-${emailMode}`}
+                    initial={prefersReducedMotion ? { opacity: 1 } : { opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={prefersReducedMotion ? { opacity: 1 } : { opacity: 0, y: -6 }}
+                    transition={{ duration: prefersReducedMotion ? 0.01 : 0.18 }}
+                  >
+                    <EmailAuthForms
+                      mode={emailMode}
+                      token={queryToken}
+                      initialNotice={initialNotice}
+                      onChangeMode={handleChangeEmailMode}
+                      onAuthenticated={onAuthenticated}
+                      onBackToCollections={() => onNavigate('/')}
+                    />
+                  </motion.div>
+                )}
               </AnimatePresence>
             </div>
           </div>
