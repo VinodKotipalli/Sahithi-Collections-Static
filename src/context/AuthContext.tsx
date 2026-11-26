@@ -28,7 +28,6 @@ export interface AuthUser {
 export interface AuthCapabilities {
   emailDeliveryConfigured: boolean;
   emailPasswordEnabled?: boolean;
-  phoneOtpEnabled?: boolean;
   providerStatusReason?: string | null;
   firebaseProjectId?: string | null;
   passwordMinLength: number;
@@ -56,11 +55,6 @@ interface AuthContextValue {
   refreshSession: () => Promise<void>;
   refreshCapabilities: () => Promise<AuthCapabilities | null>;
   loginWithEmail: (email: string, password: string) => Promise<ApiResult<{ user: AuthUser }>>;
-  establishPhoneSession: (input: {
-    idToken: string;
-    refreshToken: string;
-    fullName?: string;
-  }) => Promise<ApiResult<{ user: AuthUser }>>;
   registerWithEmail: (
     fullName: string,
     email: string,
@@ -110,14 +104,6 @@ interface AuthContextValue {
   reauthenticateWithPassword: (
     password: string
   ) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
-  reauthenticateWithPhoneToken: (input: {
-    idToken: string;
-    refreshToken: string;
-  }) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
-  syncLinkedPhone: (input: {
-    idToken: string;
-    refreshToken: string;
-  }) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
   changePassword: (newPassword: string) => Promise<ApiResult<{ message: string; user: AuthUser }>>;
   requestLinkEmail: (email: string) => Promise<ApiResult<{ message: string }>>;
   logout: () => Promise<ApiResult<{ message: string }>>;
@@ -602,30 +588,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [capabilities.authMode, requestApi]
   );
 
-  const establishPhoneSession = useCallback(
-    async (input: { idToken: string; refreshToken: string; fullName?: string }) => {
-      const res = await requestApi<{ user: AuthUser }>('/api/auth/phone-session', {
-        method: 'POST',
-        body: JSON.stringify(input),
-      });
-      if (res.ok) {
-        sessionEpochRef.current += 1;
-        setUser(res.data.user);
-        try {
-          if (typeof BroadcastChannel !== 'undefined') {
-            const ch = new BroadcastChannel('sahithi-boutique-sync');
-            ch.postMessage({ topic: 'account', at: Date.now() });
-            ch.close();
-          }
-        } catch {
-          // ignore
-        }
-      }
-      return res;
-    },
-    [requestApi]
-  );
-
   const registerWithEmail = useCallback(
     (fullName: string, email: string, password: string, confirmPassword: string) =>
       requestApi<{
@@ -789,51 +751,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return res;
     },
     [capabilities.authMode, requestApi]
-  );
-
-  const reauthenticateWithPhoneToken = useCallback(
-    async (input: { idToken: string; refreshToken: string }) => {
-      const res = await requestApi<{ message: string; user: AuthUser }>(
-        '/api/account/reauthenticate',
-        {
-          method: 'POST',
-          body: JSON.stringify(input),
-        }
-      );
-      if (res.ok) {
-        sessionEpochRef.current += 1;
-        setUser(res.data.user);
-      }
-      return res;
-    },
-    [requestApi]
-  );
-
-  const syncLinkedPhone = useCallback(
-    async (input: { idToken: string; refreshToken: string }) => {
-      const res = await requestApi<{ message: string; user: AuthUser }>(
-        '/api/account/phone',
-        {
-          method: 'POST',
-          body: JSON.stringify(input),
-        }
-      );
-      if (res.ok) {
-        sessionEpochRef.current += 1;
-        setUser(res.data.user);
-        try {
-          if (typeof BroadcastChannel !== 'undefined') {
-            const ch = new BroadcastChannel('sahithi-boutique-sync');
-            ch.postMessage({ topic: 'account', at: Date.now() });
-            ch.close();
-          }
-        } catch {
-          // ignore
-        }
-      }
-      return res;
-    },
-    [requestApi]
   );
 
   const changePassword = useCallback(
@@ -1004,7 +921,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         refreshSession: syncSessionAndCapabilities,
         refreshCapabilities,
         loginWithEmail,
-        establishPhoneSession,
         registerWithEmail,
         resendVerificationEmail,
         verifyEmailToken,
@@ -1014,8 +930,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         updateProfile,
         deleteAccount,
         reauthenticateWithPassword,
-        reauthenticateWithPhoneToken,
-        syncLinkedPhone,
         changePassword,
         requestLinkEmail,
         logout,

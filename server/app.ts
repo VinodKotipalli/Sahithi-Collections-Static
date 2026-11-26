@@ -23,7 +23,6 @@ import {
   createDefaultEmailSender,
   type EmailSender,
 } from './providers.ts';
-import type { GeminiClientFactory } from './whatsapp-ai.ts';
 import { registerCatalogAndAdminRoutes } from './catalog.ts';
 import {
   extractOobCode,
@@ -74,8 +73,6 @@ export interface CreateAuthAppOptions {
   appBaseUrl?: string;
   seedCatalog?: boolean;
   razorpayClientFactory?: RazorpayClientFactory;
-  aiClientFactory?: GeminiClientFactory;
-  whatsappFetchImpl?: typeof fetch;
 }
 
 interface AuthedRequest extends Request {
@@ -796,9 +793,7 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
       cleanSubPath === '/create-order' ||
       cleanSubPath === '/verify-payment' ||
       cleanSubPath === '/razorpay-webhook' ||
-      cleanSubPath === '/order-status' ||
-      cleanSubPath === '/whatsapp/stylist' ||
-      cleanSubPath === '/whatsapp/webhook'
+      cleanSubPath === '/order-status'
     ) {
       return next();
     }
@@ -1084,7 +1079,6 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
         authMode: restStore ? 'firebase_managed' : 'local',
         firebaseProjectId: restStore ? restStore.config.projectId : null,
         emailPasswordEnabled: fbProviderStatus ? fbProviderStatus.enabled : true,
-        phoneOtpEnabled: Boolean(restStore),
         providerStatusReason: fbProviderStatus ? fbProviderStatus.rawCode : null,
         emailDeliveryConfigured: fbProviderStatus
           ? fbProviderStatus.enabled
@@ -1707,126 +1701,6 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
   );
 
   app.post(
-    '/api/auth/phone-session',
-    authLimiter,
-    async (req: AuthedRequest, res: Response, next: NextFunction) => {
-      try {
-        if (!restStore) {
-          return sendError(
-            req,
-            res,
-            503,
-            'PHONE_AUTH_UNAVAILABLE',
-            'Mobile OTP authentication requires Firebase Authentication mode.'
-          );
-        }
-
-        const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '';
-        const refreshToken =
-          typeof req.body?.refreshToken === 'string' ? req.body.refreshToken.trim() : '';
-        const requestedName =
-          typeof req.body?.fullName === 'string' ? req.body.fullName.trim() : '';
-
-        if (!idToken || !refreshToken) {
-          return sendError(
-            req,
-            res,
-            400,
-            'VALIDATION_ERROR',
-            'Missing Firebase mobile authentication credentials.'
-          );
-        }
-
-        const claims = await verifyFirebaseIdToken(idToken, restStore.config.projectId);
-        if (!claims || !claims.phoneVerified || !claims.phoneNumber) {
-          return sendError(
-            req,
-            res,
-            401,
-            'PHONE_NOT_VERIFIED',
-            'A verified mobile OTP token is required to sign in.'
-          );
-        }
-
-        setActiveFirestoreIdToken(idToken);
-        const lookedUp = await firebaseLookupUser(restStore.config.apiKey, idToken).catch(
-          () => null
-        );
-        const effectiveName =
-          requestedName.length >= 2
-            ? requestedName.slice(0, 100)
-            : claims.name || lookedUp?.displayName || 'Customer';
-
-        if (
-          requestedName.length >= 2 &&
-          requestedName.slice(0, 100) !== (lookedUp?.displayName || claims.name)
-        ) {
-          await firebaseUpdateDisplayName(
-            restStore.config.apiKey,
-            idToken,
-            requestedName.slice(0, 100)
-          ).catch(() => undefined);
-        }
-
-        const user = await restStore.syncVerifiedUserProfile({
-          id: claims.uid,
-          fullName: effectiveName,
-          email: claims.email || lookedUp?.email || null,
-          emailVerified: Boolean(claims.email && claims.emailVerified),
-          phoneE164: claims.phoneNumber,
-          phoneVerified: true,
-          hasPassword: lookedUp ? lookedUp.hasPassword : false,
-          signInProviders: lookedUp?.providerIds || ['phone'],
-        });
-
-        const now = Date.now();
-        let issuedAt = now;
-        const userRevokedBefore = revokedFirebaseUsersBefore.get(user.id);
-        if (userRevokedBefore && issuedAt <= userRevokedBefore) {
-          issuedAt = userRevokedBefore + 1;
-        }
-
-        const csrfSecret = generateOpaqueToken(24);
-        const sessionId = crypto.randomUUID();
-        const envelope: FirebaseSessionEnvelope = {
-          idToken,
-          refreshToken,
-          uid: user.id,
-          email: user.email,
-          phoneNumber: claims.phoneNumber,
-          phoneVerified: true,
-          hasPassword: Boolean(user.has_password),
-          lastReauthAt: now,
-          csrfSecret,
-          sessionId,
-          issuedAt,
-        };
-        setFirebaseSessionCookies(req, res, envelope, restStore);
-
-        const session: SessionRow = {
-          id: sessionId,
-          user_id: user.id,
-          token_hash: 'firebase-managed',
-          csrf_secret: csrfSecret,
-          last_reauth_at: now,
-          expires_at: claims.expiresAtMs,
-          created_at: issuedAt,
-          revoked_at: null,
-        };
-
-        // Strictly never elevate phone-authenticated sessions to owner unless email_verified matches bound owner
-        const isOwner = await resolveIsBoundOwner(user);
-        return res.json({
-          csrfToken: csrfSecret,
-          user: serializePublicUser(user, session, isOwner),
-        });
-      } catch (err) {
-        return next(err);
-      }
-    }
-  );
-
-  app.post(
     '/api/auth/forgot-password',
     authLimiter,
     async (req: AuthedRequest, res: Response, next: NextFunction) => {
@@ -2217,98 +2091,6 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
   );
 
   app.post(
-    '/api/account/phone',
-    requireRecentReauth,
-    authLimiter,
-    async (req: AuthedRequest, res: Response, next: NextFunction) => {
-      try {
-        if (!restStore || !req.fbEnvelope) {
-          return sendError(
-            req,
-            res,
-            503,
-            'PHONE_AUTH_UNAVAILABLE',
-            'Verified login mobile linking requires Firebase Authentication mode.'
-          );
-        }
-
-        const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '';
-        const refreshToken =
-          typeof req.body?.refreshToken === 'string' && req.body.refreshToken.trim()
-            ? req.body.refreshToken.trim()
-            : req.fbEnvelope.refreshToken;
-        if (!idToken) {
-          return sendError(
-            req,
-            res,
-            400,
-            'VALIDATION_ERROR',
-            'Missing verified Firebase token for the updated mobile number.'
-          );
-        }
-
-        const claims = await verifyFirebaseIdToken(idToken, restStore.config.projectId);
-        if (!claims || !claims.phoneVerified || !claims.phoneNumber) {
-          return sendError(
-            req,
-            res,
-            400,
-            'PHONE_NOT_LINKED',
-            'No verified mobile number was found on the supplied Firebase token.'
-          );
-        }
-        if (claims.uid !== req.authUser!.id) {
-          return sendError(
-            req,
-            res,
-            403,
-            'ACCOUNT_MISMATCH',
-            'This mobile verification belongs to a different account.'
-          );
-        }
-
-        setActiveFirestoreIdToken(idToken);
-        const lookedUp = await firebaseLookupUser(restStore.config.apiKey, idToken).catch(
-          () => null
-        );
-        const updated = await restStore.syncVerifiedUserProfile({
-          id: req.authUser!.id,
-          fullName: req.authUser!.full_name || claims.name || 'Customer',
-          email: claims.email || req.authUser!.email || null,
-          emailVerified: Boolean(claims.email && claims.emailVerified),
-          phoneE164: claims.phoneNumber,
-          phoneVerified: true,
-          hasPassword: lookedUp ? lookedUp.hasPassword : Boolean(req.authUser!.has_password),
-          signInProviders: lookedUp?.providerIds,
-        });
-
-        const now = Date.now();
-        const updatedEnvelope: FirebaseSessionEnvelope = {
-          ...req.fbEnvelope,
-          idToken,
-          refreshToken,
-          email: updated.email,
-          phoneNumber: claims.phoneNumber,
-          phoneVerified: true,
-          hasPassword: Boolean(updated.has_password),
-          lastReauthAt: now,
-        };
-        req.fbEnvelope = updatedEnvelope;
-        req.authSession!.last_reauth_at = now;
-        setFirebaseSessionCookies(req, res, updatedEnvelope, restStore);
-
-        const isOwner = await resolveIsBoundOwner(updated);
-        return res.json({
-          message: `Verified login mobile number updated to ${claims.phoneNumber}.`,
-          user: serializePublicUser(updated, req.authSession!, isOwner),
-        });
-      } catch (err) {
-        return next(err);
-      }
-    }
-  );
-
-  app.post(
     '/api/account/reauthenticate',
     requireAuth,
     authLimiter,
@@ -2317,58 +2099,6 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
         const user = req.authUser!;
         const session = req.authSession!;
         const password = typeof req.body?.password === 'string' ? req.body.password : '';
-        const otpIdToken = typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '';
-
-        if (restStore && req.fbEnvelope && otpIdToken) {
-          const claims = await verifyFirebaseIdToken(otpIdToken, restStore.config.projectId);
-          if (!claims) {
-            return sendError(
-              req,
-              res,
-              401,
-              'INVALID_CREDENTIALS',
-              'Unable to confirm mobile OTP reauthentication.'
-            );
-          }
-          if (claims.uid !== user.id) {
-            return sendError(
-              req,
-              res,
-              403,
-              'ACCOUNT_MISMATCH',
-              'Verification token does not match your signed-in account.'
-            );
-          }
-          if (Date.now() - claims.authTimeMs > 5 * 60_000) {
-            return sendError(
-              req,
-              res,
-              403,
-              'REAUTH_REQUIRED',
-              'Please complete a fresh SMS verification step to confirm your identity.'
-            );
-          }
-          const nextRefresh =
-            typeof req.body?.refreshToken === 'string' && req.body.refreshToken.trim()
-              ? req.body.refreshToken.trim()
-              : req.fbEnvelope.refreshToken;
-          const now = Date.now();
-          const updatedEnvelope: FirebaseSessionEnvelope = {
-            ...req.fbEnvelope,
-            idToken: otpIdToken,
-            refreshToken: nextRefresh,
-            lastReauthAt: now,
-          };
-          req.fbEnvelope = updatedEnvelope;
-          session.last_reauth_at = now;
-          setActiveFirestoreIdToken(otpIdToken);
-          setFirebaseSessionCookies(req, res, updatedEnvelope, restStore);
-          const isOwner = await resolveIsBoundOwner(user);
-          return res.json({
-            message: 'Identity reauthenticated via verified mobile OTP.',
-            user: serializePublicUser(user, session, isOwner),
-          });
-        }
 
         if (restStore && req.fbEnvelope) {
           if (!user.email || !password) {
@@ -3163,8 +2893,6 @@ export function createAuthApp(options: CreateAuthAppOptions = {}) {
     verifyPassword,
     serializePublicUser,
     razorpayClientFactory: options.razorpayClientFactory,
-    aiClientFactory: options.aiClientFactory,
-    whatsappFetchImpl: options.whatsappFetchImpl,
   });
 
   const postOnlyMutationPaths = [

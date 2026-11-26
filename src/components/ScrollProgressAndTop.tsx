@@ -1,13 +1,9 @@
 import { useEffect, useState } from 'react';
-import { ArrowUp, MessageCircle } from 'lucide-react';
+import { ArrowUp } from 'lucide-react';
 import { AnimatePresence, motion, useScroll, useSpring } from 'motion/react';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 
-interface ScrollProgressAndTopProps {
-  onOpenStylist?: () => void;
-}
-
-export function ScrollProgressAndTop({ onOpenStylist }: ScrollProgressAndTopProps) {
+export function ScrollProgressAndTop() {
   const prefersReducedMotion = usePrefersReducedMotion();
   const { scrollYProgress } = useScroll();
   const scaleX = useSpring(scrollYProgress, {
@@ -59,18 +55,6 @@ export function ScrollProgressAndTop({ onOpenStylist }: ScrollProgressAndTopProp
             </motion.button>
           )}
         </AnimatePresence>
-
-        {onOpenStylist && (
-          <button
-            type="button"
-            onClick={onOpenStylist}
-            aria-label="Open WhatsApp AI Stylist"
-            className="inline-flex h-11 items-center gap-2 rounded-full border border-[#49243E]/15 bg-[#49243E] px-4 text-xs font-medium text-[#FFF9F5] shadow-md transition-colors duration-200 hover:bg-[#3A1B31] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#49243E] focus-visible:ring-offset-2 whitespace-nowrap"
-          >
-            <MessageCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
-            <span>WhatsApp Stylist</span>
-          </button>
-        )}
       </div>
     </>
   );

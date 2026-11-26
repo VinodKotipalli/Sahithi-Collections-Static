@@ -69,11 +69,11 @@ export const SITE_CONFIG = {
     },
   },
   /**
-   * EDITABLE CONTACT & WHATSAPP SETTINGS
+   * EDITABLE CONTACT SETTINGS
    * Replace empty strings with your live boutique details before publishing.
    */
   contact: {
-    whatsappNumber: '918520899337',
+    whatsappNumber: '',
     instagramHandle: '',
     email: 'saivinodkotipalli2003@gmail.com',
     storeAddress: '',
@@ -81,38 +81,11 @@ export const SITE_CONFIG = {
   } satisfies ContactConfig,
 };
 
-export const DEFAULT_WHATSAPP_DIGITS = '918520899337';
 export const DEFAULT_BOUTIQUE_EMAIL = 'saivinodkotipalli2003@gmail.com';
-
-export function normalizeWhatsAppDigits(raw: string): string {
-  const digits = raw.replace(/\D/g, '');
-  if (!digits) return '';
-  if (digits.length === 10 && /^[6-9]/.test(digits)) {
-    return `91${digits}`;
-  }
-  return digits;
-}
-
-export function resolveWhatsAppDigits(contact: ContactConfig = SITE_CONFIG.contact): string {
-  const normalized = normalizeWhatsAppDigits(contact.whatsappNumber || '');
-  return normalized.length >= 10 ? normalized : DEFAULT_WHATSAPP_DIGITS;
-}
-
-export function formatWhatsAppDisplay(raw?: string): string {
-  const digits = normalizeWhatsAppDigits(raw || '') || DEFAULT_WHATSAPP_DIGITS;
-  if (digits.length === 12 && digits.startsWith('91')) {
-    return `+91 ${digits.slice(2, 7)} ${digits.slice(7)}`;
-  }
-  return `+${digits}`;
-}
 
 export function resolveBoutiqueEmail(contact: ContactConfig = SITE_CONFIG.contact): string {
   const candidate = (contact.email || '').trim();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(candidate) ? candidate : DEFAULT_BOUTIQUE_EMAIL;
-}
-
-export function isWhatsAppConfigured(contact: ContactConfig = SITE_CONFIG.contact): boolean {
-  return resolveWhatsAppDigits(contact).length >= 10;
 }
 
 export function isInstagramConfigured(contact: ContactConfig = SITE_CONFIG.contact): boolean {
@@ -125,38 +98,4 @@ export function isEmailConfigured(contact: ContactConfig = SITE_CONFIG.contact):
 
 export function isAddressConfigured(contact: ContactConfig = SITE_CONFIG.contact): boolean {
   return contact.storeAddress.trim().length > 0;
-}
-
-export function buildWhatsAppEnquiryMessage(params: {
-  productName: string;
-  selectedSize: string;
-  selectedColor: string;
-  brandName?: string;
-}): string {
-  const brand = params.brandName?.trim() || SITE_CONFIG.brandName;
-  return `Hello ${brand}, I would like to enquire about "${params.productName}" (Size: ${params.selectedSize}, Color: ${params.selectedColor}). Could you please share availability and styling details?`;
-}
-
-export function buildWhatsAppEnquiryUrl(params: {
-  productName: string;
-  selectedSize: string;
-  selectedColor: string;
-  brandName?: string;
-  contact?: ContactConfig;
-}): string {
-  const contact = params.contact || SITE_CONFIG.contact;
-  const digits = resolveWhatsAppDigits(contact);
-  const text = encodeURIComponent(buildWhatsAppEnquiryMessage(params));
-  return `https://wa.me/${digits}?text=${text}`;
-}
-
-export function buildWhatsAppChatUrl(
-  message: string,
-  contact: ContactConfig = SITE_CONFIG.contact
-): string {
-  const digits = resolveWhatsAppDigits(contact);
-  const cleanMsg = message.trim();
-  return cleanMsg
-    ? `https://wa.me/${digits}?text=${encodeURIComponent(cleanMsg)}`
-    : `https://wa.me/${digits}`;
 }

@@ -1335,7 +1335,7 @@ export function AccountDashboard({
                           { key: 'cancelReturnUpdates', label: 'Cancellation & return updates' },
                           { key: 'promotions', label: 'Coupons & atelier launch alerts' },
                           { key: 'emailEnabled', label: 'Email notifications' },
-                          { key: 'smsWhatsappEnabled', label: 'SMS / WhatsApp notifications' },
+                          { key: 'smsWhatsappEnabled', label: 'SMS notifications' },
                         ] as const
                       ).map((pref) => (
                         <label

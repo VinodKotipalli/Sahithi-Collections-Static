@@ -5,15 +5,12 @@ import {
   Loader2,
   Mail,
   MapPin,
-  MessageCircle,
   Send,
 } from 'lucide-react';
 import {
-  formatWhatsAppDisplay,
   isAddressConfigured,
   isInstagramConfigured,
   resolveBoutiqueEmail,
-  resolveWhatsAppDigits,
 } from '../config/site';
 import { useAuth } from '../context/AuthContext';
 import { useStorefront } from '../context/StorefrontContext';
@@ -22,13 +19,11 @@ import { RevealSection } from './RevealSection';
 interface ContactAndFooterProps {
   onNavigateAuth?: () => void;
   accountLabel?: string;
-  onOpenStylist?: () => void;
 }
 
 export function ContactAndFooter({
   onNavigateAuth,
   accountLabel = 'Account / Login',
-  onOpenStylist,
 }: ContactAndFooterProps) {
   const { apiRequest } = useAuth();
   const { settings } = useStorefront();
@@ -39,8 +34,6 @@ export function ContactAndFooter({
   const currentYear = new Date().getFullYear();
 
   const cleanInstagramHandle = contact.instagramHandle.replace(/^@/, '').trim();
-  const cleanWhatsApp = resolveWhatsAppDigits(contact);
-  const displayWhatsApp = formatWhatsAppDisplay(cleanWhatsApp);
   const boutiqueEmail = resolveBoutiqueEmail(contact);
   const instagramLink =
     socialLinks.instagramUrl ||
@@ -114,51 +107,7 @@ export function ContactAndFooter({
             </div>
           </RevealSection>
 
-          <div className="mt-10 grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
-            {/* WhatsApp Card */}
-            <RevealSection delay={0.04}>
-              <div className="flex h-full flex-col justify-between rounded-2xl border border-[#49243E]/12 bg-white p-6">
-                <div>
-                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#F3D5DF]/45 text-[#49243E]">
-                    <MessageCircle className="h-5 w-5" aria-hidden="true" />
-                  </div>
-                  <h3 className="mt-4 font-serif text-xl font-semibold text-[#49243E]">
-                    WhatsApp Styling
-                  </h3>
-                  <p className="mt-2 text-sm text-[#242124]/80 tabular-nums">
-                    {displayWhatsApp}
-                  </p>
-                  <p className="mt-1 text-xs text-[#242124]/65">
-                    24/7 automated AI styling recommendations &amp; direct WhatsApp concierge.
-                  </p>
-                </div>
-
-                <div className="mt-5 flex flex-col gap-2">
-                  {onOpenStylist && (
-                    <button
-                      type="button"
-                      onClick={onOpenStylist}
-                      className="inline-flex min-h-[42px] items-center justify-center rounded-xl bg-[#49243E] px-4 py-2 text-xs font-medium text-[#FFF9F5] transition-colors hover:bg-[#3A1B31]"
-                    >
-                      Ask AI Stylist
-                    </button>
-                  )}
-                  <a
-                    href={`https://wa.me/${cleanWhatsApp}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className={`inline-flex min-h-[42px] items-center justify-center rounded-xl px-4 py-2 text-xs font-medium transition-colors ${
-                      onOpenStylist
-                        ? 'border border-[#49243E]/25 text-[#49243E] hover:bg-[#F3D5DF]/35'
-                        : 'bg-[#49243E] text-[#FFF9F5] hover:bg-[#3A1B31]'
-                    }`}
-                  >
-                    Message on WhatsApp
-                  </a>
-                </div>
-              </div>
-            </RevealSection>
-
+          <div className="mt-10 grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
             {/* Instagram Card */}
             <RevealSection delay={0.08}>
               <div className="flex h-full flex-col justify-between rounded-2xl border border-[#49243E]/12 bg-white p-6">
@@ -337,7 +286,7 @@ export function ContactAndFooter({
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     <div>
                       <label htmlFor="enquiry-phone" className="block text-xs font-medium text-[#49243E]">
-                        Phone / WhatsApp (optional)
+                        Phone (optional)
                       </label>
                       <input
                         id="enquiry-phone"
@@ -475,8 +424,8 @@ export function ContactAndFooter({
             <p>
               &copy; {currentYear} {brandName}. All rights reserved.
             </p>
-            <p className="tabular-nums">
-              WhatsApp: <a href={`https://wa.me/${cleanWhatsApp}`} target="_blank" rel="noopener noreferrer" className="text-[#F3D5DF] hover:underline">{displayWhatsApp}</a> · <a href={`mailto:${boutiqueEmail}`} className="text-[#F3D5DF] hover:underline">{boutiqueEmail}</a>
+            <p>
+              <a href={`mailto:${boutiqueEmail}`} className="text-[#F3D5DF] hover:underline">{boutiqueEmail}</a>
             </p>
           </div>
         </div>

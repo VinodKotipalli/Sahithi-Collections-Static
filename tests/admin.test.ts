@@ -1326,13 +1326,13 @@ test('CMS optional empty fields persist without default reversion, validation re
     '/api/admin/settings',
     {
       ...currentSettings,
-      contact: { ...currentSettings.contact, whatsappNumber: '123' },
+      contact: { ...currentSettings.contact, email: 'not-an-email' },
       socialLinks: { ...currentSettings.socialLinks, instagramUrl: 'not-a-url' },
     },
     ownerCsrf
   );
   assert.equal(badSettings.res.status, 400);
-  assert.ok((badSettings.json.fieldErrors as Record<string, string>)?.['contact.whatsappNumber']);
+  assert.ok((badSettings.json.fieldErrors as Record<string, string>)?.['contact.email']);
 
   const badProduct = await jsonReq(
     ownerJar,

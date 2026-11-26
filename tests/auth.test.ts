@@ -120,6 +120,7 @@ test('No mobile/SMS auth endpoints remain and capabilities report email-only con
   const caps = (await capRes.json()) as Record<string, unknown>;
   assert.equal(caps.emailDeliveryConfigured, true);
   assert.equal('smsDeliveryConfigured' in caps, false);
+  assert.equal('phoneOtpEnabled' in caps, false);
 
   const jar = new CookieJar();
   const { csrfToken } = await bootstrapSession(jar);
@@ -127,9 +128,13 @@ test('No mobile/SMS auth endpoints remain and capabilities report email-only con
   const removedEndpoints = [
     '/api/auth/otp/send',
     '/api/auth/otp/verify',
+    '/api/auth/phone-session',
+    '/api/account/phone',
     '/api/account/reauthenticate/otp',
     '/api/account/link-phone/send',
     '/api/account/link-phone/verify',
+    '/api/whatsapp/stylist',
+    '/api/whatsapp/webhook',
   ];
 
   for (const endpoint of removedEndpoints) {

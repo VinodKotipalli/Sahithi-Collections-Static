@@ -32,11 +32,6 @@ function validateSettingsClient(s: SiteSettings): Record<string, string> {
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     errors['contact.email'] = 'Please enter a valid concierge contact email address.';
   }
-  const phone = s.contact.whatsappNumber.trim();
-  if (phone && phone.replace(/[^0-9]/g, '').length < 7) {
-    errors['contact.whatsappNumber'] =
-      'WhatsApp / phone number must contain at least 7 digits (e.g. 919876543210).';
-  }
   const socials: Array<{ key: string; label: string; value: string }> = [
     { key: 'socialLinks.instagramUrl', label: 'Instagram URL', value: s.socialLinks.instagramUrl.trim() },
     { key: 'socialLinks.facebookUrl', label: 'Facebook URL', value: s.socialLinks.facebookUrl.trim() },
@@ -385,35 +380,6 @@ export function AdminSettingsPanel({
           Contact &amp; Showroom Details
         </h3>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <div>
-            <label htmlFor="settings-whatsapp" className="block text-xs font-medium text-[#49243E]">
-              WhatsApp Number (with country code)
-            </label>
-            <input
-              id="settings-whatsapp"
-              type="text"
-              value={settings.contact.whatsappNumber}
-              onChange={(e) => {
-                clearFieldError('contact.whatsappNumber');
-                setSettings((p) =>
-                  p ? { ...p, contact: { ...p.contact, whatsappNumber: e.target.value } } : p
-                );
-              }}
-              placeholder="918520899337"
-              aria-invalid={Boolean(fieldErrors['contact.whatsappNumber'])}
-              className={`mt-1 h-11 w-full rounded-xl border bg-[#FFF9F5]/60 px-3.5 text-sm tabular-nums focus:bg-white focus:outline-none ${
-                fieldErrors['contact.whatsappNumber']
-                  ? 'border-[#9F1239] focus:border-[#9F1239]'
-                  : 'border-[#49243E]/18 focus:border-[#49243E]'
-              }`}
-            />
-            {fieldErrors['contact.whatsappNumber'] && (
-              <p className="mt-1 text-xs font-medium text-[#9F1239]">
-                {fieldErrors['contact.whatsappNumber']}
-              </p>
-            )}
-          </div>
-
           <div>
             <label htmlFor="settings-ig-handle" className="block text-xs font-medium text-[#49243E]">
               Instagram Handle

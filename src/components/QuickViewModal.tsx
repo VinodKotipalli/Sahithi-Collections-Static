@@ -13,19 +13,12 @@ import {
   ChevronLeft,
   ChevronRight,
   Heart,
-  MessageCircle,
   ShoppingBag,
   X,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
-import {
-  buildWhatsAppEnquiryUrl,
-  formatWhatsAppDisplay,
-  resolveWhatsAppDigits,
-} from '../config/site';
-import { useStorefront } from '../context/StorefrontContext';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
 import type { BagItem, Product } from '../types/boutique';
@@ -53,7 +46,6 @@ interface QuickViewModalProps {
   onToggleWishlist: (id: string) => void;
   onAddToBag?: (item: Omit<BagItem, 'quantity'> & { quantity?: number }) => void;
   onBuyNow?: (item: Omit<BagItem, 'quantity'> & { quantity?: number }) => void;
-  onAskStylist?: (product: Product, selectedSize: string, selectedColor: string) => void;
   relatedProducts?: Product[];
   onSelectProduct?: (product: Product) => void;
   onClose: () => void;
@@ -68,7 +60,6 @@ export function QuickViewModal({
   onToggleWishlist,
   onAddToBag,
   onBuyNow,
-  onAskStylist,
   relatedProducts = [],
   onSelectProduct,
   onClose,
@@ -77,7 +68,6 @@ export function QuickViewModal({
   const imageFrameRef = useRef<HTMLDivElement>(null);
   const colorStripRef = useRef<HTMLDivElement>(null);
   const prefersReducedMotion = usePrefersReducedMotion();
-  const { settings } = useStorefront();
   const isOpen = product !== null;
 
   const [activeImageIndex, setActiveImageIndex] = useState(0);
@@ -281,18 +271,6 @@ export function QuickViewModal({
 
   const selectedColorName = selectedColorOption?.name || product?.colors[0]?.name || 'Default';
   const selectedSizeLabel = activeVariant?.size || selectedSize || '';
-
-  const whatsappDigits = resolveWhatsAppDigits(settings.contact);
-  const whatsappDisplay = formatWhatsAppDisplay(whatsappDigits);
-  const enquiryUrl = product
-    ? buildWhatsAppEnquiryUrl({
-        productName: product.name,
-        selectedSize: selectedSizeLabel || 'Standard',
-        selectedColor: selectedColorName,
-        brandName: settings.brandName,
-        contact: settings.contact,
-      })
-    : '';
 
   const buildBagPayload = () => {
     if (!product || !activeVariant) return null;
@@ -989,13 +967,13 @@ export function QuickViewModal({
                       </button>
                     </div>
 
-                    {/* Mobile Wishlist + Stylist / WhatsApp row */}
-                    <div className="flex flex-col gap-2 sm:flex-row">
+                    {/* Mobile Wishlist button */}
+                    <div className="flex flex-col gap-2 sm:hidden">
                       <button
                         type="button"
                         onClick={() => onToggleWishlist(product.id)}
                         aria-pressed={isWishlisted}
-                        className={`flex min-h-[42px] items-center justify-center gap-2 rounded-xl border px-4 py-2 text-xs font-medium transition-colors sm:hidden ${
+                        className={`flex min-h-[42px] items-center justify-center gap-2 rounded-xl border px-4 py-2 text-xs font-medium transition-colors ${
                           isWishlisted
                             ? 'border-[#B76E79] bg-[#F3D5DF]/45 text-[#49243E]'
                             : 'border-[#49243E]/20 bg-white text-[#49243E]'
@@ -1007,34 +985,6 @@ export function QuickViewModal({
                         />
                         <span>{isWishlisted ? 'Saved to Wishlist' : 'Save to Wishlist'}</span>
                       </button>
-
-                      {onAskStylist && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            onAskStylist(
-                              product,
-                              selectedSizeLabel || 'Standard',
-                              selectedColorName
-                            )
-                          }
-                          className="flex min-h-[42px] flex-1 items-center justify-center gap-2 rounded-xl border border-[#49243E]/25 bg-white px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/35"
-                        >
-                          <MessageCircle className="h-4 w-4" aria-hidden="true" />
-                          <span>Ask Stylist</span>
-                        </button>
-                      )}
-                      {enquiryUrl && (
-                        <a
-                          href={enquiryUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="flex min-h-[42px] flex-1 items-center justify-center gap-2 rounded-xl border border-[#49243E]/20 bg-white px-4 py-2 text-xs font-medium text-[#49243E] transition-colors hover:bg-[#F3D5DF]/25 tabular-nums"
-                        >
-                          <MessageCircle className="h-4 w-4" aria-hidden="true" />
-                          <span>WhatsApp ({whatsappDisplay})</span>
-                        </a>
-                      )}
                     </div>
                   </div>
                 </div>
